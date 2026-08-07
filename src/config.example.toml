@@ -1,0 +1,17 @@
+[app]
+poll_interval = 5
+history_length = 40
+
+# ssh_target accepts either user@host or an alias from ~/.ssh/config.
+# vllm_url is accessed directly from the machine running dgx-top.
+[[nodes]]
+label = "spark-1"
+ssh_target = "spark@spark01.example.com"
+vllm_url = "http://spark01.example.com:8000"
+worker = false
+
+[[nodes]]
+label = "spark-2"
+ssh_target = "spark@spark02.example.com"
+vllm_url = "http://spark02.example.com:8000"
+worker = true
