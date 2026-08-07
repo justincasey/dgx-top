@@ -1,0 +1,14 @@
+name: Diag
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python --version
