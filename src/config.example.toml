@@ -1,6 +1,8 @@
 [app]
 poll_interval = 5
 history_length = 40
+# Color theme; run `dgx-top themes` for the full list of supported themes.
+theme = "dgx-dark"
 
 # ssh_target accepts either user@host or an alias from ~/.ssh/config.
 # vllm_url is accessed directly from the machine running dgx-top.

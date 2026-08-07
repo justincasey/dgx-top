@@ -122,6 +122,7 @@ worker = true
 | `worker`         | Marks a worker node in a tensor-parallel deployment                         |
 | `poll_interval`  | Initial polling interval in seconds, from 1 to 60                           |
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
+| `theme`          | Color theme name; see [Themes](#themes)                                    |
 
 The SSH target and vLLM URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
 
@@ -131,8 +132,36 @@ To use a different file:
 dgx-top --config /path/to/config.toml check
 dgx-top --config /path/to/config.toml
 ```
-
 Or set `DGX_TOP_CONFIG`.
+
+## Themes
+
+The dashboard is themed with Textual's native theme system. Set the theme in the
+configuration file:
+
+```toml
+[app]
+theme = "tokyo-night"
+```
+
+or override it on the command line:
+
+```bash
+dgx-top --theme tokyo-night-storm
+```
+
+Every Textual built-in theme is supported out of the box — including the full
+Tokyo Night family — plus the classic `dgx-dark` default:
+
+- **Dark:** `dgx-dark` (default), `tokyo-night`, `tokyo-night-storm`, `nord`,
+  `gruvbox`, `dracula`, `monokai`, `catppuccin-mocha`, `catppuccin-macchiato`,
+  `catppuccin-frappe`, `rose-pine`, `rose-pine-moon`, `solarized-dark`,
+  `atom-one-dark`, `textual-dark`, `flexoki`
+- **Light:** `tokyo-night-light`, `catppuccin-latte`, `solarized-light`,
+  `rose-pine-dawn`, `atom-one-light`, `textual-light`
+
+Run `dgx-top themes` for the complete list. An unknown theme name is rejected
+with the available options when the configuration is loaded.
 
 ## Preflight checks
 

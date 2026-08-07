@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from themes import DEFAULT_THEME, theme_names
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.9/3.10
@@ -31,6 +33,21 @@ class Settings:
     nodes: tuple[NodeConfig, ...]
     poll_interval: int = 5
     history_length: int = 40
+    theme: str = DEFAULT_THEME
+
+
+def _parse_theme(app: dict, override: str | None) -> str:
+    """Resolve the configured theme, validating it against known theme names."""
+    theme = app.get("theme", DEFAULT_THEME)
+    if not isinstance(theme, str) or not theme.strip():
+        raise ConfigError("app.theme must be a non-empty theme name")
+    theme = theme.strip()
+    if override:
+        theme = override.strip()
+    if theme not in theme_names():
+        available = ", ".join(theme_names())
+        raise ConfigError(f"unknown theme {theme!r}; available themes: {available}")
+    return theme
 
 
 def default_config_path() -> Path:
@@ -77,7 +94,7 @@ def _parse_node(raw: object, node_number: int) -> NodeConfig:
     return NodeConfig(label, ssh_target, vllm_url, worker)
 
 
-def load_config(path: str | Path | None = None) -> Settings:
+def load_config(path: str | Path | None = None, theme: str | None = None) -> Settings:
     config_path = Path(path).expanduser() if path else default_config_path()
     if not config_path.is_file():
         raise ConfigError(
@@ -110,7 +127,7 @@ def load_config(path: str | Path | None = None) -> Settings:
         raise ConfigError("app.poll_interval must be an integer from 1 to 60")
     if not isinstance(history_length, int) or not 10 <= history_length <= 1000:
         raise ConfigError("app.history_length must be an integer from 10 to 1000")
-    return Settings(nodes, poll_interval, history_length)
+    return Settings(nodes, poll_interval, history_length, _parse_theme(app, theme))
 
 
 _SETTINGS: Settings | None = None
@@ -118,10 +135,10 @@ SPARK_UNITS: dict[int, dict[str, object]] = {}
 HISTORY_LEN = 40
 
 
-def configure(path: str | Path | None = None) -> Settings:
+def configure(path: str | Path | None = None, theme: str | None = None) -> Settings:
     """Load settings and update compatibility globals used by the collector."""
     global _SETTINGS, HISTORY_LEN
-    settings = load_config(path)
+    settings = load_config(path, theme=theme)
     _SETTINGS = settings
     HISTORY_LEN = settings.history_length
     SPARK_UNITS.clear()

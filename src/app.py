@@ -11,34 +11,54 @@ from textual.widgets import Sparkline, Static
 from collector import _init_model_names, poll_cluster
 from config import get_settings
 from stats import ClusterStats, SparkUnitStats
+from themes import CUSTOM_THEMES, Palette, build_palette
 
-# ─── Greyscale helpers ─────────────────────────────────────────────────
+# ─── Theme helpers ───────────────────────────────────────────────────
 
 TEMP_ALERT = 80
 TEMP_WARM = 60
 
+_palette_cache: dict[str, Palette] = {}
 
-def _grid_cell(util: float) -> Text:
+
+def _palette_for(app: "DGXTop") -> Palette:
+    """Resolve (and cache) the semantic palette for the app's active theme."""
+    theme = app.current_theme
+    cached = _palette_cache.get(theme.name)
+    if cached is None:
+        cached = build_palette(theme)
+        _palette_cache[theme.name] = cached
+    return cached
+
+
+def _lerp_hex(start: str, end: str, t: float) -> str:
+    """Linearly interpolate two #rrggbb colors; t clamps to [0, 1]."""
+    t = max(0.0, min(1.0, t))
+    a = [int(start[i : i + 2], 16) for i in (1, 3, 5)]
+    b = [int(end[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
+
+
+def _grid_cell(util: float, pal: Palette) -> Text:
     """Render a fixed square whose brightness tracks core utilization."""
     clamped = max(0.0, min(100.0, util))
-    level = 32 + round(clamped * 223 / 100)
-    return Text("■", style=f"rgb({level},{level},{level})")
+    return Text("\u25a0", style=_lerp_hex(pal.faint, pal.fg, clamped / 100))
 
 
-def _val_style(v: float, hi: float = 70, lo: float = 20) -> str:
+def _val_style(v: float, pal: Palette, hi: float = 70, lo: float = 20) -> str:
     if v >= hi:
-        return "bold white"
+        return f"bold {pal.fg}"
     if v <= lo:
-        return "grey46"
-    return "grey85"
+        return pal.muted
+    return pal.mid
 
 
-def _temp_style(c: float) -> str:
+def _temp_style(c: float, pal: Palette) -> str:
     if c >= TEMP_ALERT:
-        return "bold red"
+        return f"bold {pal.error}"
     if c >= TEMP_WARM:
-        return "bold white"
-    return "grey66"
+        return f"bold {pal.fg}"
+    return pal.dim
 
 
 def _fmt_tokens(n: int) -> str:
@@ -51,7 +71,9 @@ def _fmt_tokens(n: int) -> str:
         return f"{n / 1_000_000:.1f}M"
 
 
-def _compute_kv_risk(pct: float, prefix_hit: float, used_tok: int, total_tok: int) -> Text:
+def _compute_kv_risk(
+    pct: float, prefix_hit: float, used_tok: int, total_tok: int, pal: Palette
+) -> Text:
     """Multi-factor KV cache risk assessment.
 
     Factors considered:
@@ -84,13 +106,13 @@ def _compute_kv_risk(pct: float, prefix_hit: float, used_tok: int, total_tok: in
         factors.append("low cache hit")
 
     if not factors:
-        return Text("", style="grey69")
+        return Text("", style=pal.muted)
 
     label = "KV " + ("!! " if critical else "! ")
-    style = "bold red" if critical else "bold yellow"
+    style = f"bold {pal.error}" if critical else f"bold {pal.warn}"
     return Text.assemble(
         Text(label, style=style),
-        Text("  ".join(factors), style="grey69"),
+        Text("  ".join(factors), style=pal.dim),
     )
 
 
@@ -112,11 +134,17 @@ class MeterBar(Static):
         width = self.content_size.width
         if width <= 0:
             return Text()
+        pal = _palette_for(self.app)
         filled = round(self._pct / 100 * width)
-        fill_style = "bold white" if self._pct >= 80 else "grey74" if self._pct >= 50 else "grey46"
+        if self._pct >= 80:
+            fill_style = f"bold {pal.fg}"
+        elif self._pct >= 50:
+            fill_style = pal.mid
+        else:
+            fill_style = pal.dim
         return Text.assemble(
-            Text("█" * filled, style=fill_style),
-            Text("░" * (width - filled), style="grey30"),
+            Text("\u2588" * filled, style=fill_style),
+            Text("\u2591" * (width - filled), style=pal.faint),
         )
 
 
@@ -139,16 +167,16 @@ class ThroughputTile(Static):
 
     def compose(self):
         yield Static("THROUGHPUT", classes="section-header")
-        yield Sparkline(id="tp-prompt-chart", max_color="#aabbcc", min_color="#446688")
+        yield Sparkline(id="tp-prompt-chart")
         yield Static(id="tp-prompt-stats")
-        yield Sparkline(id="tp-gen-chart", max_color="#ccbbaa", min_color="#886644")
+        yield Sparkline(id="tp-gen-chart")
         yield Static(id="tp-gen-stats")
         yield Static(id="tp-ratio")
         yield Static("KV CACHE", classes="section-header")
         yield Static(id="kv-stats")
         yield Static(id="kv-detail")
         yield MeterBar(id="kv-bar", classes="meter")
-        yield Sparkline(id="kv-usage-chart", max_color="#667788", min_color="#334455")
+        yield Sparkline(id="kv-usage-chart")
         yield Static(id="kv-risk")
 
     def on_mount(self):
@@ -183,6 +211,7 @@ class ThroughputTile(Static):
             prefix_hit: Prefix cache hit rate (-1 = unavailable)
             kv_history: Per-node KV usage history for sparkline
         """
+        pal = _palette_for(self.app)
         # Line 1: request status with prefix hit rate
         hit_str = ""
         if prefix_hit >= 0:
@@ -190,14 +219,14 @@ class ThroughputTile(Static):
 
         if req > 0 or wait > 0:
             kv_line1 = Text.assemble(
-                Text(f"{req}r", style="grey85"),
-                Text(f"  {wait}w", style="grey50" if wait == 0 else "bold white"),
-                Text(hit_str, style="bold cyan" if prefix_hit > 0 else "grey46"),
+                Text(f"{req}r", style=pal.mid),
+                Text(f"  {wait}w", style=pal.muted if wait == 0 else f"bold {pal.fg}"),
+                Text(hit_str, style=f"bold {pal.accent}" if prefix_hit > 0 else pal.muted),
             )
         else:
             kv_line1 = Text.assemble(
-                Text("idle", style="grey46"),
-                Text(hit_str, style="bold cyan" if prefix_hit > 0 else "grey46"),
+                Text("idle", style=pal.muted),
+                Text(hit_str, style=f"bold {pal.accent}" if prefix_hit > 0 else pal.muted),
             )
         self.query_one("#kv-stats", Static).update(kv_line1)
 
@@ -207,12 +236,12 @@ class ThroughputTile(Static):
             used_str = _fmt_tokens(used_tok)
             total_str = _fmt_tokens(total_tok)
             capacity_line = Text.assemble(
-                Text("Capacity: ", style="grey35"),
-                Text(f"{used_str} / {total_str} tok", style="bold white"),
-                Text(f"  ({pct:.0f}%)", style="grey66"),
+                Text("Capacity: ", style=pal.faint),
+                Text(f"{used_str} / {total_str} tok", style=f"bold {pal.fg}"),
+                Text(f"  ({pct:.0f}%)", style=pal.dim),
             )
         else:
-            capacity_line = Text(f"Capacity: {pct:.0f}%", style="grey66")
+            capacity_line = Text(f"Capacity: {pct:.0f}%", style=pal.dim)
         self.query_one("#kv-detail", Static).update(capacity_line)
 
         # Line 3: MeterBar visual
@@ -225,10 +254,11 @@ class ThroughputTile(Static):
             chart.data = kv_history
 
         # Line 4: risk assessment (multi-factor like memory thrash)
-        risk = _compute_kv_risk(pct, prefix_hit, used_tok, total_tok)
+        risk = _compute_kv_risk(pct, prefix_hit, used_tok, total_tok, pal)
         self.query_one("#kv-risk", Static).update(risk)
 
     def _render_content(self):
+        pal = _palette_for(self.app)
         prompt_chart = self.query_one("#tp-prompt-chart", Sparkline)
         prompt_stats = self.query_one("#tp-prompt-stats", Static)
         if self._prompt_data:
@@ -237,16 +267,16 @@ class ThroughputTile(Static):
             p_avg = sum(p_vals) / len(p_vals)
             prompt_stats.update(
                 Text.assemble(
-                    Text(f"min {min(p_vals):.0f}", style="grey46"),
-                    Text("   avg ", style="grey35"),
-                    Text(f"{p_avg:.0f}", style="bold white"),
-                    Text("   max ", style="grey35"),
-                    Text(f"{max(p_vals):.0f}", style="grey85"),
+                    Text(f"min {min(p_vals):.0f}", style=pal.muted),
+                    Text("   avg ", style=pal.faint),
+                    Text(f"{p_avg:.0f}", style=f"bold {pal.fg}"),
+                    Text("   max ", style=pal.faint),
+                    Text(f"{max(p_vals):.0f}", style=pal.mid),
                 )
             )
         else:
             prompt_chart.data = []
-            prompt_stats.update(Text("\u2014", style="grey46"))
+            prompt_stats.update(Text("\u2014", style=pal.muted))
 
         gen_chart = self.query_one("#tp-gen-chart", Sparkline)
         gen_stats = self.query_one("#tp-gen-stats", Static)
@@ -256,23 +286,23 @@ class ThroughputTile(Static):
             g_avg = sum(g_vals) / len(g_vals)
             gen_stats.update(
                 Text.assemble(
-                    Text(f"min {min(g_vals):.0f}", style="grey46"),
-                    Text("   avg ", style="grey35"),
-                    Text(f"{g_avg:.0f}", style="bold white"),
-                    Text("   max ", style="grey35"),
-                    Text(f"{max(g_vals):.0f}", style="grey85"),
+                    Text(f"min {min(g_vals):.0f}", style=pal.muted),
+                    Text("   avg ", style=pal.faint),
+                    Text(f"{g_avg:.0f}", style=f"bold {pal.fg}"),
+                    Text("   max ", style=pal.faint),
+                    Text(f"{max(g_vals):.0f}", style=pal.mid),
                 )
             )
         else:
             gen_chart.data = []
-            gen_stats.update(Text("\u2014", style="grey46"))
+            gen_stats.update(Text("\u2014", style=pal.muted))
 
         ratio_widget = self.query_one("#tp-ratio", Static)
         if self._prompt_gen_ratio > 0:
             ratio_widget.update(
                 Text.assemble(
-                    Text("ratio ", style="grey35"),
-                    Text(f"{self._prompt_gen_ratio:.0f}:1", style="bold white"),
+                    Text("ratio ", style=pal.faint),
+                    Text(f"{self._prompt_gen_ratio:.0f}:1", style=f"bold {pal.fg}"),
                 )
             )
         else:
@@ -311,23 +341,24 @@ class NodeTile(Static):
     def update_node(self, s: SparkUnitStats):
         idx = self.idx
         online = s.online
-        dash = Text("—", style="grey46")
+        pal = _palette_for(self.app)
+        dash = Text("—", style=pal.muted)
         label = s.label
         if s.model_name:
             model = Text(s.model_name)
             model.truncate(15, overflow="ellipsis")
             label += f"  {model.plain}"
         self.query_one(f"#node-label-{idx}", Static).update(
-            Text(label, style="bold white" if online else "grey46")
+            Text(label, style=f"bold {pal.fg}" if online else pal.muted)
         )
 
         if online:
             gpu = s.gpu_util_pct
             self.query_one(f"#node-gpu-row-{idx}", Static).update(
                 Text.assemble(
-                    Text(f"{gpu:.0f}%", style=_val_style(gpu)),
+                    Text(f"{gpu:.0f}%", style=_val_style(gpu, pal)),
                     Text("   "),
-                    Text(f"{s.temp_c:.0f}°C", style=_temp_style(s.temp_c)),
+                    Text(f"{s.temp_c:.0f}°C", style=_temp_style(s.temp_c, pal)),
                 )
             )
             self.query_one(f"#node-gpu-bar-{idx}", MeterBar).update_pct(gpu)
@@ -340,21 +371,21 @@ class NodeTile(Static):
             total_gb = s.mem_total_bytes // (1024**3)
             used_pct = s.mem_used_bytes / s.mem_total_bytes * 100
             row = Text.assemble(
-                Text(f"{used_gb}G", style="bold white"),
-                Text(f"/{total_gb}G  ", style="grey46"),
-                Text(f"{used_pct:.0f}%", style=_val_style(used_pct, 80)),
+                Text(f"{used_gb}G", style=f"bold {pal.fg}"),
+                Text(f"/{total_gb}G  ", style=pal.muted),
+                Text(f"{used_pct:.0f}%", style=_val_style(used_pct, pal, 80)),
             )
             if s.swap_total_kb > 0:
                 swap_pct = s.swap_used_kb / s.swap_total_kb * 100
                 row.append(
                     f"  swp {s.swap_used_kb / (1024 * 1024):.1f}G",
-                    style="bold red" if swap_pct > 70 else "grey46",
+                    style=f"bold {pal.error}" if swap_pct > 70 else pal.muted,
                 )
             self.query_one(f"#node-mem-row-{idx}", Static).update(row)
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(used_pct)
         elif online:
             self.query_one(f"#node-mem-row-{idx}", Static).update(
-                Text(f"{s.gpu_mem_pct:.0f}%", style=_val_style(s.gpu_mem_pct, 80))
+                Text(f"{s.gpu_mem_pct:.0f}%", style=_val_style(s.gpu_mem_pct, pal, 80))
             )
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(0)
         else:
@@ -365,16 +396,16 @@ class NodeTile(Static):
             avg = sum(s.cpu_cores_util) / len(s.cpu_cores_util)
             self.query_one(f"#node-cpu-row-{idx}", Static).update(
                 Text.assemble(
-                    Text("util  ", style="grey50"),
-                    Text(f"{avg:.0f}%", style=_val_style(avg)),
-                    Text("   temp  ", style="grey50"),
-                    Text(f"{s.cpu_temp_c:.0f}°C", style=_temp_style(s.cpu_temp_c)),
+                    Text("util  ", style=pal.muted),
+                    Text(f"{avg:.0f}%", style=_val_style(avg, pal)),
+                    Text("   temp  ", style=pal.muted),
+                    Text(f"{s.cpu_temp_c:.0f}°C", style=_temp_style(s.cpu_temp_c, pal)),
                 )
             )
             self.query_one(f"#node-cpu-bar-{idx}", MeterBar).update_pct(avg)
             core_cells = []
             for core_idx, util in enumerate(s.cpu_cores_util[:20]):
-                core_cells.append(_grid_cell(util))
+                core_cells.append(_grid_cell(util, pal))
                 if core_idx < min(len(s.cpu_cores_util), 20) - 1:
                     core_cells.append(Text(" "))
             self.query_one(f"#node-cpu-grid-{idx}", Static).update(Text.assemble(*core_cells))
@@ -393,7 +424,7 @@ class DGXTop(App):
     CSS = """
     Screen {
         layout: vertical;
-        background: #0a0a0a;
+        background: $background;
         overflow-y: auto;
     }
 
@@ -401,8 +432,8 @@ class DGXTop(App):
         height: 2;
         padding: 0 1;
         content-align: left middle;
-        background: #0a0a0a;
-        border-bottom: solid #333333;
+        background: $background;
+        border-bottom: solid $border-blurred;
     }
 
     #kpis {
@@ -412,28 +443,27 @@ class DGXTop(App):
         grid-rows: 18;
         grid-gutter: 0;
         height: 18;
-        background: #0a0a0a;
+        background: $background;
     }
 
     ThroughputTile, NodeTile {
         height: 18;
         min-width: 20;
-        border: solid #2a2a2a;
+        border: solid $border-blurred;
         padding: 0 1;
         layout: vertical;
-        background: #0f0f0f;
+        background: $panel;
     }
-
 
     .node-header {
         height: 1;
-        color: #ffffff;
+        color: $text;
         text-style: bold;
     }
 
     .section-header {
         height: 1;
-        color: #777777;
+        color: $text-muted;
     }
 
     ThroughputTile .section-header {
@@ -446,12 +476,34 @@ class DGXTop(App):
 
     #tp-prompt-chart, #tp-gen-chart {
         height: 2;
-        color: #aaaaaa;
+    }
+
+    #tp-prompt-chart > .sparkline--max-color {
+        color: $secondary;
+    }
+
+    #tp-prompt-chart > .sparkline--min-color {
+        color: $secondary 35%;
+    }
+
+    #tp-gen-chart > .sparkline--max-color {
+        color: $accent;
+    }
+
+    #tp-gen-chart > .sparkline--min-color {
+        color: $accent 35%;
     }
 
     #kv-usage-chart {
         height: 2;
-        color: #777788;
+    }
+
+    #kv-usage-chart > .sparkline--max-color {
+        color: $primary;
+    }
+
+    #kv-usage-chart > .sparkline--min-color {
+        color: $primary 30%;
     }
 
     #kv-risk {
@@ -465,13 +517,12 @@ class DGXTop(App):
 
     .meter {
         height: 1;
-        color: #888888;
+        color: $text-muted;
     }
 
     .cores {
         height: 2;
     }
-
 
     #kpis.medium {
         grid-rows: 18 18;
@@ -511,6 +562,9 @@ class DGXTop(App):
     def __init__(self):
         super().__init__()
         self.settings = get_settings()
+        for custom in CUSTOM_THEMES:
+            self.register_theme(custom)
+        self.theme = self.settings.theme
         self.poll_speeds = sorted({1, 2, 5, 10, self.settings.poll_interval})
         self._polling = False
         self._poll_speed_idx = self.poll_speeds.index(self.settings.poll_interval)
@@ -553,16 +607,17 @@ class DGXTop(App):
         self._set_title()
 
     def _set_title(self):
+        pal = _palette_for(self)
         interval = self.poll_speeds[self._poll_speed_idx]
         topo = self._current_topology or "..."
         self.query_one("#title", Static).update(
             Text.assemble(
-                Text("dgx-top", style="bold white"),
-                Text(" \u26a1", style="grey35"),
-                Text(topo, style="bold cyan"),
-                Text(" :: ", style="grey27"),
-                Text(f"poll {interval}s  ", style="grey46"),
-                Text("[+/-]speed [r]efresh [q]uit", style="grey30"),
+                Text("dgx-top", style=f"bold {pal.fg}"),
+                Text(" \u26a1", style=pal.faint),
+                Text(topo, style=f"bold {pal.accent}"),
+                Text(" :: ", style=pal.faint),
+                Text(f"poll {interval}s  ", style=pal.muted),
+                Text("[+/-]speed [r]efresh [q]uit", style=pal.faint),
             )
         )
 
