@@ -94,12 +94,14 @@ def theme_names() -> list[str]:
 class Palette:
     """Semantic colors resolved from the active theme.
 
-    ``fg``/``mid``/``dim``/``muted``/``faint`` are a five-step foreground ramp
-    (bright to dim) used for dashboard text; ``grid_lo`` is the low end of the
-    CPU core-cell brightness ramp; the remaining fields are the theme's accent
-    and status colors. All values are ``#rrggbb`` hex strings.
+    ``background`` is the concrete theme background. ``fg``/``mid``/``dim``/
+    ``muted``/``faint`` are a five-step foreground ramp (bright to dim);
+    ``grid_lo`` is retained for other low-emphasis rendering. The remaining
+    fields are the theme's accent and status colors. All values are
+    ``#rrggbb`` hex strings.
     """
 
+    background: str
     fg: str
     mid: str
     dim: str
@@ -108,6 +110,7 @@ class Palette:
     grid_lo: str
     accent: str
     primary: str
+    secondary: str
     warn: str
     error: str
     ok: str
@@ -179,6 +182,7 @@ def build_palette(theme: Theme) -> Palette:
         grid_lo = _ramp(foreground_color, _LIGHT_DEEMPHASIS, 0.72)
 
     return Palette(
+        background=background_color.hex,
         fg=foreground_color.hex,
         mid=mid,
         dim=dim,
@@ -188,6 +192,7 @@ def build_palette(theme: Theme) -> Palette:
         accent=color("accent", theme.primary or "#00E0E0"),
         primary=color("primary", "#4AA3FF"),
         warn=color("warning", "#E3B341"),
+        secondary=color("secondary", "#33CCFF"),
         error=color("error", "#F05050"),
         ok=color("success", "#57D787"),
     )

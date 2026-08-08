@@ -43,6 +43,7 @@ def test_ansi_themes_produce_concrete_hex_palette():
     for name in ("ansi-dark", "ansi-light"):
         palette = build_palette(get_theme(name))
         for field in (
+            "background",
             "fg",
             "mid",
             "dim",
@@ -50,6 +51,7 @@ def test_ansi_themes_produce_concrete_hex_palette():
             "faint",
             "accent",
             "primary",
+            "secondary",
             "error",
         ):
             assert getattr(palette, field).startswith("#"), f"{name}.{field} not hex"
