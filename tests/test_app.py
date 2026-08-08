@@ -229,7 +229,7 @@ async def test_compact_tier_fits_a_320x320_viewport(tmp_path: Path, monkeypatch)
     async with app.run_test(size=(40, 21)) as pilot:
         await pilot.pause()
 
-        assert app.compact is True
+        assert app.density == "compact"
         throughput = app.query_one(ThroughputTile)
         nodes = list(app.query(NodeTile))
         assert len(nodes) == 2
@@ -260,63 +260,151 @@ async def test_compact_tier_fits_a_320x320_viewport(tmp_path: Path, monkeypatch)
             assert text(f"#node-cpu-grid-{idx}").count("\u25a0") == 20
 
 
-async def test_medium_tier_shows_every_node_tile(tmp_path: Path):
+def _stub_polling(monkeypatch) -> None:
+    """Serve synthetic telemetry so layout assertions never race a real poll."""
+    import app as app_module
+
+    async def fake_poll():
+        return _fake_cluster()
+
+    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
+
+
+async def _resize(pilot, width: int, height: int) -> None:
+    await pilot.resize_terminal(width, height)
+    await pilot.pause()
+    await pilot.pause()
+
+
+async def test_medium_tier_shows_every_node_tile(tmp_path: Path, monkeypatch):
     """The two-column tier must wrap onto a second row, not clip a node."""
     from app import DGXTop, NodeTile
 
     path = tmp_path / "config.toml"
     _two_node_config(path)
     configure(path)
+    _stub_polling(monkeypatch)
 
     app = DGXTop()
     async with app.run_test(size=(70, 60)) as pilot:
-        app.cluster = _fake_cluster()
-        app._update_ui()
         await pilot.pause()
 
-        assert app.compact is False
         assert app.query_one("#kpis").has_class("medium")
         heights = sorted(tile.region.height for tile in app.query(NodeTile))
-        assert heights == [10, 10]
+        assert heights == [16, 16]
 
 
-async def test_compact_engages_until_the_dense_layout_actually_fits(tmp_path: Path):
-    """The tier follows required height, not an arbitrary row threshold.
-
-    One column of three 10-row tiles plus the title needs 32 rows, so a 20-row
-    viewport must compact instead of clipping the stack into a scroll region.
-    """
+async def test_density_steps_down_one_tier_at_a_time(tmp_path: Path, monkeypatch):
+    """Density follows the rows each grid row gets: roomy → dense → compact."""
     from app import DGXTop
 
     path = tmp_path / "config.toml"
     _two_node_config(path)
     configure(path)
+    _stub_polling(monkeypatch)
 
     app = DGXTop()
-    async with app.run_test(size=(40, 20)) as pilot:
+    async with app.run_test(size=(180, 16)) as pilot:
         await pilot.pause()
-        assert app.compact is True
+        assert app.density == "roomy"
 
-        await pilot.resize_terminal(40, 32)
-        await pilot.pause()
-        assert app.compact is False
+        await _resize(pilot, 180, 14)
+        assert app.density == "dense"
+
+        await _resize(pilot, 180, 11)
+        assert app.density == "compact"
+
+        # One column of three tiles needs three times the height for the same
+        # density, so the same rows buy a looser layout at three columns.
+        await _resize(pilot, 40, 40)
+        assert app.density == "dense"
+
+        await _resize(pilot, 40, 26)
+        assert app.density == "compact"
+
+        await _resize(pilot, 40, 50)
+        assert app.density == "roomy"
 
 
-async def test_dense_layout_fits_a_180_pixel_tall_viewport(tmp_path: Path):
-    """At three columns the base layout must fit 12 rows (~180px)."""
+async def test_tiles_fill_the_viewport_until_they_cap_out(tmp_path: Path, monkeypatch):
+    """No dead space: the grid stretches to the bottom until tiles cap out."""
     from app import DGXTop, NodeTile, ThroughputTile
 
     path = tmp_path / "config.toml"
     _two_node_config(path)
     configure(path)
+    _stub_polling(monkeypatch)
 
     app = DGXTop()
     async with app.run_test(size=(180, 12)) as pilot:
-        app.cluster = _fake_cluster()
-        app._update_ui()
         await pilot.pause()
 
-        assert app.compact is False
+        for height, expected in ((12, 10), (14, 12), (16, 14), (40, 16)):
+            await _resize(pilot, 180, height)
+            tiles = list(app.query(ThroughputTile)) + list(app.query(NodeTile))
+            for tile in tiles:
+                assert tile.region.height == expected, (
+                    f"{tile.id} is {tile.region.height} rows at height {height}"
+                )
+
+
+async def test_no_row_is_clipped_at_any_viewport(tmp_path: Path, monkeypatch):
+    """Fluidity invariant: every row stays inside its tile at every size.
+
+    Covers all three densities, all three column tiers and the scrolling floor.
+    """
+    from app import DGXTop, NodeTile, ThroughputTile
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+    _stub_polling(monkeypatch)
+
+    sizes = (
+        (180, 40),
+        (180, 16),
+        (180, 12),
+        (120, 22),
+        (70, 24),
+        (40, 50),
+        (40, 40),
+        (40, 26),
+        (40, 21),
+        (26, 16),
+    )
+
+    app = DGXTop()
+    async with app.run_test(size=(180, 40)) as pilot:
+        await pilot.pause()
+
+        for width, height in sizes:
+            await _resize(pilot, width, height)
+            # Compact drops the border, so the last usable row is the tile's own
+            # bottom; the bordered densities lose one row to it.
+            border = 0 if app.density == "compact" else 1
+            for tile in list(app.query(ThroughputTile)) + list(app.query(NodeTile)):
+                limit = tile.region.bottom - border
+                for child in tile.walk_children():
+                    assert child.region.bottom <= limit, (
+                        f"{type(child).__name__} in {tile.id} is clipped at "
+                        f"{width}x{height} ({app.density})"
+                    )
+
+
+async def test_dense_layout_fits_a_180_pixel_tall_viewport(tmp_path: Path, monkeypatch):
+    """At three columns the dense layout must fit 12 rows (~180px)."""
+    from app import DGXTop, NodeTile, ThroughputTile
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+    _stub_polling(monkeypatch)
+
+    app = DGXTop()
+    async with app.run_test(size=(180, 12)) as pilot:
+        await pilot.pause()
+
+        assert app.density == "dense"
         kpis = app.query_one("#kpis")
         assert not kpis.has_class("narrow") and not kpis.has_class("medium")
         tiles = list(app.query(ThroughputTile)) + list(app.query(NodeTile))

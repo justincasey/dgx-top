@@ -18,14 +18,30 @@ from themes import CUSTOM_THEMES, Palette, build_palette
 TEMP_ALERT = 80
 TEMP_WARM = 60
 
-# Responsive tiers. Width picks the column count; the compact tier folds every
-# tile down to five rows so the whole dashboard fits a ~320x320px viewport
-# (roughly 40x21 cells).
+# Responsive tiers. Width picks the column count; the height available per grid
+# row picks the density. Within a density every chart and meter is elastic, so
+# intermediate heights are absorbed by taller graphics instead of dead space.
 NARROW_WIDTH = 46
 MEDIUM_WIDTH = 90
 COMPACT_WIDTH = 34
 TITLE_HEIGHT = 2
-TILE_HEIGHT = 10
+
+# Minimum rows the tallest tile (throughput) needs in each density.
+COMPACT_ROWS = 7
+DENSE_ROWS = 10
+ROOMY_ROWS = 13
+# Past this the tiles stop stretching; extra space stays below the grid rather
+# than inflating bars into wallpaper.
+ROOMY_MAX_ROWS = 16
+
+
+def _density_for(rows_available: int) -> str:
+    """Densest layout that fits ``rows_available`` rows per grid row."""
+    if rows_available >= ROOMY_ROWS:
+        return "roomy"
+    if rows_available >= DENSE_ROWS:
+        return "dense"
+    return "compact"
 
 
 def _grid_rows(tiles: int, columns: int) -> int:
@@ -143,13 +159,22 @@ def _compute_kv_risk(
 # ─── Widgets ────────────────────────────────────────────────────────────
 
 
+def _density(widget) -> str:
+    """Active density: ``compact``, ``dense`` or ``roomy``."""
+    return getattr(widget.app, "density", "dense")
+
+
 def _compact(widget) -> bool:
     """True when the app is in its space-starved compact tier."""
-    return bool(getattr(widget.app, "compact", False))
+    return _density(widget) == "compact"
 
 
 class MeterBar(Static):
-    """A percentage bar that always fills its available content width."""
+    """A percentage bar that always fills its available content box.
+
+    The bar is repeated for every content row it is given, so a meter placed in
+    an elastic slot thickens with the layout instead of leaving a gap.
+    """
 
     def __init__(self, *args, metric_color: str = "primary", **kwargs):
         super().__init__(*args, **kwargs)
@@ -162,15 +187,24 @@ class MeterBar(Static):
 
     def render(self) -> Text:
         width = self.content_size.width
+        rows = max(1, self.content_size.height)
         if width <= 0:
             return Text()
         pal = _palette_for(self.app)
         filled = round(self._pct / 100 * width)
         fill_style = getattr(pal, self._metric_color)
-        return Text.assemble(
+        bar = Text.assemble(
             Text("\u2588" * filled, style=fill_style),
             Text("\u2591" * (width - filled), style=pal.faint),
         )
+        if rows == 1:
+            return bar
+        stacked = Text()
+        for row in range(rows):
+            if row:
+                stacked.append("\n")
+            stacked.append_text(bar.copy())
+        return stacked
 
 
 class ThroughputTile(Static):
@@ -366,12 +400,13 @@ class ThroughputTile(Static):
 
 
 class NodeTile(Static):
-    """Dense per-Spark hardware tile.
+    """Per-Spark hardware tile that scales with the available height.
 
-    The GPU/MEM/CPU section labels are prefixes on their own value rows rather
-    than separate header lines, so each section costs two rows: values then
-    meter. The compact tier shortens the prefixes to one letter, folds the
-    meter onto the value row and drops the core grid's spacing.
+    ``roomy`` gives each section its own header line, ``dense`` turns those
+    headers into ``GPU``/``MEM``/``CPU`` prefixes on the value rows, and
+    ``compact`` shortens the prefixes to one letter, folds the meter onto the
+    value row and drops the core grid's spacing. Meters are elastic, so leftover
+    height thickens them rather than leaving a gap.
     """
 
     def __init__(self, idx: int, *args, **kwargs):
@@ -381,12 +416,15 @@ class NodeTile(Static):
     def compose(self):
         idx = self.idx
         yield Static(id=f"node-label-{idx}")
+        yield Static("GPU", classes="section-header gpu-header")
         with Vertical(classes="pair-row"):
             yield Static(id=f"node-gpu-row-{idx}")
             yield MeterBar(id=f"node-gpu-bar-{idx}", classes="meter", metric_color="secondary")
+        yield Static("MEMORY", classes="section-header memory-header")
         with Vertical(classes="pair-row"):
             yield Static(id=f"node-mem-row-{idx}")
             yield MeterBar(id=f"node-mem-bar-{idx}", classes="meter", metric_color="ok")
+        yield Static("CPU", classes="section-header cpu-header")
         with Vertical(classes="pair-row"):
             yield Static(id=f"node-cpu-row-{idx}")
             yield MeterBar(id=f"node-cpu-bar-{idx}", classes="meter", metric_color="accent")
@@ -401,11 +439,18 @@ class NodeTile(Static):
         for name in ("gpu-bar", "mem-bar", "cpu-bar"):
             self.query_one(f"#node-{name}-{self.idx}", MeterBar).update_pct(0)
 
+    def _prefix(self, density: str, short: str, medium: str, style: str) -> Text:
+        """Row prefix for the active density; ``roomy`` uses a header line."""
+        if density == "roomy":
+            return Text("")
+        return Text(f"{short} " if density == "compact" else f"{medium}  ", style=style)
+
     def update_node(self, s: SparkUnitStats):
         idx = self.idx
         online = s.online
         pal = _palette_for(self.app)
-        compact = _compact(self)
+        density = _density(self)
+        compact = density == "compact"
         dash = Text("—", style=pal.muted)
         label = s.label
         if s.model_name:
@@ -416,7 +461,7 @@ class NodeTile(Static):
             Text(label, style=f"bold {pal.fg}" if online else pal.muted)
         )
 
-        gpu_prefix = Text("G " if compact else "GPU  ", style=pal.secondary)
+        gpu_prefix = self._prefix(density, "G", "GPU", pal.secondary)
         if online:
             gpu = s.gpu_util_pct
             self.query_one(f"#node-gpu-row-{idx}", Static).update(
@@ -432,7 +477,7 @@ class NodeTile(Static):
             self.query_one(f"#node-gpu-row-{idx}", Static).update(dash)
             self.query_one(f"#node-gpu-bar-{idx}", MeterBar).update_pct(0)
 
-        mem_prefix = Text("M " if compact else "MEM  ", style=pal.ok)
+        mem_prefix = self._prefix(density, "M", "MEM", pal.ok)
         if s.mem_total_bytes > 0:
             used_gb = s.mem_used_bytes // (1024**3)
             total_gb = s.mem_total_bytes // (1024**3)
@@ -461,7 +506,7 @@ class NodeTile(Static):
             self.query_one(f"#node-mem-row-{idx}", Static).update(dash)
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(0)
 
-        cpu_prefix = Text("C " if compact else "CPU  ", style=pal.accent)
+        cpu_prefix = self._prefix(density, "C", "CPU", pal.accent)
         if online and s.cpu_cores_util:
             avg = sum(s.cpu_cores_util) / len(s.cpu_cores_util)
             self.query_one(f"#node-cpu-row-{idx}", Static).update(
@@ -512,25 +557,45 @@ class DGXTop(App):
         text-overflow: ellipsis;
     }
 
-    /* Columns come from the tier; rows are implicit so any node count wraps
-       instead of being clipped to a single grid row. */
+    /* Columns come from the width tier; rows are implicit so any node count
+       wraps, and `1fr` rows split whatever height is left over the title. */
     #kpis {
         layout: grid;
         grid-size: 3;
-        grid-rows: 10;
+        grid-rows: 1fr;
         grid-gutter: 0;
-        height: auto;
+        height: 1fr;
         background: $background;
     }
 
-    /* Eight content rows per tile plus the border. */
+    /* Below the compact minimum the grid stops stretching and the screen
+       scrolls instead of clipping tile contents. */
+    #kpis.scroll {
+        grid-rows: auto;
+        height: auto;
+    }
+
+    /* Past the comfortable maximum the rows stop growing. */
+    #kpis.capped {
+        grid-rows: 16;
+        height: auto;
+    }
+
     ThroughputTile, NodeTile {
-        height: 10;
+        height: 100%;
         min-width: 20;
         border: solid $border-blurred;
         padding: 0 1;
         layout: vertical;
         background: $panel;
+    }
+
+    #kpis.scroll ThroughputTile {
+        height: 7;
+    }
+
+    #kpis.scroll NodeTile {
+        height: 5;
     }
 
     .section-header {
@@ -540,43 +605,68 @@ class DGXTop(App):
         text-overflow: ellipsis;
     }
 
+    .gpu-header {
+        color: $secondary 70%;
+    }
+
+    .memory-header {
+        color: $success 70%;
+    }
+
     .kv-header {
         color: $primary 70%;
+    }
+
+    .cpu-header {
+        color: $accent 70%;
     }
 
     ThroughputTile > Static, NodeTile > Static {
         height: 1;
     }
 
-    /* Throughput: statistics beside a two-row sparkline. */
+    /* Throughput: statistics beside an elastic sparkline. The charts carry
+       twice the weight of the KV graphics row, so leftover height lands in the
+       waveforms and the tile fills exactly. */
     .tp-pair {
         layout: horizontal;
-        height: 2;
+        height: 2fr;
+        min-height: 2;
         width: 1fr;
     }
 
     .tp-pair > Static {
         width: auto;
-        height: 2;
+        height: 100%;
         content-align: left middle;
         padding-right: 1;
     }
 
+    /* Charts grow with the layout but stop before they turn into wallpaper. */
     .tp-pair > Sparkline {
         width: 1fr;
-        height: 2;
+        height: 100%;
+        max-height: 8;
     }
 
     /* KV: capacity meter beside its usage history. */
     #kv-graphics {
         layout: horizontal;
-        height: 1;
+        height: 1fr;
+        min-height: 1;
         width: 1fr;
     }
 
-    #kv-graphics > MeterBar, #kv-graphics > Sparkline {
+    #kv-graphics > Sparkline {
         width: 1fr;
-        height: 1;
+        height: 100%;
+        max-height: 6;
+    }
+
+    #kv-graphics > MeterBar {
+        width: 1fr;
+        height: 100%;
+        max-height: 2;
     }
 
     #tp-prompt-chart > .sparkline--max-color {
@@ -608,10 +698,13 @@ class DGXTop(App):
         text-overflow: ellipsis;
     }
 
-    /* A node value row above its meter. Folded onto one line when compact. */
+    /* A node value row above its elastic meter: one row of values plus a bar
+       that thickens to two rows and no further. */
     .pair-row {
         layout: vertical;
-        height: 2;
+        height: 1fr;
+        min-height: 2;
+        max-height: 3;
         width: 1fr;
     }
 
@@ -619,8 +712,13 @@ class DGXTop(App):
         height: 1;
     }
 
+    .pair-row > MeterBar {
+        height: 1fr;
+        min-height: 1;
+        max-height: 2;
+    }
+
     .meter {
-        height: 1;
         color: $text-muted;
     }
 
@@ -649,7 +747,21 @@ class DGXTop(App):
         padding: 0;
     }
 
-    /* ── Compact tier ─────────────────────────────────────────────────
+    /* ── Dense ────────────────────────────────────────────────────────
+       Section labels ride on their value rows. */
+    Screen.dense .gpu-header,
+    Screen.dense .memory-header,
+    Screen.dense .cpu-header {
+        display: none;
+    }
+
+    /* ── Roomy ────────────────────────────────────────────────────────
+       Sections get their own header lines and the KV block a separator. */
+    Screen.roomy ThroughputTile .kv-header {
+        margin-top: 1;
+    }
+
+    /* ── Compact ──────────────────────────────────────────────────────
        Borders, padding and the THROUGHPUT row go; node meters fold onto their
        value rows. Throughput keeps its two-row sparklines. */
     Screen.compact #title {
@@ -658,43 +770,40 @@ class DGXTop(App):
         border-bottom: none;
     }
 
-    Screen.compact ThroughputTile {
-        height: 7;
+    Screen.compact ThroughputTile, Screen.compact NodeTile {
         min-width: 0;
         border: none;
         padding: 0;
     }
 
-    Screen.compact NodeTile {
-        height: 5;
-        min-width: 0;
-        border: none;
-        padding: 0;
-    }
-
+    Screen.compact .gpu-header,
+    Screen.compact .memory-header,
+    Screen.compact .cpu-header,
     Screen.compact #tp-header {
         display: none;
     }
 
+    /* Still elastic: a compact tier with a little slack thickens its meters
+       rather than leaving the tile half empty. */
     Screen.compact .pair-row {
         layout: horizontal;
-        height: 1;
+        height: 1fr;
+        min-height: 1;
+        max-height: 2;
     }
 
     Screen.compact .pair-row > Static {
         width: auto;
-        height: 1;
+        height: 100%;
+        content-align: left middle;
         padding-right: 1;
     }
 
     Screen.compact .pair-row > MeterBar {
         width: 1fr;
-        height: 1;
+        height: 100%;
+        max-height: 2;
         padding-right: 0;
-    }
-
-    Screen.compact #kpis {
-        grid-rows: auto;
     }
     """
 
@@ -720,8 +829,10 @@ class DGXTop(App):
         self._poll_timer = None
         self.history: dict[str, collections.deque] = {}
         self._current_topology: str = ""
-        self.compact = False
-        self.columns = 3
+        # Unset until the first resize, so the first _apply_tier always applies
+        # the density class to the screen rather than short-circuiting.
+        self.density = ""
+        self.columns = 0
 
     def compose(self):
         yield Static(id="title")
@@ -741,31 +852,41 @@ class DGXTop(App):
         self._apply_tier(event.size.width, event.size.height)
 
     def _apply_tier(self, width: int, height: int) -> None:
-        """Pick the column tier and toggle the compact tier.
+        """Pick the column tier and the density for the current viewport.
 
-        Column count follows width. Compact is chosen whenever the dense base
-        layout would not fit the viewport, so the dashboard is never clipped
-        into a scroll region while a shorter version would have fit.
+        Columns follow width. Density follows the rows each grid row actually
+        gets, so the layout degrades one step at a time instead of snapping
+        between extremes; within a density the elastic charts and meters absorb
+        whatever height is left over.
         """
         kpis = self.query_one("#kpis", Grid)
         if width < NARROW_WIDTH:
             columns = 1
-            kpis.set_classes("narrow")
+            column_class = "narrow"
         elif width < MEDIUM_WIDTH:
             columns = 2
-            kpis.set_classes("medium")
+            column_class = "medium"
         else:
             columns = 3
-            kpis.set_classes("")
+            column_class = ""
 
         rows = _grid_rows(1 + len(self.settings.nodes), columns)
-        needed = TITLE_HEIGHT + rows * TILE_HEIGHT
-        compact = width < COMPACT_WIDTH or needed > height
-        if compact == self.compact and columns == self.columns:
+        available = max(0, height - TITLE_HEIGHT) // rows
+        density = "compact" if width < COMPACT_WIDTH else _density_for(available)
+        classes = [column_class] if column_class else []
+        if available < COMPACT_ROWS:
+            # Under the compact minimum the grid gives up stretching and scrolls.
+            classes.append("scroll")
+        elif available > ROOMY_MAX_ROWS:
+            classes.append("capped")
+        kpis.set_classes(classes)
+
+        if density == self.density and columns == self.columns:
             return
-        self.compact = compact
+        self.density = density
         self.columns = columns
-        self.screen.set_class(compact, "compact")
+        for name in ("compact", "dense", "roomy"):
+            self.screen.set_class(name == density, name)
         self._set_title()
         self._update_ui()
 
@@ -796,14 +917,15 @@ class DGXTop(App):
         pal = _palette_for(self)
         interval = self.poll_speeds[self._poll_speed_idx]
         topo = self._current_topology or "..."
-        keys = "+- t r q" if self.compact else "[+/-]speed [t]heme [r]efresh [q]uit"
+        compact = self.density == "compact"
+        keys = "+- t r q" if compact else "[+/-]speed [t]heme [r]efresh [q]uit"
         self.query_one("#title", Static).update(
             Text.assemble(
                 Text("dgx-top", style=f"bold {pal.fg}"),
                 Text(" \u26a1", style=pal.faint),
                 Text(topo, style=f"bold {pal.accent}"),
-                Text(" " if self.compact else " :: ", style=pal.faint),
-                Text(f"{interval}s  " if self.compact else f"poll {interval}s  ", style=pal.muted),
+                Text(" " if compact else " :: ", style=pal.faint),
+                Text(f"{interval}s  " if compact else f"poll {interval}s  ", style=pal.muted),
                 Text(keys, style=pal.faint),
             )
         )

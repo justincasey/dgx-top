@@ -182,7 +182,7 @@ No collected telemetry or endpoint response body is written to disk.
 
 ## Layout and small terminals
 
-The dashboard reflows to the terminal it is given. Columns follow width:
+The dashboard is fluid in both axes. Width picks the column count:
 
 | Width       | Layout                                             |
 | ----------- | -------------------------------------------------- |
@@ -190,31 +190,50 @@ The dashboard reflows to the terminal it is given. Columns follow width:
 | `46`–`89`   | Throughput spans two columns, nodes below           |
 | `< 46`      | Everything stacked in one column                    |
 
-The base layout is dense: every tile is eight rows plus its border, so three
-columns need 12 terminal rows in total — about 180 pixels. It keeps the section
-labels, the spelled-out `min`/`avg`/`max` and `Capacity: … tok` values, the
-spaced CPU core grid and a meter of its own per metric, but pairs each sparkline
-with the numbers beside it and puts the prompt/generation ratio on the
-`THROUGHPUT` header and the request counts plus KV risk badge on the
-`KV CACHE` header.
+Height picks the **density**. dgx-top divides the rows left over after the title
+by the number of grid rows the column tier needs, then takes the loosest layout
+that fits — so it degrades one step at a time instead of snapping between
+extremes, and one column simply needs three times the height for the same
+density.
 
-dgx-top compares the height that layout needs (`2` title rows plus `10` per grid
-row) against the terminal. Whenever it would not fit — or the terminal is under
-34 columns — it switches to a **compact tier** rather than clipping tiles into a
-scroll region. Compact folds node tiles into five rows and the throughput tile
-into seven, so a one-column stack fits a 320x320-pixel viewport (roughly 40x21
-cells).
+| Rows per tile | Density   | Look                                                     |
+| ------------- | --------- | -------------------------------------------------------- |
+| `>= 13`       | `roomy`   | `GPU`/`MEMORY`/`CPU` get their own header lines           |
+| `10`–`12`     | `dense`   | Those headers become `GPU`/`MEM`/`CPU` row prefixes       |
+| `< 10`        | `compact` | One-letter prefixes, meters folded onto their value rows  |
 
-No metric is dropped in either tier; in compact they are relocated:
+Within a density nothing is left stranded: the sparklines and meters are elastic,
+so a viewport between two breakpoints grows the waveforms and thickens the bars
+instead of leaving dead space. Growth is bounded — charts stop at eight rows,
+meters at two, tiles at 16 — so a tall terminal stays a dashboard rather than
+turning into wallpaper. Below the compact minimum the grid stops stretching and
+the screen scrolls rather than clipping anything.
+
+Three columns of `dense` tiles fit 12 terminal rows (about 180 pixels); a
+one-column `compact` stack fits a 320x320-pixel viewport, roughly 40x21 cells:
+
+```
+dgx-top ⚡DUAL 5s  +- t r q
+P 0·3600·7200 ▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅
+G 0·1200·2400 ▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅
+2r  1w  h 45%  3:1
+1.2M/3.8M 32%
+████░░░░░░░░░░░░░░░░  ▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅▁▂▃▅
+spark-head Qwen3.6-2…
+G 73% 64°C ██████████████████░░░░░░░░░░░
+M 62G/120G 52% s1.0G ██████████░░░░░░░░░
+C 48% 51°C █████████████░░░░░░░░░░░░░░░░
+■■■■■■■■■■■■■■■■■■■■
+```
+
+No metric is dropped at any size; compact relocates them:
 
 - Section labels shorten to one letter: `G` GPU, `M` memory, `C` CPU,
   `P` prompt throughput, `G` generation throughput.
 - Node value rows share their line with their meter.
-- `min avg max` labels collapse to a fixed `min·avg·max` order, e.g.
-  `P 0·3600·7200`.
-- Throughput has priority: its two sparklines keep full two-row height. The
-  `THROUGHPUT` row disappears and its ratio joins the KV request row
-  (`2r 1w h 45% 3:1`).
+- `min avg max` labels collapse to a fixed `min·avg·max` order.
+- Throughput has priority: its two sparklines keep full height. The
+  `THROUGHPUT` row disappears and its ratio joins the KV request row.
 - Swap shortens to `s1.0G`, and the CPU core grid drops its inter-core spacing
   while still showing every core.
 
