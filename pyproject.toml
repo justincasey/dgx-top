@@ -44,7 +44,7 @@ Issues = "https://github.com/justincasey/dgx-top/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["app", "cli", "collector", "config", "preflight", "stats"]
+py-modules = ["app", "cli", "collector", "config", "preflight", "stats", "themes"]
 
 [tool.setuptools.data-files]
 "share/dgx-top" = ["src/config.example.toml"]

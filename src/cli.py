@@ -22,10 +22,16 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="configuration file (default: $DGX_TOP_CONFIG or ~/.config/dgx-top/config.toml)",
     )
+    parser.add_argument(
+        "--theme",
+        metavar="NAME",
+        help="color theme override (default: the theme from the configuration file)",
+    )
     subparsers = parser.add_subparsers(dest="command")
     init_parser = subparsers.add_parser("init", help="create an editable example configuration")
     init_parser.add_argument("--force", action="store_true", help="replace an existing file")
     subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and vLLM")
+    subparsers.add_parser("themes", help="list available color themes")
     return parser
 
 
@@ -48,15 +54,29 @@ def _init_config(path: Path | None, force: bool) -> int:
     return 0
 
 
+def _list_themes() -> int:
+    """Print every supported theme, marking the default and light themes."""
+    from themes import DEFAULT_THEME, get_theme, theme_names
+
+    print(f"default theme: {DEFAULT_THEME}")
+    for name in theme_names():
+        theme = get_theme(name)
+        note = " (light)" if theme is not None and not theme.dark else ""
+        print(f"  {name}{note}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "init":
         return _init_config(args.config, args.force)
+    if args.command == "themes":
+        return _list_themes()
     try:
         if args.command == "check":
-            settings = load_config(args.config)
+            settings = load_config(args.config, theme=args.theme)
             return asyncio.run(run_preflight(settings))
-        configure(args.config)
+        configure(args.config, theme=args.theme)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
