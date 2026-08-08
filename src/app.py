@@ -4,7 +4,7 @@ import collections
 
 from rich.text import Text
 from textual.app import App, Binding
-from textual.containers import Grid
+from textual.containers import Grid, Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Sparkline, Static
 
@@ -17,6 +17,29 @@ from themes import CUSTOM_THEMES, Palette, build_palette
 
 TEMP_ALERT = 80
 TEMP_WARM = 60
+
+# Responsive tiers. Width picks the column count; the compact tier folds every
+# tile down to five rows so the whole dashboard fits a ~320x320px viewport
+# (roughly 40x21 cells).
+NARROW_WIDTH = 46
+MEDIUM_WIDTH = 90
+COMPACT_WIDTH = 34
+TITLE_HEIGHT = 2
+TILE_HEIGHT = 10
+
+
+def _grid_rows(tiles: int, columns: int) -> int:
+    """Grid rows used by ``tiles`` tiles, honouring the throughput tile's span.
+
+    In the two-column tier the throughput tile spans both columns, so it owns a
+    row of its own; single-column stacks everything.
+    """
+    if columns >= 3:
+        return -(-tiles // columns)
+    if columns == 2:
+        return 1 + -(-(tiles - 1) // 2)
+    return tiles
+
 
 _palette_cache: dict[str, Palette] = {}
 
@@ -120,6 +143,11 @@ def _compute_kv_risk(
 # ─── Widgets ────────────────────────────────────────────────────────────
 
 
+def _compact(widget) -> bool:
+    """True when the app is in its space-starved compact tier."""
+    return bool(getattr(widget.app, "compact", False))
+
+
 class MeterBar(Static):
     """A percentage bar that always fills its available content width."""
 
@@ -153,6 +181,13 @@ class ThroughputTile(Static):
     used_blocks × block_size. This overcounts actual stored tokens (a partially
     filled block counts as fully allocated) but is the correct metric for
     capacity planning: the scheduler cannot use partial blocks.
+
+    The base layout is dense by design: each sparkline shares its two rows with
+    the statistics beside it, the prompt/generation ratio rides on the
+    THROUGHPUT header, and the request counts plus the KV risk badge ride on
+    the KV CACHE header. The compact tier drops the header words and the
+    THROUGHPUT row entirely. Throughput keeps two-row sparklines in both tiers
+    because it is the primary signal; no metric is dropped.
     """
 
     def __init__(self, *args, **kwargs):
@@ -161,20 +196,21 @@ class ThroughputTile(Static):
         self._prompt_data: list[float] = []
         self._prompt_gen_ratio: float = 0.0
         self._kv_data: list[float] = []
+        self._kv: dict | None = None
 
     def compose(self):
-        yield Static("THROUGHPUT", classes="section-header")
-        yield Sparkline(id="tp-prompt-chart")
-        yield Static(id="tp-prompt-stats")
-        yield Sparkline(id="tp-gen-chart")
-        yield Static(id="tp-gen-stats")
-        yield Static(id="tp-ratio")
-        yield Static("KV CACHE", classes="section-header kv-header")
-        yield Static(id="kv-stats")
+        yield Static(id="tp-header", classes="section-header")
+        with Horizontal(classes="tp-pair"):
+            yield Static(id="tp-prompt-stats")
+            yield Sparkline(id="tp-prompt-chart")
+        with Horizontal(classes="tp-pair"):
+            yield Static(id="tp-gen-stats")
+            yield Sparkline(id="tp-gen-chart")
+        yield Static(id="kv-header", classes="section-header kv-header")
         yield Static(id="kv-detail")
-        yield MeterBar(id="kv-bar", classes="meter", metric_color="primary")
-        yield Sparkline(id="kv-usage-chart")
-        yield Static(id="kv-risk")
+        with Horizontal(id="kv-graphics"):
+            yield MeterBar(id="kv-bar", classes="meter", metric_color="primary")
+            yield Sparkline(id="kv-usage-chart")
 
     def on_mount(self):
         self._render_content()
@@ -208,123 +244,153 @@ class ThroughputTile(Static):
             prefix_hit: Prefix cache hit rate (-1 = unavailable)
             kv_history: Per-node KV usage history for sparkline
         """
+        self._kv = dict(
+            pct=pct,
+            req=req,
+            wait=wait,
+            used_tok=used_tok,
+            total_tok=total_tok,
+            prefix_hit=prefix_hit,
+        )
+        if kv_history:
+            self._kv_data = kv_history
+        self._render_kv()
+
+    def _render_kv(self):
+        if self._kv is None:
+            return
+        pct = self._kv["pct"]
+        req = self._kv["req"]
+        wait = self._kv["wait"]
+        used_tok = self._kv["used_tok"]
+        total_tok = self._kv["total_tok"]
+        prefix_hit = self._kv["prefix_hit"]
         pal = _palette_for(self.app)
-        # Line 1: request status with prefix hit rate
-        hit_str = ""
-        if prefix_hit >= 0:
-            hit_str = f"  hit {prefix_hit:.0f}%"
+        compact = _compact(self)
 
+        # Header row: section label, request status, prefix hit rate, the
+        # prompt/generation ratio when the THROUGHPUT row is hidden, and the
+        # risk badge. Everything short enough to share one line.
+        header = Text()
+        if not compact:
+            header.append("KV CACHE   ", style=pal.muted)
         if req > 0 or wait > 0:
-            kv_line1 = Text.assemble(
-                Text(f"{req}r", style=pal.mid),
-                Text(f"  {wait}w", style=pal.muted if wait == 0 else f"bold {pal.fg}"),
-                Text(hit_str, style=f"bold {pal.accent}" if prefix_hit > 0 else pal.muted),
-            )
+            header.append(f"{req}r", style=pal.mid)
+            header.append(f"  {wait}w", style=pal.muted if wait == 0 else f"bold {pal.fg}")
         else:
-            kv_line1 = Text.assemble(
-                Text("idle", style=pal.muted),
-                Text(hit_str, style=f"bold {pal.accent}" if prefix_hit > 0 else pal.muted),
+            header.append("idle", style=pal.muted)
+        if prefix_hit >= 0:
+            header.append(
+                f"  h {prefix_hit:.0f}%" if compact else f"  hit {prefix_hit:.0f}%",
+                style=f"bold {pal.accent}" if prefix_hit > 0 else pal.muted,
             )
-        self.query_one("#kv-stats", Static).update(kv_line1)
+        if compact and self._prompt_gen_ratio > 0:
+            header.append(f"  {self._prompt_gen_ratio:.0f}:1", style=f"bold {pal.fg}")
+        risk = _compute_kv_risk(pct, prefix_hit, used_tok, total_tok, pal)
+        if risk.plain:
+            header.append("  ")
+            header.append_text(risk)
+        self.query_one("#kv-header", Static).update(header)
 
-        # Line 2: capacity-framed token usage (block-allocated capacity)
-        # Format: "Capacity: 1.23M / 3.80M tok (32%)"
+        # Capacity row: block-allocated token capacity.
+        # Wide: "Capacity: 1.2M / 3.8M tok  (32%)"; compact: "1.2M/3.8M 32%".
         if total_tok > 0:
             used_str = _fmt_tokens(used_tok)
             total_str = _fmt_tokens(total_tok)
-            capacity_line = Text.assemble(
-                Text("Capacity: ", style=pal.faint),
-                Text(f"{used_str} / {total_str} tok", style=f"bold {pal.fg}"),
-                Text(f"  ({pct:.0f}%)", style=pal.primary),
-            )
+            if compact:
+                capacity_line = Text.assemble(
+                    Text(f"{used_str}/{total_str}", style=f"bold {pal.fg}"),
+                    Text(f" {pct:.0f}%", style=pal.primary),
+                )
+            else:
+                capacity_line = Text.assemble(
+                    Text("Capacity: ", style=pal.faint),
+                    Text(f"{used_str} / {total_str} tok", style=f"bold {pal.fg}"),
+                    Text(f"  ({pct:.0f}%)", style=pal.primary),
+                )
         else:
-            capacity_line = Text(f"Capacity: {pct:.0f}%", style=pal.primary)
+            capacity_line = Text(
+                f"{pct:.0f}%" if compact else f"Capacity: {pct:.0f}%", style=pal.primary
+            )
         self.query_one("#kv-detail", Static).update(capacity_line)
 
-        # Line 3: MeterBar visual
+        # Graphics row: capacity meter beside the usage history sparkline.
         self.query_one("#kv-bar", MeterBar).update_pct(pct)
+        if self._kv_data:
+            self.query_one("#kv-usage-chart", Sparkline).data = self._kv_data
 
-        # KV usage sparkline from per-node history
-        if kv_history:
-            self._kv_data = kv_history
-            chart = self.query_one("#kv-usage-chart", Sparkline)
-            chart.data = kv_history
-
-        # Line 4: risk assessment (multi-factor like memory thrash)
-        risk = _compute_kv_risk(pct, prefix_hit, used_tok, total_tok, pal)
-        self.query_one("#kv-risk", Static).update(risk)
+    def _stats_line(self, tag: str, vals: list[float], pal: Palette) -> Text:
+        """min/avg/max summary; compact collapses the labels to fixed order."""
+        lo, hi = min(vals), max(vals)
+        avg = sum(vals) / len(vals)
+        if _compact(self):
+            return Text.assemble(
+                Text(f"{tag} ", style=pal.faint),
+                Text(f"{lo:.0f}", style=pal.muted),
+                Text("\u00b7", style=pal.faint),
+                Text(f"{avg:.0f}", style=f"bold {pal.fg}"),
+                Text("\u00b7", style=pal.faint),
+                Text(f"{hi:.0f}", style=pal.mid),
+            )
+        return Text.assemble(
+            Text(f"{tag}  ", style=pal.faint),
+            Text(f"min {lo:.0f}", style=pal.muted),
+            Text("   avg ", style=pal.faint),
+            Text(f"{avg:.0f}", style=f"bold {pal.fg}"),
+            Text("   max ", style=pal.faint),
+            Text(f"{hi:.0f}", style=pal.mid),
+        )
 
     def _render_content(self):
         pal = _palette_for(self.app)
-        prompt_chart = self.query_one("#tp-prompt-chart", Sparkline)
-        prompt_stats = self.query_one("#tp-prompt-stats", Static)
-        if self._prompt_data:
-            p_vals = self._prompt_data
-            prompt_chart.data = p_vals
-            p_avg = sum(p_vals) / len(p_vals)
-            prompt_stats.update(
-                Text.assemble(
-                    Text(f"min {min(p_vals):.0f}", style=pal.muted),
-                    Text("   avg ", style=pal.faint),
-                    Text(f"{p_avg:.0f}", style=f"bold {pal.fg}"),
-                    Text("   max ", style=pal.faint),
-                    Text(f"{max(p_vals):.0f}", style=pal.mid),
-                )
-            )
-        else:
-            prompt_chart.data = []
-            prompt_stats.update(Text("\u2014", style=pal.muted))
 
-        gen_chart = self.query_one("#tp-gen-chart", Sparkline)
-        gen_stats = self.query_one("#tp-gen-stats", Static)
-        if self._gen_data:
-            g_vals = self._gen_data
-            gen_chart.data = g_vals
-            g_avg = sum(g_vals) / len(g_vals)
-            gen_stats.update(
-                Text.assemble(
-                    Text(f"min {min(g_vals):.0f}", style=pal.muted),
-                    Text("   avg ", style=pal.faint),
-                    Text(f"{g_avg:.0f}", style=f"bold {pal.fg}"),
-                    Text("   max ", style=pal.faint),
-                    Text(f"{max(g_vals):.0f}", style=pal.mid),
-                )
-            )
-        else:
-            gen_chart.data = []
-            gen_stats.update(Text("\u2014", style=pal.muted))
+        for tag, data, chart_id, stats_id in (
+            ("P", self._prompt_data, "#tp-prompt-chart", "#tp-prompt-stats"),
+            ("G", self._gen_data, "#tp-gen-chart", "#tp-gen-stats"),
+        ):
+            chart = self.query_one(chart_id, Sparkline)
+            stats = self.query_one(stats_id, Static)
+            if data:
+                chart.data = data
+                stats.update(self._stats_line(tag, data, pal))
+            else:
+                chart.data = []
+                stats.update(Text(f"{tag} \u2014", style=pal.muted))
 
-        ratio_widget = self.query_one("#tp-ratio", Static)
+        header = Text("THROUGHPUT", style=pal.muted)
         if self._prompt_gen_ratio > 0:
-            ratio_widget.update(
-                Text.assemble(
-                    Text("ratio ", style=pal.faint),
-                    Text(f"{self._prompt_gen_ratio:.0f}:1", style=f"bold {pal.fg}"),
-                )
-            )
-        else:
-            ratio_widget.update("")
+            header.append("   ratio ", style=pal.faint)
+            header.append(f"{self._prompt_gen_ratio:.0f}:1", style=f"bold {pal.fg}")
+        self.query_one("#tp-header", Static).update(header)
+        self._render_kv()
 
 
 class NodeTile(Static):
-    """Compact per-Spark hardware tile."""
+    """Dense per-Spark hardware tile.
+
+    The GPU/MEM/CPU section labels are prefixes on their own value rows rather
+    than separate header lines, so each section costs two rows: values then
+    meter. The compact tier shortens the prefixes to one letter, folds the
+    meter onto the value row and drops the core grid's spacing.
+    """
 
     def __init__(self, idx: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.idx = idx
 
     def compose(self):
-        yield Static(id=f"node-label-{self.idx}")
-        yield Static("GPU", classes="section-header gpu-header")
-        yield Static(id=f"node-gpu-row-{self.idx}")
-        yield MeterBar(id=f"node-gpu-bar-{self.idx}", classes="meter", metric_color="secondary")
-        yield Static("MEMORY", classes="section-header memory-header")
-        yield Static(id=f"node-mem-row-{self.idx}")
-        yield MeterBar(id=f"node-mem-bar-{self.idx}", classes="meter", metric_color="ok")
-        yield Static("CPU", classes="section-header cpu-header")
-        yield Static(id=f"node-cpu-row-{self.idx}")
-        yield MeterBar(id=f"node-cpu-bar-{self.idx}", classes="meter", metric_color="accent")
-        yield Static(id=f"node-cpu-grid-{self.idx}", classes="cores")
+        idx = self.idx
+        yield Static(id=f"node-label-{idx}")
+        with Vertical(classes="pair-row"):
+            yield Static(id=f"node-gpu-row-{idx}")
+            yield MeterBar(id=f"node-gpu-bar-{idx}", classes="meter", metric_color="secondary")
+        with Vertical(classes="pair-row"):
+            yield Static(id=f"node-mem-row-{idx}")
+            yield MeterBar(id=f"node-mem-bar-{idx}", classes="meter", metric_color="ok")
+        with Vertical(classes="pair-row"):
+            yield Static(id=f"node-cpu-row-{idx}")
+            yield MeterBar(id=f"node-cpu-bar-{idx}", classes="meter", metric_color="accent")
+        yield Static(id=f"node-cpu-grid-{idx}", classes="cores")
 
     def on_mount(self):
         self._clear()
@@ -339,22 +405,25 @@ class NodeTile(Static):
         idx = self.idx
         online = s.online
         pal = _palette_for(self.app)
+        compact = _compact(self)
         dash = Text("—", style=pal.muted)
         label = s.label
         if s.model_name:
             model = Text(s.model_name)
-            model.truncate(15, overflow="ellipsis")
-            label += f"  {model.plain}"
+            model.truncate(10 if compact else 15, overflow="ellipsis")
+            label += f" {model.plain}" if compact else f"  {model.plain}"
         self.query_one(f"#node-label-{idx}", Static).update(
             Text(label, style=f"bold {pal.fg}" if online else pal.muted)
         )
 
+        gpu_prefix = Text("G " if compact else "GPU  ", style=pal.secondary)
         if online:
             gpu = s.gpu_util_pct
             self.query_one(f"#node-gpu-row-{idx}", Static).update(
                 Text.assemble(
+                    gpu_prefix,
                     Text(f"{gpu:.0f}%", style=pal.secondary),
-                    Text("   "),
+                    Text(" " if compact else "   "),
                     Text(f"{s.temp_c:.0f}°C", style=_temp_style(s.temp_c, pal)),
                 )
             )
@@ -363,52 +432,57 @@ class NodeTile(Static):
             self.query_one(f"#node-gpu-row-{idx}", Static).update(dash)
             self.query_one(f"#node-gpu-bar-{idx}", MeterBar).update_pct(0)
 
+        mem_prefix = Text("M " if compact else "MEM  ", style=pal.ok)
         if s.mem_total_bytes > 0:
             used_gb = s.mem_used_bytes // (1024**3)
             total_gb = s.mem_total_bytes // (1024**3)
             used_pct = s.mem_used_bytes / s.mem_total_bytes * 100
             row = Text.assemble(
+                mem_prefix,
                 Text(f"{used_gb}G", style=f"bold {pal.fg}"),
-                Text(f"/{total_gb}G  ", style=pal.muted),
+                Text(f"/{total_gb}G ", style=pal.muted),
                 Text(f"{used_pct:.0f}%", style=pal.ok),
             )
             if s.swap_total_kb > 0:
                 swap_pct = s.swap_used_kb / s.swap_total_kb * 100
+                swap_gb = s.swap_used_kb / (1024 * 1024)
                 row.append(
-                    f"  swp {s.swap_used_kb / (1024 * 1024):.1f}G",
+                    f" s{swap_gb:.1f}G" if compact else f"  swp {swap_gb:.1f}G",
                     style=f"bold {pal.error}" if swap_pct > 70 else pal.muted,
                 )
             self.query_one(f"#node-mem-row-{idx}", Static).update(row)
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(used_pct)
         elif online:
             self.query_one(f"#node-mem-row-{idx}", Static).update(
-                Text(
-                    f"{s.gpu_mem_pct:.0f}%",
-                    style=pal.ok,
-                )
+                Text.assemble(mem_prefix, Text(f"{s.gpu_mem_pct:.0f}%", style=pal.ok))
             )
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(0)
         else:
             self.query_one(f"#node-mem-row-{idx}", Static).update(dash)
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(0)
 
+        cpu_prefix = Text("C " if compact else "CPU  ", style=pal.accent)
         if online and s.cpu_cores_util:
             avg = sum(s.cpu_cores_util) / len(s.cpu_cores_util)
             self.query_one(f"#node-cpu-row-{idx}", Static).update(
                 Text.assemble(
-                    Text("util  ", style=pal.muted),
+                    cpu_prefix,
                     Text(f"{avg:.0f}%", style=pal.accent),
-                    Text("   temp  ", style=pal.muted),
+                    Text(" " if compact else "   "),
                     Text(f"{s.cpu_temp_c:.0f}°C", style=_temp_style(s.cpu_temp_c, pal)),
                 )
             )
             self.query_one(f"#node-cpu-bar-{idx}", MeterBar).update_pct(avg)
-            core_cells = []
-            for core_idx, util in enumerate(s.cpu_cores_util[:20]):
-                core_cells.append(_grid_cell(util, pal))
-                if core_idx < min(len(s.cpu_cores_util), 20) - 1:
-                    core_cells.append(Text(" "))
-            self.query_one(f"#node-cpu-grid-{idx}", Static).update(Text.assemble(*core_cells))
+            # The grid is one row everywhere, so the inter-core spacing is only
+            # affordable while the tile shares the width with other columns.
+            spaced = not compact and getattr(self.app, "columns", 1) > 1
+            cores = s.cpu_cores_util[:20]
+            cells: list[Text] = []
+            for core_idx, util in enumerate(cores):
+                cells.append(_grid_cell(util, pal))
+                if spaced and core_idx < len(cores) - 1:
+                    cells.append(Text(" "))
+            self.query_one(f"#node-cpu-grid-{idx}", Static).update(Text.assemble(*cells))
         else:
             self.query_one(f"#node-cpu-row-{idx}", Static).update(dash if online else "")
             self.query_one(f"#node-cpu-bar-{idx}", MeterBar).update_pct(0)
@@ -434,20 +508,24 @@ class DGXTop(App):
         content-align: left middle;
         background: $background;
         border-bottom: solid $border-blurred;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
 
+    /* Columns come from the tier; rows are implicit so any node count wraps
+       instead of being clipped to a single grid row. */
     #kpis {
         layout: grid;
-        grid-size: 3 1;
-        grid-columns: 1fr 1fr 1fr;
-        grid-rows: 18;
+        grid-size: 3;
+        grid-rows: 10;
         grid-gutter: 0;
-        height: 18;
+        height: auto;
         background: $background;
     }
 
+    /* Eight content rows per tile plus the border. */
     ThroughputTile, NodeTile {
-        height: 18;
+        height: 10;
         min-width: 20;
         border: solid $border-blurred;
         padding: 0 1;
@@ -455,43 +533,50 @@ class DGXTop(App):
         background: $panel;
     }
 
-    .node-header {
-        height: 1;
-        color: $text;
-        text-style: bold;
-    }
-
     .section-header {
         height: 1;
         color: $text-muted;
-    }
-
-    .gpu-header {
-        color: $secondary 70%;
-    }
-
-    .memory-header {
-        color: $success 70%;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
 
     .kv-header {
         color: $primary 70%;
     }
 
-    .cpu-header {
-        color: $accent 70%;
-    }
-
-    ThroughputTile .section-header {
-        margin-top: 1;
-    }
-
     ThroughputTile > Static, NodeTile > Static {
         height: 1;
     }
 
-    #tp-prompt-chart, #tp-gen-chart {
+    /* Throughput: statistics beside a two-row sparkline. */
+    .tp-pair {
+        layout: horizontal;
         height: 2;
+        width: 1fr;
+    }
+
+    .tp-pair > Static {
+        width: auto;
+        height: 2;
+        content-align: left middle;
+        padding-right: 1;
+    }
+
+    .tp-pair > Sparkline {
+        width: 1fr;
+        height: 2;
+    }
+
+    /* KV: capacity meter beside its usage history. */
+    #kv-graphics {
+        layout: horizontal;
+        height: 1;
+        width: 1fr;
+    }
+
+    #kv-graphics > MeterBar, #kv-graphics > Sparkline {
+        width: 1fr;
+        height: 1;
     }
 
     #tp-prompt-chart > .sparkline--max-color {
@@ -510,10 +595,6 @@ class DGXTop(App):
         color: $accent 35%;
     }
 
-    #kv-usage-chart {
-        height: 2;
-    }
-
     #kv-usage-chart > .sparkline--max-color {
         color: $primary;
     }
@@ -522,13 +603,20 @@ class DGXTop(App):
         color: $primary 30%;
     }
 
-    #kv-risk {
-        height: 1;
-    }
-
-    #tp-prompt-stats, #tp-gen-stats, #tp-ratio, #kv-detail, #kv-stats {
+    #tp-prompt-stats, #tp-gen-stats, #kv-detail {
         text-wrap: nowrap;
         text-overflow: ellipsis;
+    }
+
+    /* A node value row above its meter. Folded onto one line when compact. */
+    .pair-row {
+        layout: vertical;
+        height: 2;
+        width: 1fr;
+    }
+
+    .pair-row > Static {
+        height: 1;
     }
 
     .meter {
@@ -537,12 +625,11 @@ class DGXTop(App):
     }
 
     .cores {
-        height: 2;
+        height: 1;
     }
 
     #kpis.medium {
-        grid-rows: 18 18;
-        height: 36;
+        grid-size: 2;
     }
 
     #kpis.medium ThroughputTile {
@@ -550,10 +637,7 @@ class DGXTop(App):
     }
 
     #kpis.narrow {
-        grid-size: 1 3;
-        grid-columns: 1fr;
-        grid-rows: 18 18 18;
-        height: 54;
+        grid-size: 1;
     }
 
     #kpis.narrow ThroughputTile {
@@ -563,6 +647,54 @@ class DGXTop(App):
     #kpis.narrow ThroughputTile, #kpis.narrow NodeTile {
         min-width: 0;
         padding: 0;
+    }
+
+    /* ── Compact tier ─────────────────────────────────────────────────
+       Borders, padding and the THROUGHPUT row go; node meters fold onto their
+       value rows. Throughput keeps its two-row sparklines. */
+    Screen.compact #title {
+        height: 1;
+        padding: 0;
+        border-bottom: none;
+    }
+
+    Screen.compact ThroughputTile {
+        height: 7;
+        min-width: 0;
+        border: none;
+        padding: 0;
+    }
+
+    Screen.compact NodeTile {
+        height: 5;
+        min-width: 0;
+        border: none;
+        padding: 0;
+    }
+
+    Screen.compact #tp-header {
+        display: none;
+    }
+
+    Screen.compact .pair-row {
+        layout: horizontal;
+        height: 1;
+    }
+
+    Screen.compact .pair-row > Static {
+        width: auto;
+        height: 1;
+        padding-right: 1;
+    }
+
+    Screen.compact .pair-row > MeterBar {
+        width: 1fr;
+        height: 1;
+        padding-right: 0;
+    }
+
+    Screen.compact #kpis {
+        grid-rows: auto;
     }
     """
 
@@ -588,6 +720,8 @@ class DGXTop(App):
         self._poll_timer = None
         self.history: dict[str, collections.deque] = {}
         self._current_topology: str = ""
+        self.compact = False
+        self.columns = 3
 
     def compose(self):
         yield Static(id="title")
@@ -604,13 +738,36 @@ class DGXTop(App):
         self.run_worker(_init_model_names())
 
     def on_resize(self, event) -> None:
+        self._apply_tier(event.size.width, event.size.height)
+
+    def _apply_tier(self, width: int, height: int) -> None:
+        """Pick the column tier and toggle the compact tier.
+
+        Column count follows width. Compact is chosen whenever the dense base
+        layout would not fit the viewport, so the dashboard is never clipped
+        into a scroll region while a shorter version would have fit.
+        """
         kpis = self.query_one("#kpis", Grid)
-        if event.size.width < 46:
+        if width < NARROW_WIDTH:
+            columns = 1
             kpis.set_classes("narrow")
-        elif event.size.width < 90:
+        elif width < MEDIUM_WIDTH:
+            columns = 2
             kpis.set_classes("medium")
         else:
+            columns = 3
             kpis.set_classes("")
+
+        rows = _grid_rows(1 + len(self.settings.nodes), columns)
+        needed = TITLE_HEIGHT + rows * TILE_HEIGHT
+        compact = width < COMPACT_WIDTH or needed > height
+        if compact == self.compact and columns == self.columns:
+            return
+        self.compact = compact
+        self.columns = columns
+        self.screen.set_class(compact, "compact")
+        self._set_title()
+        self._update_ui()
 
     def watch_theme(self, theme_name: str) -> None:
         """Repaint palette-derived Rich content when the theme changes.
@@ -639,14 +796,15 @@ class DGXTop(App):
         pal = _palette_for(self)
         interval = self.poll_speeds[self._poll_speed_idx]
         topo = self._current_topology or "..."
+        keys = "+- t r q" if self.compact else "[+/-]speed [t]heme [r]efresh [q]uit"
         self.query_one("#title", Static).update(
             Text.assemble(
                 Text("dgx-top", style=f"bold {pal.fg}"),
                 Text(" \u26a1", style=pal.faint),
                 Text(topo, style=f"bold {pal.accent}"),
-                Text(" :: ", style=pal.faint),
-                Text(f"poll {interval}s  ", style=pal.muted),
-                Text("[+/-]speed [t]heme [r]efresh [q]uit", style=pal.faint),
+                Text(" " if self.compact else " :: ", style=pal.faint),
+                Text(f"{interval}s  " if self.compact else f"poll {interval}s  ", style=pal.muted),
+                Text(keys, style=pal.faint),
             )
         )
 

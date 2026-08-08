@@ -180,6 +180,44 @@ switch is session-only — set `theme` in the configuration file to make it stic
 
 No collected telemetry or endpoint response body is written to disk.
 
+## Layout and small terminals
+
+The dashboard reflows to the terminal it is given. Columns follow width:
+
+| Width       | Layout                                             |
+| ----------- | -------------------------------------------------- |
+| `>= 90`     | Throughput and both nodes side by side (3 columns)  |
+| `46`–`89`   | Throughput spans two columns, nodes below           |
+| `< 46`      | Everything stacked in one column                    |
+
+The base layout is dense: every tile is eight rows plus its border, so three
+columns need 12 terminal rows in total — about 180 pixels. It keeps the section
+labels, the spelled-out `min`/`avg`/`max` and `Capacity: … tok` values, the
+spaced CPU core grid and a meter of its own per metric, but pairs each sparkline
+with the numbers beside it and puts the prompt/generation ratio on the
+`THROUGHPUT` header and the request counts plus KV risk badge on the
+`KV CACHE` header.
+
+dgx-top compares the height that layout needs (`2` title rows plus `10` per grid
+row) against the terminal. Whenever it would not fit — or the terminal is under
+34 columns — it switches to a **compact tier** rather than clipping tiles into a
+scroll region. Compact folds node tiles into five rows and the throughput tile
+into seven, so a one-column stack fits a 320x320-pixel viewport (roughly 40x21
+cells).
+
+No metric is dropped in either tier; in compact they are relocated:
+
+- Section labels shorten to one letter: `G` GPU, `M` memory, `C` CPU,
+  `P` prompt throughput, `G` generation throughput.
+- Node value rows share their line with their meter.
+- `min avg max` labels collapse to a fixed `min·avg·max` order, e.g.
+  `P 0·3600·7200`.
+- Throughput has priority: its two sparklines keep full two-row height. The
+  `THROUGHPUT` row disappears and its ratio joins the KV request row
+  (`2r 1w h 45% 3:1`).
+- Swap shortens to `s1.0G`, and the CPU core grid drops its inter-core spacing
+  while still showing every core.
+
 ## Controls
 
 | Key | Action              |
