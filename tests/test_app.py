@@ -73,3 +73,59 @@ def test_custom_themes_are_registered(tmp_path: Path):
     assert app.get_theme("tokyo-night-storm") is not None
     assert app.get_theme("tokyo-night-light") is not None
     assert app.get_theme("tokyo-night") is not None  # Textual built-in
+
+
+async def test_meter_bar_keeps_one_base_color_at_all_utilizations():
+    from textual.app import App, ComposeResult
+
+    from app import MeterBar
+    from themes import CUSTOM_THEMES, build_palette, get_theme
+
+    class MeterHarness(App):
+        CSS = "MeterBar { width: 10; height: 1; }"
+
+        def __init__(self):
+            super().__init__()
+            for theme in CUSTOM_THEMES:
+                self.register_theme(theme)
+            self.theme = "dgx-dark"
+
+        def compose(self) -> ComposeResult:
+            yield MeterBar(metric_color="secondary", id="meter")
+
+    app = MeterHarness()
+    async with app.run_test(size=(20, 5)) as pilot:
+        meter = app.query_one("#meter", MeterBar)
+        palette = build_palette(get_theme("dgx-dark"))
+
+        meter.update_pct(25)
+        await pilot.pause()
+        low_style = str(meter.render().spans[0].style)
+
+        meter.update_pct(95)
+        await pilot.pause()
+        high_style = str(meter.render().spans[0].style)
+
+    assert low_style.lower() == palette.secondary.lower()
+    assert high_style.lower() == palette.secondary.lower()
+
+
+def test_cpu_core_cells_keep_one_hue_and_gain_saturation():
+    from app import _grid_cell
+    from themes import build_palette, get_theme
+
+    palette = build_palette(get_theme("dgx-dark"))
+
+    assert str(_grid_cell(0, palette).style) != palette.accent
+    assert str(_grid_cell(100, palette).style).lower() == palette.accent.lower()
+    assert str(_grid_cell(100, palette).style).lower() != palette.error.lower()
+
+
+def test_light_theme_cpu_ramp_remains_distinct():
+    from app import _metric_ramp
+    from themes import build_palette, get_theme
+
+    palette = build_palette(get_theme("tokyo-night-light"))
+
+    assert _metric_ramp(0, palette, "accent") != palette.background
+    assert _metric_ramp(100, palette, "accent") == palette.accent

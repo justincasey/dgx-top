@@ -39,18 +39,19 @@ def _lerp_hex(start: str, end: str, t: float) -> str:
     return "#" + "".join(f"{round(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
 
 
+def _metric_ramp(value: float, pal: Palette, color: str) -> str:
+    """Increase a theme color's saturation as utilization rises."""
+    clamped = max(0.0, min(100.0, value))
+    hue = getattr(pal, color)
+    if clamped == 100:
+        return hue
+    low = _lerp_hex(hue, pal.background, 0.55)
+    return _lerp_hex(low, hue, clamped / 100)
+
+
 def _grid_cell(util: float, pal: Palette) -> Text:
-    """Render a fixed square whose brightness tracks core utilization."""
-    clamped = max(0.0, min(100.0, util))
-    return Text("\u25a0", style=_lerp_hex(pal.grid_lo, pal.fg, clamped / 100))
-
-
-def _val_style(v: float, pal: Palette, hi: float = 70, lo: float = 20) -> str:
-    if v >= hi:
-        return f"bold {pal.fg}"
-    if v <= lo:
-        return pal.muted
-    return pal.mid
+    """Render a CPU square with saturation proportional to utilization."""
+    return Text("\u25a0", style=_metric_ramp(util, pal, "accent"))
 
 
 def _temp_style(c: float, pal: Palette) -> str:
@@ -122,8 +123,9 @@ def _compute_kv_risk(
 class MeterBar(Static):
     """A percentage bar that always fills its available content width."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, metric_color: str = "primary", **kwargs):
         super().__init__(*args, **kwargs)
+        self._metric_color = metric_color
         self._pct = 0.0
 
     def update_pct(self, pct: float) -> None:
@@ -136,12 +138,7 @@ class MeterBar(Static):
             return Text()
         pal = _palette_for(self.app)
         filled = round(self._pct / 100 * width)
-        if self._pct >= 80:
-            fill_style = f"bold {pal.fg}"
-        elif self._pct >= 50:
-            fill_style = pal.dim
-        else:
-            fill_style = pal.muted
+        fill_style = getattr(pal, self._metric_color)
         return Text.assemble(
             Text("\u2588" * filled, style=fill_style),
             Text("\u2591" * (width - filled), style=pal.faint),
@@ -172,10 +169,10 @@ class ThroughputTile(Static):
         yield Sparkline(id="tp-gen-chart")
         yield Static(id="tp-gen-stats")
         yield Static(id="tp-ratio")
-        yield Static("KV CACHE", classes="section-header")
+        yield Static("KV CACHE", classes="section-header kv-header")
         yield Static(id="kv-stats")
         yield Static(id="kv-detail")
-        yield MeterBar(id="kv-bar", classes="meter")
+        yield MeterBar(id="kv-bar", classes="meter", metric_color="primary")
         yield Sparkline(id="kv-usage-chart")
         yield Static(id="kv-risk")
 
@@ -238,10 +235,10 @@ class ThroughputTile(Static):
             capacity_line = Text.assemble(
                 Text("Capacity: ", style=pal.faint),
                 Text(f"{used_str} / {total_str} tok", style=f"bold {pal.fg}"),
-                Text(f"  ({pct:.0f}%)", style=pal.dim),
+                Text(f"  ({pct:.0f}%)", style=pal.primary),
             )
         else:
-            capacity_line = Text(f"Capacity: {pct:.0f}%", style=pal.dim)
+            capacity_line = Text(f"Capacity: {pct:.0f}%", style=pal.primary)
         self.query_one("#kv-detail", Static).update(capacity_line)
 
         # Line 3: MeterBar visual
@@ -318,15 +315,15 @@ class NodeTile(Static):
 
     def compose(self):
         yield Static(id=f"node-label-{self.idx}")
-        yield Static("GPU", classes="section-header")
+        yield Static("GPU", classes="section-header gpu-header")
         yield Static(id=f"node-gpu-row-{self.idx}")
-        yield MeterBar(id=f"node-gpu-bar-{self.idx}", classes="meter")
-        yield Static("MEMORY", classes="section-header")
+        yield MeterBar(id=f"node-gpu-bar-{self.idx}", classes="meter", metric_color="secondary")
+        yield Static("MEMORY", classes="section-header memory-header")
         yield Static(id=f"node-mem-row-{self.idx}")
-        yield MeterBar(id=f"node-mem-bar-{self.idx}", classes="meter")
-        yield Static("CPU", classes="section-header")
+        yield MeterBar(id=f"node-mem-bar-{self.idx}", classes="meter", metric_color="ok")
+        yield Static("CPU", classes="section-header cpu-header")
         yield Static(id=f"node-cpu-row-{self.idx}")
-        yield MeterBar(id=f"node-cpu-bar-{self.idx}", classes="meter")
+        yield MeterBar(id=f"node-cpu-bar-{self.idx}", classes="meter", metric_color="accent")
         yield Static(id=f"node-cpu-grid-{self.idx}", classes="cores")
 
     def on_mount(self):
@@ -356,7 +353,7 @@ class NodeTile(Static):
             gpu = s.gpu_util_pct
             self.query_one(f"#node-gpu-row-{idx}", Static).update(
                 Text.assemble(
-                    Text(f"{gpu:.0f}%", style=_val_style(gpu, pal)),
+                    Text(f"{gpu:.0f}%", style=pal.secondary),
                     Text("   "),
                     Text(f"{s.temp_c:.0f}°C", style=_temp_style(s.temp_c, pal)),
                 )
@@ -373,7 +370,7 @@ class NodeTile(Static):
             row = Text.assemble(
                 Text(f"{used_gb}G", style=f"bold {pal.fg}"),
                 Text(f"/{total_gb}G  ", style=pal.muted),
-                Text(f"{used_pct:.0f}%", style=_val_style(used_pct, pal, 80)),
+                Text(f"{used_pct:.0f}%", style=pal.ok),
             )
             if s.swap_total_kb > 0:
                 swap_pct = s.swap_used_kb / s.swap_total_kb * 100
@@ -385,7 +382,10 @@ class NodeTile(Static):
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(used_pct)
         elif online:
             self.query_one(f"#node-mem-row-{idx}", Static).update(
-                Text(f"{s.gpu_mem_pct:.0f}%", style=_val_style(s.gpu_mem_pct, pal, 80))
+                Text(
+                    f"{s.gpu_mem_pct:.0f}%",
+                    style=pal.ok,
+                )
             )
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(0)
         else:
@@ -397,7 +397,7 @@ class NodeTile(Static):
             self.query_one(f"#node-cpu-row-{idx}", Static).update(
                 Text.assemble(
                     Text("util  ", style=pal.muted),
-                    Text(f"{avg:.0f}%", style=_val_style(avg, pal)),
+                    Text(f"{avg:.0f}%", style=pal.accent),
                     Text("   temp  ", style=pal.muted),
                     Text(f"{s.cpu_temp_c:.0f}°C", style=_temp_style(s.cpu_temp_c, pal)),
                 )
@@ -464,6 +464,22 @@ class DGXTop(App):
     .section-header {
         height: 1;
         color: $text-muted;
+    }
+
+    .gpu-header {
+        color: $secondary 70%;
+    }
+
+    .memory-header {
+        color: $success 70%;
+    }
+
+    .kv-header {
+        color: $primary 70%;
+    }
+
+    .cpu-header {
+        color: $accent 70%;
     }
 
     ThroughputTile .section-header {
