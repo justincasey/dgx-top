@@ -157,3 +157,174 @@ async def test_theme_binding_opens_picker_and_repaints_title(tmp_path: Path):
         after = [(str(span.style), span.text) for span in title.content.render(app.console)]
 
     assert before != after
+
+
+def _two_node_config(path: Path) -> None:
+    path.write_text(
+        """
+[app]
+poll_interval = 5
+history_length = 25
+
+[[nodes]]
+label = "head"
+ssh_target = "head"
+vllm_url = "http://head.example.com:8000"
+
+[[nodes]]
+label = "worker"
+ssh_target = "worker"
+vllm_url = "http://worker.example.com:8000"
+"""
+    )
+
+
+def _fake_cluster():
+    from stats import ClusterStats, SparkUnitStats, TopologyInfo
+
+    units = []
+    for index, label in enumerate(("head", "worker")):
+        unit = SparkUnitStats(label=label)
+        unit.online = True
+        unit.model_hosted = index == 0
+        unit.model_name = "Qwen3.6-27B-Instruct"
+        unit.gpu_util_pct = 73.0
+        unit.temp_c = 64.0
+        unit.mem_used_bytes = 62 * 1024**3
+        unit.mem_total_bytes = 120 * 1024**3
+        unit.swap_total_kb = 4 * 1024 * 1024
+        unit.swap_used_kb = 1 * 1024 * 1024
+        unit.cpu_cores_util = [50.0] * 20
+        unit.cpu_temp_c = 51.0
+        unit.kv_cache_pct = 32.0
+        unit.kv_total_tokens = 3_800_000
+        unit.kv_cache_used_tokens = 1_230_000
+        unit.kv_prefix_hit_rate = 45.0
+        unit.requests_running = 2
+        unit.requests_waiting = 1
+        unit.prompt_gen_ratio = 3.0
+        unit.throughput_tok_s = 1200.0
+        unit.prompt_throughput_tok_s = 3600.0
+        units.append(unit)
+    return ClusterStats(units=units, topology=TopologyInfo(topology_type="DUAL"))
+
+
+async def test_compact_tier_fits_a_320x320_viewport(tmp_path: Path, monkeypatch):
+    """A ~320x320px viewport (40x21 cells) must show every tile and metric."""
+    from textual.widgets import Static
+
+    import app as app_module
+    from app import DGXTop, NodeTile, ThroughputTile
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+
+    async def fake_poll():
+        return _fake_cluster()
+
+    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
+
+    app = DGXTop()
+    async with app.run_test(size=(40, 21)) as pilot:
+        await pilot.pause()
+
+        assert app.compact is True
+        throughput = app.query_one(ThroughputTile)
+        nodes = list(app.query(NodeTile))
+        assert len(nodes) == 2
+        # Throughput is the priority signal: it keeps two-row sparklines and so
+        # gets two rows more than a node tile.
+        assert throughput.region.height == 7
+        for tile in [throughput, *nodes]:
+            assert tile.region.bottom <= 21, f"{tile.id} overflows the viewport"
+        for node in nodes:
+            assert node.region.height == 5
+
+        def text(selector: str) -> str:
+            return app.query_one(selector, Static).content.plain
+
+        # Every metric survives the fold: throughput min/avg/max for both
+        # streams, requests/waiting/hit-rate/ratio, KV capacity, and the
+        # per-node GPU/memory/swap/CPU values plus all 20 core cells.
+        prompt_stats = text("#tp-prompt-stats")
+        assert prompt_stats.startswith("P ") and "7200" in prompt_stats
+        gen_stats = text("#tp-gen-stats")
+        assert gen_stats.startswith("G ") and "2400" in gen_stats
+        assert text("#kv-header") == "2r  1w  h 45%  3:1"
+        assert text("#kv-detail") == "1.2M/3.8M 32%"
+        for idx in (0, 1):
+            assert text(f"#node-gpu-row-{idx}") == "G 73% 64°C"
+            assert text(f"#node-mem-row-{idx}") == "M 62G/120G 52% s1.0G"
+            assert text(f"#node-cpu-row-{idx}") == "C 50% 51°C"
+            assert text(f"#node-cpu-grid-{idx}").count("\u25a0") == 20
+
+
+async def test_medium_tier_shows_every_node_tile(tmp_path: Path):
+    """The two-column tier must wrap onto a second row, not clip a node."""
+    from app import DGXTop, NodeTile
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+
+    app = DGXTop()
+    async with app.run_test(size=(70, 60)) as pilot:
+        app.cluster = _fake_cluster()
+        app._update_ui()
+        await pilot.pause()
+
+        assert app.compact is False
+        assert app.query_one("#kpis").has_class("medium")
+        heights = sorted(tile.region.height for tile in app.query(NodeTile))
+        assert heights == [10, 10]
+
+
+async def test_compact_engages_until_the_dense_layout_actually_fits(tmp_path: Path):
+    """The tier follows required height, not an arbitrary row threshold.
+
+    One column of three 10-row tiles plus the title needs 32 rows, so a 20-row
+    viewport must compact instead of clipping the stack into a scroll region.
+    """
+    from app import DGXTop
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+
+    app = DGXTop()
+    async with app.run_test(size=(40, 20)) as pilot:
+        await pilot.pause()
+        assert app.compact is True
+
+        await pilot.resize_terminal(40, 32)
+        await pilot.pause()
+        assert app.compact is False
+
+
+async def test_dense_layout_fits_a_180_pixel_tall_viewport(tmp_path: Path):
+    """At three columns the base layout must fit 12 rows (~180px)."""
+    from app import DGXTop, NodeTile, ThroughputTile
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+
+    app = DGXTop()
+    async with app.run_test(size=(180, 12)) as pilot:
+        app.cluster = _fake_cluster()
+        app._update_ui()
+        await pilot.pause()
+
+        assert app.compact is False
+        kpis = app.query_one("#kpis")
+        assert not kpis.has_class("narrow") and not kpis.has_class("medium")
+        tiles = list(app.query(ThroughputTile)) + list(app.query(NodeTile))
+        for tile in tiles:
+            assert tile.region.height == 10
+            assert tile.region.bottom <= 12, f"{tile.id} overflows the viewport"
+        # Every child row is inside the tile, i.e. nothing is clipped by the
+        # border the way the KV risk row used to be.
+        for tile in tiles:
+            for child in tile.walk_children():
+                assert child.region.bottom <= tile.region.bottom - 1
