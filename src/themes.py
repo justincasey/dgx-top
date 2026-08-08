@@ -18,9 +18,24 @@ from textual.theme import BUILTIN_THEMES, Theme
 DEFAULT_THEME = "dgx-dark"
 """Default theme name; reproduces the classic dgx-top look."""
 
-# Tokyo Night palettes from folke/tokyonight.nvim. ``tokyo-night`` (night) is a
-# Textual built-in; storm and light are registered here so the full family is
-# available.
+# Tokyo Night palettes from folke/tokyonight.nvim. All three variants are
+# registered here: Textual's built-in ``tokyo-night`` uses ``fg_gutter``
+# (#414868) as its panel color, which washes out the dashboard tiles against
+# the #1A1B26 background, so it is overridden with the darker canonical night
+# bg_dark/bg_float pair.
+_TOKYO_NIGHT = dict(
+    primary="#BB9AF7",  # magenta
+    secondary="#7AA2F7",  # blue
+    warning="#E0AF68",  # yellow
+    error="#F7768E",  # red
+    success="#9ECE6A",  # green
+    accent="#FF9E64",  # orange
+    foreground="#C0CAF5",
+    background="#1A1B26",
+    surface="#16161E",
+    panel="#1F2335",
+)
+
 _TOKYO_STORM = dict(
     primary="#BB9AF7",  # magenta
     secondary="#7AA2F7",  # blue
@@ -64,6 +79,10 @@ CUSTOM_THEMES: list[Theme] = [
             "text-muted": "#9AA0A6",
             "border-blurred": "#2A2A2A",
         },
+    ),
+    Theme(
+        name="tokyo-night",
+        **_TOKYO_NIGHT,
     ),
     Theme(
         name="tokyo-night-storm",
