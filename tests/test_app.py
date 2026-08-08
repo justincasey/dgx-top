@@ -129,3 +129,31 @@ def test_light_theme_cpu_ramp_remains_distinct():
 
     assert _metric_ramp(0, palette, "accent") != palette.background
     assert _metric_ramp(100, palette, "accent") == palette.accent
+
+
+async def test_theme_binding_opens_picker_and_repaints_title(tmp_path: Path):
+    from textual.widgets import Static
+
+    path = tmp_path / "config.toml"
+    _config(path)
+    configure(path)
+
+    from app import DGXTop
+
+    app = DGXTop()
+    async with app.run_test(size=(120, 40)) as pilot:
+        title = app.query_one("#title", Static)
+        assert "[t]heme" in title.content.plain
+        before = [(str(span.style), span.text) for span in title.content.render(app.console)]
+
+        await pilot.press("t")
+        await pilot.pause()
+        assert type(app.screen).__name__ == "CommandPalette"
+        await pilot.press("escape")
+        await pilot.pause()
+
+        app.theme = "tokyo-night-storm"
+        await pilot.pause()
+        after = [(str(span.style), span.text) for span in title.content.render(app.console)]
+
+    assert before != after

@@ -569,6 +569,7 @@ class DGXTop(App):
     BINDINGS = [
         Binding("plus", "poll_faster", "Faster"),
         Binding("minus", "poll_slower", "Slower"),
+        Binding("t", "change_theme", "Theme"),
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
     ]
@@ -611,6 +612,18 @@ class DGXTop(App):
         else:
             kpis.set_classes("")
 
+    def watch_theme(self, theme_name: str) -> None:
+        """Repaint palette-derived Rich content when the theme changes.
+
+        Textual restyles CSS itself, but the title and tile bodies are
+        rendered as ``Text`` with colors resolved from the active theme, so
+        they must be rebuilt immediately instead of waiting for the next poll.
+        """
+        if not self.is_running:
+            return
+        self._set_title()
+        self._update_ui()
+
     def _current_interval(self) -> int:
         return self.poll_speeds[self._poll_speed_idx]
 
@@ -633,7 +646,7 @@ class DGXTop(App):
                 Text(topo, style=f"bold {pal.accent}"),
                 Text(" :: ", style=pal.faint),
                 Text(f"poll {interval}s  ", style=pal.muted),
-                Text("[+/-]speed [r]efresh [q]uit", style=pal.faint),
+                Text("[+/-]speed [t]heme [r]efresh [q]uit", style=pal.faint),
             )
         )
 

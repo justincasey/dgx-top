@@ -164,6 +164,12 @@ Tokyo Night family — plus the classic `dgx-dark` default:
 Run `dgx-top themes` for the complete list. An unknown theme name is rejected
 with the available options when the configuration is loaded.
 
+### Switching themes while running
+
+Press `t` in the dashboard to open a fuzzy theme picker. Highlighting an entry
+previews it live and `enter` keeps it; `escape` restores the previous theme. The
+switch is session-only — set `theme` in the configuration file to make it stick.
+
 ## Preflight checks
 
 `dgx-top check` tests every node concurrently:
