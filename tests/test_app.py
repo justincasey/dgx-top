@@ -391,6 +391,65 @@ async def test_no_row_is_clipped_at_any_viewport(tmp_path: Path, monkeypatch):
                     )
 
 
+async def test_history_charts_hold_full_pair_width(tmp_path: Path, monkeypatch):
+    """All three history bar charts must span the whole tile width at every tier.
+
+    Each label floats over its chart (``position: absolute``) so it takes no
+    horizontal space and cannot starve the chart. Every chart -- prompt,
+    generation, and KV usage -- must fill the entire tile width, with its label
+    overlaid on top rather than sitting beside it.
+    """
+    from textual.widgets import Sparkline, Static
+
+    from app import DGXTop
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+    _stub_polling(monkeypatch)
+
+    app = DGXTop()
+    async with app.run_test(size=(180, 40)) as pilot:
+        await pilot.pause()
+
+        # Three columns, two columns, and the compact ~320x320px narrow
+        # single-column tier ((40, 21), the same viewport the compact test uses).
+        for width, height in ((180, 22), (120, 22), (70, 24), (46, 30), (40, 21)):
+            await _resize(pilot, width, height)
+
+            tile = app.query_one("#kpi-throughput")
+            charts = [
+                app.query_one(cid, Sparkline)
+                for cid in ("#tp-prompt-chart", "#tp-gen-chart", "#kv-usage-chart")
+            ]
+            for chart in charts:
+                assert chart.region.width == tile.content_size.width, (
+                    f"{chart.id} is {chart.region.width}/{tile.content_size.width} "
+                    f"at {width}x{height}"
+                )
+            # Each label floats on the top row, left-aligned with the chart, and
+            # the chart plot is offset one row below it so the bars form a clean
+            # rectangle instead of rising past the label. The label shares the
+            # chart's left edge and sits exactly one row above the plot.
+            labels = ("#tp-prompt-stats", "#tp-gen-stats", "#kv-detail")
+            for stats_id, chart in zip(labels, charts):
+                stats = app.query_one(stats_id, Static)
+                assert stats.styles.position == "absolute"
+                assert stats.region.x == chart.region.x, (
+                    f"{stats_id} should share {chart.id}'s left edge, not sit beside "
+                    f"it, got {stats.region} vs {chart.region} at {width}x{height}"
+                )
+                assert stats.region.height == 1 and stats.region.y == chart.region.y - 1, (
+                    f"{stats_id} should be a one-row label directly above {chart.id}, "
+                    f"got {stats.region} vs {chart.region} at {width}x{height}"
+                )
+                assert stats.region.width < chart.region.width, (
+                    f"{stats_id} should be a floating label inside the chart span, "
+                    f"got width {stats.region.width} vs {chart.region.width} "
+                    f"at {width}x{height}"
+                )
+
+
 async def test_dense_layout_fits_a_180_pixel_tall_viewport(tmp_path: Path, monkeypatch):
     """At three columns the dense layout must fit 12 rows (~180px)."""
     from app import DGXTop, NodeTile, ThroughputTile

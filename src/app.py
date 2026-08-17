@@ -216,9 +216,9 @@ class ThroughputTile(Static):
     filled block counts as fully allocated) but is the correct metric for
     capacity planning: the scheduler cannot use partial blocks.
 
-    The base layout is dense by design: each sparkline shares its two rows with
-    the statistics beside it, the prompt/generation ratio rides on the
-    THROUGHPUT header, and the request counts plus the KV risk badge ride on
+    The base layout is dense by design: each sparkline fills its pair row with
+    the statistics floating on top of it, the prompt/generation ratio rides on
+    the THROUGHPUT header, and the request counts plus the KV risk badge ride on
     the KV CACHE header. The compact tier drops the header words and the
     THROUGHPUT row entirely. Throughput keeps two-row sparklines in both tiers
     because it is the primary signal; no metric is dropped.
@@ -235,16 +235,15 @@ class ThroughputTile(Static):
     def compose(self):
         yield Static(id="tp-header", classes="section-header")
         with Horizontal(classes="tp-pair"):
-            yield Static(id="tp-prompt-stats")
             yield Sparkline(id="tp-prompt-chart")
+            yield Static(id="tp-prompt-stats")
         with Horizontal(classes="tp-pair"):
-            yield Static(id="tp-gen-stats")
             yield Sparkline(id="tp-gen-chart")
+            yield Static(id="tp-gen-stats")
         yield Static(id="kv-header", classes="section-header kv-header")
-        yield Static(id="kv-detail")
-        with Horizontal(id="kv-graphics"):
-            yield MeterBar(id="kv-bar", classes="meter", metric_color="primary")
+        with Vertical(id="kv-graphics"):
             yield Sparkline(id="kv-usage-chart")
+            yield Static(id="kv-detail")
 
     def on_mount(self):
         self._render_content()
@@ -346,10 +345,12 @@ class ThroughputTile(Static):
             capacity_line = Text(
                 f"{pct:.0f}%" if compact else f"Capacity: {pct:.0f}%", style=pal.primary
             )
-        self.query_one("#kv-detail", Static).update(capacity_line)
-
-        # Graphics row: capacity meter beside the usage history sparkline.
-        self.query_one("#kv-bar", MeterBar).update_pct(pct)
+        # The capacity line floats over the usage chart (position: absolute) so
+        # the chart runs full width beneath it; force a layout pass so the auto
+        # width tracks the new text.
+        kv_detail = self.query_one("#kv-detail", Static)
+        kv_detail.update(capacity_line)
+        kv_detail.refresh(layout=True)
         if self._kv_data:
             self.query_one("#kv-usage-chart", Sparkline).data = self._kv_data
 
@@ -390,6 +391,9 @@ class ThroughputTile(Static):
             else:
                 chart.data = []
                 stats.update(Text(f"{tag} \u2014", style=pal.muted))
+            # The stats float (position: absolute, width: auto) over the chart;
+            # force a layout pass so the auto width tracks the new text.
+            stats.refresh(layout=True)
 
         header = Text("THROUGHPUT", style=pal.muted)
         if self._prompt_gen_ratio > 0:
@@ -625,48 +629,57 @@ class DGXTop(App):
         height: 1;
     }
 
-    /* Throughput: statistics beside an elastic sparkline. The charts carry
-       twice the weight of the KV graphics row, so leftover height lands in the
-       waveforms and the tile fills exactly. */
+    /* Throughput: the history chart fills the whole pair row and the
+       statistics float on top of it. The chart carries twice the weight of the
+       KV graphics row, so leftover height lands in the waveforms and the tile
+       fills exactly. */
     .tp-pair {
-        layout: horizontal;
+        layout: vertical;
         height: 2fr;
         min-height: 2;
         width: 1fr;
     }
 
     .tp-pair > Static {
+        position: absolute;
         width: auto;
-        height: 100%;
-        content-align: left middle;
+        height: 1;
+        content-align: left top;
         padding-right: 1;
     }
 
-    /* Charts grow with the layout but stop before they turn into wallpaper. */
+    /* Charts grow with the layout but stop before they turn into wallpaper.
+       The top row is reserved for the floating label so the plot is a clean
+       rectangle beneath it rather than rising past the label on the right. */
     .tp-pair > Sparkline {
-        width: 1fr;
-        height: 100%;
+        width: 100%;
+        height: 1fr;
         max-height: 8;
+        margin-top: 1;
     }
 
-    /* KV: capacity meter beside its usage history. */
+    /* KV: the usage history chart fills the full width and the capacity line
+       floats on top of it, matching the throughput charts. */
     #kv-graphics {
-        layout: horizontal;
+        layout: vertical;
         height: 1fr;
-        min-height: 1;
+        min-height: 2;
         width: 1fr;
+    }
+
+    #kv-graphics > Static {
+        position: absolute;
+        width: auto;
+        height: 1;
+        content-align: left top;
+        padding-right: 1;
     }
 
     #kv-graphics > Sparkline {
-        width: 1fr;
-        height: 100%;
+        width: 100%;
+        height: 1fr;
         max-height: 6;
-    }
-
-    #kv-graphics > MeterBar {
-        width: 1fr;
-        height: 100%;
-        max-height: 2;
+        margin-top: 1;
     }
 
     #tp-prompt-chart > .sparkline--max-color {
