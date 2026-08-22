@@ -117,6 +117,87 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.kv_total_blocks, 5000)
 
 
+class NonFiniteVllmMetricsTests(unittest.TestCase):
+    """Non-finite vLLM metrics (NaN/Inf) must be dropped, never reach the UI.
+
+    A NaN/Inf in the chart history crashes the Textual Sparkline renderer and
+    exits the whole app, so the parser has to keep them out.
+    """
+
+    def test_nan_kv_usage_perc_is_ignored(self):
+        stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} NaN\n')
+
+        self.assertEqual(stats.kv_cache_pct, 0.0)
+
+    def test_overflowing_kv_usage_is_ignored(self):
+        # 1e308 * 100 overflows to inf even though the raw value is finite.
+        stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} 1e308\n')
+
+        self.assertEqual(stats.kv_cache_pct, 0.0)
+
+    def test_nan_kv_usage_does_not_derive_block_counts(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:cache_config_info{block_size="16",num_gpu_blocks="10000"} 1.0\n'
+            'vllm:kv_cache_usage_perc{model_name="a"} NaN\n'
+        )
+
+        self.assertEqual(stats.kv_cache_pct, 0.0)
+        self.assertEqual(stats.kv_cache_free_blocks, 0)
+        self.assertEqual(stats.kv_cache_used_tokens, 0)
+        self.assertEqual(stats.kv_total_tokens, 10000 * 16)
+
+    def test_inf_generation_tokens_are_ignored(self):
+        stats = collector._parse_vllm_metrics('vllm:generation_tokens{model_name="a"} +Inf\n')
+
+        self.assertEqual(stats.generation_tokens_total, 0.0)
+        self.assertFalse(stats.model_hosted)
+
+    def test_finite_generation_tokens_survive_a_bad_series(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:generation_tokens{model_name="a"} NaN\n'
+            'vllm:generation_tokens{model_name="b"} 100.0\n'
+        )
+
+        self.assertEqual(stats.generation_tokens_total, 100.0)
+        self.assertTrue(stats.model_hosted)
+
+    def test_inf_requests_running_does_not_break_parse(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:num_requests_running{model_name="a"} +Inf\n'
+            'vllm:generation_tokens{model_name="b"} 5.0\n'
+        )
+
+        self.assertEqual(stats.requests_running, 0)
+        self.assertTrue(stats.model_hosted)
+
+    def test_inf_requests_waiting_does_not_break_parse(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:num_requests_waiting{model_name="a"} +Inf\n'
+            'vllm:generation_tokens{model_name="b"} 5.0\n'
+        )
+
+        self.assertEqual(stats.requests_waiting, 0)
+        self.assertTrue(stats.model_hosted)
+
+    def test_inf_request_generation_tokens_sum_is_ignored(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:request_generation_tokens_sum{model_name="a"} +Inf\n'
+        )
+
+        self.assertEqual(stats.generation_tokens_total, 0.0)
+        self.assertFalse(stats.model_hosted)
+
+    def test_nan_prefix_hit_rate_is_ignored(self):
+        stats = collector._parse_vllm_metrics('vllm:prefix_cache_hit_rate{model_name="a"} NaN\n')
+
+        self.assertEqual(stats.kv_prefix_hit_rate, -1.0)
+
+    def test_nan_prompt_tokens_are_ignored(self):
+        stats = collector._parse_vllm_metrics('vllm:prompt_tokens{model_name="a"} NaN\n')
+
+        self.assertEqual(stats.prompt_tokens_total, 0.0)
+
+
 class ClusterStatsKvAggregationTests(unittest.TestCase):
     """Tests for ClusterStats KV aggregation properties."""
 
@@ -268,6 +349,24 @@ class ThroughputTests(unittest.TestCase):
 
         self.assertNotIn(99, collector._prev_tokens)
         self.assertEqual(unstaged.throughput_tok_s, 0.0)
+
+    def test_rate_overflow_drops_infinite_rate(self):
+        # A huge-but-finite delta (5e307 tokens over a 1e-6 s window) overflows
+        # to inf — it must not reach the charts.
+        collector._prev_tokens[1] = (10.0 - 1e-6, 1e308)
+        s = SparkUnitStats(model_hosted=True, generation_tokens_total=1.5e308)
+
+        collector._update_throughput(1, s, 10.0)
+
+        self.assertEqual(s.throughput_tok_s, 0.0)
+
+    def test_prompt_rate_overflow_drops_infinite_rate(self):
+        collector._prev_prompt_tokens[1] = (10.0 - 1e-6, 1e308)
+        s = SparkUnitStats(model_hosted=True, prompt_tokens_total=1.5e308)
+
+        collector._update_prompt_throughput(1, s, 10.0)
+
+        self.assertEqual(s.prompt_throughput_tok_s, 0.0)
 
 
 class MemoryThrashParseTests(unittest.TestCase):

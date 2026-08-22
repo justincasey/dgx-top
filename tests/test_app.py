@@ -562,3 +562,48 @@ async def test_dense_layout_fits_a_180_pixel_tall_viewport(tmp_path: Path, monke
         for tile in tiles:
             for child in tile.walk_children():
                 assert child.region.bottom <= tile.region.bottom - 1
+
+
+async def test_non_finite_samples_do_not_crash_the_app(tmp_path: Path, monkeypatch):
+    """NaN/Inf metrics must never reach a Sparkline.
+
+    Regression for the "everything goes blank" bug: Textual's Sparkline raises
+    ValueError on non-finite data during the compositor repaint, which exits
+    the whole app. The history guards must drop the bad samples so the app
+    keeps running.
+    """
+    import collections
+    import math
+
+    import app as app_module
+    from app import DGXTop
+    from stats import ClusterStats, SparkUnitStats, TopologyInfo
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+
+    async def bad_cluster():
+        bad = SparkUnitStats(label="head", model_hosted=True)
+        bad.kv_cache_pct = float("nan")
+        bad.throughput_tok_s = float("inf")
+        bad.prompt_throughput_tok_s = float("nan")
+        bad.kv_total_tokens = 3_800_000
+        bad.kv_cache_used_tokens = 1_230_000
+        bad.requests_running = 1
+        worker = SparkUnitStats(label="worker", online=False)
+        return ClusterStats(units=[bad, worker], topology=TopologyInfo(topology_type="SINGLE"))
+
+    monkeypatch.setattr(app_module, "poll_cluster", bad_cluster)
+
+    app = DGXTop()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        # Pre-fix the repaint with the NaN in the chart raises and exits.
+        assert app.is_running
+        assert all(math.isfinite(v) for v in app.history["throughput"])
+        assert all(math.isfinite(v) for v in app.history["prompt-throughput"])
+        # The NaN KV sample was dropped entirely, not painted as a value.
+        assert app.history["kv-usage-head"] == collections.deque()
