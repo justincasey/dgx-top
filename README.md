@@ -15,9 +15,9 @@
 - Running and waiting requests
 - KV-cache utilization, block-allocated token capacity, and prefix-cache hit rate
 - GPU utilization, temperature, memory, and power draw
-- CPU utilization, temperature, and per-core activity
+- CPU utilization, temperature, frequency, and per-core activity
 - Memory-pressure and thrashing risk from Linux PSI, swap, reclaim, and fault counters
-- InfiniBand/RoCE link state derived from sysfs without requiring `ibstat`
+- InfiniBand/RoCE link state and throughput (RX/TX rates and wire utilization) derived from sysfs without requiring `ibstat`
 
 ## Requirements
 
@@ -198,8 +198,8 @@ density.
 
 | Rows per tile | Density   | Look                                                     |
 | ------------- | --------- | -------------------------------------------------------- |
-| `>= 13`       | `roomy`   | `GPU`/`MEMORY`/`CPU` get their own header lines           |
-| `10`–`12`     | `dense`   | Those headers become `GPU`/`MEM`/`CPU` row prefixes       |
+| `>= 14`       | `roomy`   | `GPU`/`MEMORY`/`CPU` get their own header lines           |
+| `10`–`13`     | `dense`   | Those headers become `GPU`/`MEM`/`CPU` row prefixes       |
 | `< 10`        | `compact` | One-letter prefixes, meters folded onto their value rows  |
 
 Within a density nothing is left stranded: the sparklines and meters are elastic,
@@ -244,6 +244,7 @@ No metric is dropped at any size; compact relocates them:
 | `+` | Poll faster         |
 | `-` | Poll slower         |
 | `r` | Refresh immediately |
+| `t` | Open the fuzzy theme picker (see [Themes](#switching-themes-while-running)) |
 | `q` | Quit                |
 
 ## Troubleshooting
