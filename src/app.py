@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import collections
+import logging
+import math
+from pathlib import Path
 
 from rich.text import Text
 from textual.app import App, Binding
@@ -9,9 +12,11 @@ from textual.reactive import reactive
 from textual.widgets import Sparkline, Static
 
 from collector import _init_model_names, poll_cluster
-from config import get_settings
+from config import default_config_path, get_settings
 from stats import ClusterStats, SparkUnitStats
 from themes import CUSTOM_THEMES, Palette, build_palette
+
+log = logging.getLogger("dgx-top")
 
 # ─── Theme helpers ───────────────────────────────────────────────────
 
@@ -1031,6 +1036,7 @@ class DGXTop(App):
             stats = await poll_cluster()
             self.cluster = stats
         except Exception as e:
+            log.warning("poll failed: %s", e)
             stats = ClusterStats()
             stats.units = [
                 SparkUnitStats(label=node.label, error=str(e)) for node in self.settings.nodes
@@ -1048,20 +1054,27 @@ class DGXTop(App):
 
     def _update_kpis(self, stats: ClusterStats):
         units = stats.units
+        skipped: list[str] = []
+
+        def _record(key: str, hist_key: str, value: float) -> None:
+            if math.isfinite(value):
+                self.history[hist_key].append(value)
+            else:
+                skipped.append(key)
 
         # Generation throughput history
         tp = stats.total_throughput
         self.history.setdefault(
             "throughput", collections.deque(maxlen=self.settings.history_length)
         )
-        self.history["throughput"].append(tp)
+        _record("throughput", "throughput", tp)
 
         # Prompt throughput history
         prompt_tp = stats.total_prompt_throughput
         self.history.setdefault(
             "prompt-throughput", collections.deque(maxlen=self.settings.history_length)
         )
-        self.history["prompt-throughput"].append(prompt_tp)
+        _record("prompt-throughput", "prompt-throughput", prompt_tp)
 
         hosted_units = stats.hosted_units
 
@@ -1081,7 +1094,13 @@ class DGXTop(App):
         for u in hosted_units:
             key = f"kv-usage-{u.label}"
             self.history.setdefault(key, collections.deque(maxlen=self.settings.history_length))
-            self.history[key].append(u.kv_cache_pct)
+            _record(f"kv:{u.label}", key, u.kv_cache_pct)
+        if skipped:
+            log.warning(
+                "dropped %d non-finite sample(s): %s",
+                len(skipped),
+                ", ".join(sorted(set(skipped))),
+            )
         # Aggregated (first-hosted) KV info for display
         kv_pct = stats.kv_cache_pct
         kv_total_tok = stats.total_kv_capacity_tokens
@@ -1130,7 +1149,30 @@ class DGXTop(App):
         self.run_worker(self._poll())
 
 
-def run():
+def run(config_path: str | Path | None = None) -> None:
+    """Start the TUI, logging next to the effective config file.
+
+    ``config_path`` is the same path CLI/config resolution used (honouring
+    ``--config`` and ``DGX_TOP_CONFIG``). The file handler is attached to the
+    dgx-top logger (never the root), so it works even when an embedding app
+    pre-configured root logging, and an unwritable/missing log directory can
+    never fail startup.
+    """
+    if config_path is None:
+        config_path = default_config_path()
+    if not log.handlers:
+        log_path = Path(config_path).expanduser().with_name("dgx-top.log")
+        try:
+            handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        except OSError:
+            # No handler attached, so this WARNING falls through to stderr
+            # (logging.lastResort); never crash the TUI for a log location.
+            log.warning("cannot open log file %s; diagnostics will not be written", log_path)
+        else:
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            log.addHandler(handler)
+            log.setLevel(logging.INFO)
+    log.info("dgx-top starting")
     app = DGXTop()
     app.run()
 

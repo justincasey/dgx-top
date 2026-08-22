@@ -83,7 +83,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from app import run
 
-    run()
+    # Effective config path as resolved by load_config: --config wins, then
+    # DGX_TOP_CONFIG/default. run() logs next to it.
+    run(args.config)
     return 0
 
 

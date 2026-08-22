@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from typing import Dict, List, Tuple
@@ -128,34 +129,49 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
         if line.startswith("vllm:kv_cache_usage_perc"):
             parts = line.split()
             if len(parts) >= 2:
-                val = float(parts[-1])
-                s.kv_cache_pct = val * 100
-                # Derive block and token counts from the usage percentage.
-                # usage_pct already accounts for the null block subtraction.
-                if s.kv_block_size > 0 and s.kv_total_blocks > 0:
-                    s.kv_cache_free_blocks = int(s.kv_total_blocks * (1 - val))
-                    used_blocks = s.kv_total_blocks - s.kv_cache_free_blocks
-                    s.kv_cache_used_tokens = used_blocks * s.kv_block_size
+                # Non-finite gauges (NaN/Inf, or values that overflow the
+                # ×100 scaling) would poison the Sparkline history and crash
+                # the app renderer — drop them.
+                pct = float(parts[-1]) * 100
+                if math.isfinite(pct):
+                    s.kv_cache_pct = pct
+                    # Derive block and token counts from the usage percentage.
+                    # usage_pct already accounts for the null block subtraction.
+                    if s.kv_block_size > 0 and s.kv_total_blocks > 0:
+                        val = float(parts[-1])
+                        s.kv_cache_free_blocks = int(s.kv_total_blocks * (1 - val))
+                        used_blocks = s.kv_total_blocks - s.kv_cache_free_blocks
+                        s.kv_cache_used_tokens = used_blocks * s.kv_block_size
     for line in lines:
         if line.startswith("vllm:prefix_cache_hit_rate"):
             parts = line.split()
             if len(parts) >= 2:
-                s.kv_prefix_hit_rate = float(parts[-1]) * 100
+                hit = float(parts[-1]) * 100
+                if math.isfinite(hit):
+                    s.kv_prefix_hit_rate = hit
         elif line.startswith("vllm:cache_hit_rate"):
             parts = line.split()
             if len(parts) >= 2:
-                s.kv_prefix_hit_rate = float(parts[-1]) * 100
+                hit = float(parts[-1]) * 100
+                if math.isfinite(hit):
+                    s.kv_prefix_hit_rate = hit
 
     # Requests running
     for line in lines:
         if line.startswith("vllm:num_requests_running"):
             parts = line.split()
             if len(parts) >= 2:
-                s.requests_running = int(float(parts[-1]))
+                running = float(parts[-1])
+                # int(inf) raises OverflowError and would drop this node's
+                # whole vLLM parse — ignore non-finite counts.
+                if math.isfinite(running):
+                    s.requests_running = int(running)
         elif line.startswith("vllm:num_requests_waiting"):
             parts = line.split()
             if len(parts) >= 2:
-                s.requests_waiting = int(float(parts[-1]))
+                waiting = float(parts[-1])
+                if math.isfinite(waiting):
+                    s.requests_waiting = int(waiting)
 
     # TTFT histogram
     ttft_lines = [l for l in lines if "vllm:time_to_first_token" in l]
@@ -177,22 +193,38 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     # updates when requests finish, so it can lag and spike during long generations.
     generation_tokens_total = 0.0
     has_generation_tokens = False
+    # The live counter's metric being present at all (even with a bad value)
+    # is distinct from having parsed a finite value: a transient NaN poll must
+    # not silently fall back to the request-sum histogram (which lags the live
+    # counter and would rebase the throughput baseline onto a different source,
+    # painting a false spike on recovery).
+    saw_generation_tokens = False
     request_generation_tokens_total = 0.0
     has_request_generation_tokens = False
     for line in lines:
         if line.startswith("vllm:generation_tokens"):
             parts = line.split()
             if len(parts) >= 2:
-                has_generation_tokens = True
-                generation_tokens_total += float(parts[-1])
+                saw_generation_tokens = True
+                value = float(parts[-1])
+                if math.isfinite(value):
+                    has_generation_tokens = True
+                    generation_tokens_total += value
         elif line.startswith("vllm:request_generation_tokens_sum"):
             parts = line.split()
             if len(parts) >= 2:
-                has_request_generation_tokens = True
-                request_generation_tokens_total += float(parts[-1])
-    s.generation_tokens_total = (
-        generation_tokens_total if has_generation_tokens else request_generation_tokens_total
-    )
+                value = float(parts[-1])
+                if math.isfinite(value):
+                    has_request_generation_tokens = True
+                    request_generation_tokens_total += value
+    if has_generation_tokens:
+        s.generation_tokens_total = generation_tokens_total
+    elif saw_generation_tokens:
+        # Live counter present but only non-finite: report 0 so the throughput
+        # baseline is dropped and recovers cleanly instead of mixing sources.
+        s.generation_tokens_total = 0.0
+    else:
+        s.generation_tokens_total = request_generation_tokens_total
 
     if (
         has_generation_tokens
@@ -208,7 +240,9 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
         if line.startswith("vllm:prompt_tokens"):
             parts = line.split()
             if len(parts) >= 2:
-                s.prompt_tokens_total += float(parts[-1])
+                prompt = float(parts[-1])
+                if math.isfinite(prompt):
+                    s.prompt_tokens_total += prompt
 
     s.online = True
     return s
@@ -929,7 +963,11 @@ def _update_throughput(unit_id: int, s: SparkUnitStats, now: float) -> None:
         dt = now - prev_time
         token_delta = s.generation_tokens_total - prev_tokens
         if dt > 0 and token_delta >= 0:
-            s.throughput_tok_s = token_delta / dt
+            # The ratio can overflow to inf with a huge counter and a tiny
+            # window; a non-finite rate would crash the chart renderer.
+            rate = token_delta / dt
+            if math.isfinite(rate):
+                s.throughput_tok_s = rate
     _prev_tokens[unit_id] = (now, s.generation_tokens_total)
 
 
@@ -945,7 +983,9 @@ def _update_prompt_throughput(unit_id: int, s: SparkUnitStats, now: float) -> No
         dt = now - prev_time
         token_delta = s.prompt_tokens_total - prev_tokens
         if dt > 0 and token_delta >= 0:
-            s.prompt_throughput_tok_s = token_delta / dt
+            rate = token_delta / dt
+            if math.isfinite(rate):
+                s.prompt_throughput_tok_s = rate
     _prev_prompt_tokens[unit_id] = (now, s.prompt_tokens_total)
 
 
@@ -1082,7 +1122,10 @@ async def poll_cluster() -> ClusterStats:
         _update_prompt_throughput(unit_id, s, now)
         # Compute prompt:generated ratio (Spark Monitor insight)
         if s.prompt_throughput_tok_s > 0 and s.throughput_tok_s > 0:
-            s.prompt_gen_ratio = s.prompt_throughput_tok_s / s.throughput_tok_s
+            ratio = s.prompt_throughput_tok_s / s.throughput_tok_s
+            # finite/finite can still overflow to inf with extreme rates.
+            if math.isfinite(ratio):
+                s.prompt_gen_ratio = ratio
 
     # Derive cluster topology from per-node topology data
     node_topos: dict[int, dict] = {}
