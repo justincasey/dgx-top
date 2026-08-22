@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -586,6 +587,175 @@ class TelemetryParseTests(unittest.TestCase):
         self.assertNotIn("cpu_temp", result)
         self.assertEqual(result["cpu_stat"], "cpu  100 200")
         self.assertEqual(result["thrash_output"], "100 200")
+
+    def test_cpu_freq_and_roce_sections_are_parsed(self):
+        output = (
+            "---CPU_STAT---\ncpu  1 2 3\n"
+            "---CPU_FREQ---\n2700000\n2800000\n"
+            "---ROCE---\nroce:mlx5_0:1:100:200\n"
+            "---TOPOLOGY---\nib:mlx5_0:1:4: ACTIVE:InfiniBand\n"
+        )
+        result = collector._parse_telemetry_output(output)
+
+        self.assertEqual(result["cpu_freq"], "2700000\n2800000")
+        self.assertEqual(result["roce_output"], "roce:mlx5_0:1:100:200")
+        self.assertEqual(result["topology_output"], "ib:mlx5_0:1:4: ACTIVE:InfiniBand")
+
+
+class CpuFreqParseTests(unittest.TestCase):
+    """Tests for _parse_cpu_freq pure function."""
+
+    def test_average_of_scaling_cur_freq_khz_values(self):
+        self.assertAlmostEqual(collector._parse_cpu_freq("2700000\n2900000\n2500000\n"), 2700.0)
+
+    def test_cpuinfo_mhz_values(self):
+        self.assertAlmostEqual(collector._parse_cpu_freq("cpu MHz\t: 2700.000\n"), 2700.0)
+
+    def test_empty_output_returns_zero(self):
+        self.assertEqual(collector._parse_cpu_freq(""), 0.0)
+
+    def test_garbage_lines_are_skipped(self):
+        self.assertEqual(collector._parse_cpu_freq("not a number\n2700000\n"), 2700.0)
+
+
+class RoceParseTests(unittest.TestCase):
+    """Tests for _parse_roce_output and _update_roce_rates."""
+
+    def setUp(self):
+        collector._prev_roce.clear()
+
+    def test_parses_each_port_with_4x_octet_scaling_and_rate(self):
+        output = (
+            "roce:mlx5_0:1:100:200:200 Gb/sec (2X NDR)\nroce:mlx5_0:2:50:25:40 Gb/sec (4X QDR)\n"
+        )
+        ports = collector._parse_roce_output(output)
+        self.assertEqual(ports[("mlx5_0", "1")], (100 * 4, 200 * 4, 200e9 / 8))
+        self.assertEqual(ports[("mlx5_0", "2")], (50 * 4, 25 * 4, 40e9 / 8))
+
+    def test_unreadable_rate_yields_zero_capacity(self):
+        ports = collector._parse_roce_output("roce:mlx5_0:1:100:200\n")
+        self.assertEqual(ports[("mlx5_0", "1")], (400, 800, 0.0))
+
+    def test_skips_non_roce_lines(self):
+        ports = collector._parse_roce_output("guid:foo:bar\nib:mlx5:1:4: ACTIVE:InfiniBand\n")
+        self.assertEqual(ports, {})
+
+    def test_no_usable_ports_returns_empty(self):
+        self.assertEqual(collector._parse_roce_output(""), {})
+
+    def test_rates_derive_from_cumulative_delta(self):
+        ports = {("mlx5_0", "1"): (800, 400, 25e9)}
+        rx1, tx1 = collector._update_roce_rates("h", ports, 10.0)
+        self.assertEqual((rx1, tx1), (0.0, 0.0))  # first observation seeds only
+        ports = {("mlx5_0", "1"): (1600, 800, 25e9)}
+        rx2, tx2 = collector._update_roce_rates("h", ports, 12.0)
+        self.assertEqual((rx2, tx2), (400.0, 200.0))
+
+    def test_counter_reset_yields_zero_rate_without_negative(self):
+        collector._update_roce_rates("h", {("mlx5_0", "1"): (800, 400, 25e9)}, 10.0)
+        rx, tx = collector._update_roce_rates("h", {("mlx5_0", "1"): (0, 0, 25e9)}, 12.0)
+        self.assertEqual((rx, tx), (0.0, 0.0))
+        # baseline re-seeded, next poll with a fresh counter derives again
+        rx2, tx2 = collector._update_roce_rates("h", {("mlx5_0", "1"): (1600, 800, 25e9)}, 14.0)
+        self.assertEqual((rx2, tx2), (800.0, 400.0))
+
+    def test_idle_poll_refreshes_baseline_time(self):
+        collector._update_roce_rates("h", {("mlx5_0", "1"): (800, 400, 25e9)}, 0.0)
+        # No counter movement for 10s: the next nonzero delta is measured
+        # against the LATEST poll, not the last busy one.
+        collector._update_roce_rates("h", {("mlx5_0", "1"): (800, 400, 25e9)}, 10.0)
+        rx, tx = collector._update_roce_rates("h", {("mlx5_0", "1"): (1200, 600, 25e9)}, 11.0)
+        self.assertEqual((rx, tx), (400.0, 200.0))
+
+    def test_new_port_seeds_only_and_absent_port_is_dropped(self):
+        # Active-set change: a port's lifetime counters appear only now; they
+        # must seed the baseline, not count as one interval of traffic.
+        rx, tx = collector._update_roce_rates(
+            "h", {("mlx5_0", "2"): (90_000_000_000, 80_000_000_000, 25e9)}, 5.0
+        )
+        self.assertEqual((rx, tx), (0.0, 0.0))
+        # The port goes away and the surviving port keeps its own rates.
+        rx, tx = collector._update_roce_rates(
+            "h", {("mlx5_0", "2"): (90_000_000_100, 80_000_000_100, 25e9)}, 7.0
+        )
+        self.assertEqual((rx, tx), (50.0, 50.0))
+        # A previously unknown port appearing is again seed-only.
+        rx, tx = collector._update_roce_rates(
+            "h",
+            {
+                ("mlx5_0", "2"): (90_000_000_200, 80_000_000_200, 25e9),
+                ("mlx5_0", "3"): (5, 6, 10e9),
+            },
+            9.0,
+        )
+        self.assertEqual((rx, tx), (50.0, 50.0))
+        # Port 3 vanished: no negative rate, no stuck baseline.
+        rx, tx = collector._update_roce_rates(
+            "h", {("mlx5_0", "2"): (90_000_000_400, 80_000_000_400, 25e9)}, 11.0
+        )
+        self.assertEqual((rx, tx), (100.0, 100.0))
+
+
+class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
+    """Tests for the _SSH_ batch command and end-to-end fetch wiring."""
+
+    async def test_roce_command_matches_ACTIVE_state_by_glob_not_exact(self):
+        """state holds '4: ACTIVE' — exact '= ACTIVE' matches skip every port."""
+        captured: dict = {}
+
+        async def fake_ssh_run(target, cmd):
+            captured["cmd"] = cmd
+            return (
+                "---ROCE---\n"
+                "roce:rocep1s0f1:1:381880659154:381825975309:200 Gb/sec (2X NDR)\n"
+                "---TOPOLOGY---\n"
+                "ib:rocep1s0f1:1:4: ACTIVE:InfiniBand\n"
+            )
+
+        with patch.object(collector, "_ssh_run", side_effect=fake_ssh_run):
+            telemetry = await collector._fetch_telemetry("host")
+
+        self.assertIn("*ACTIVE*", captured["cmd"])
+        self.assertNotIn('" = "ACTIVE"', captured["cmd"])
+        ports = collector._parse_roce_output(telemetry["roce_output"])
+        rcv, xmit, cap = ports[("rocep1s0f1", "1")]
+        self.assertTrue(rcv > 0 and xmit > 0 and cap > 0)
+
+    async def test_poll_unit_fills_freq_and_roce_from_telemetry(self):
+        units = {
+            7: {
+                "label": "test-node",
+                "ssh_target": "tester@spark.test",
+                "vllm_url": "http://spark.test:8000",
+                "worker": False,
+            }
+        }
+        metrics_mock = AsyncMock(
+            return_value='vllm:request_generation_tokens_sum{model_name="a"} 0.0\n'
+        )
+        telemetry_mock = AsyncMock(
+            return_value={
+                "cpu_freq": "2700000\n2900000\n",
+                "roce_output": "roce:rocep1s0f1:1:80000:70000:200 Gb/sec (2X NDR)\n",
+            }
+        )
+        collector._prev_roce.clear()
+        collector._prev_roce["tester@spark.test"] = {
+            ("rocep1s0f1", "1"): (time.monotonic() - 1.0, 0, 0)
+        }
+
+        with patch.object(collector, "SPARK_UNITS", units):
+            with patch.object(collector, "_fetch_vllm_metrics", metrics_mock):
+                with patch.object(collector, "_fetch_telemetry", telemetry_mock):
+                    with patch.object(collector.httpx, "AsyncClient") as http_client:
+                        stats = await collector.poll_unit(7)
+
+        self.assertAlmostEqual(stats.cpu_freq_mhz, 2800.0)
+        self.assertTrue(stats.roce_rx_bps > 0)  # 80000*4 bytes over ~1s
+        self.assertTrue(stats.roce_tx_bps > 0)
+        # One port at 200 Gb/s -> full-duplex capacity of 2 * 25e9 B/s.
+        self.assertAlmostEqual(stats.roce_capacity_bps, 2 * 25e9)
+        http_client.assert_not_called()
 
 
 class CpuStatParseTests(unittest.TestCase):

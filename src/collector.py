@@ -426,6 +426,16 @@ def _parse_telemetry_output(stdout: str) -> dict:
                 result[prev_section] = "\n".join(prev_sections)
             prev_section = "topology_output"
             prev_sections = []
+        elif line == "---CPU_FREQ---":
+            if prev_section is not None:
+                result[prev_section] = "\n".join(prev_sections)
+            prev_section = "cpu_freq"
+            prev_sections = []
+        elif line == "---ROCE---":
+            if prev_section is not None:
+                result[prev_section] = "\n".join(prev_sections)
+            prev_section = "roce_output"
+            prev_sections = []
         else:
             prev_sections.append(line)
     # Last section
@@ -486,6 +496,116 @@ def _parse_topology_output(output: str) -> dict:
         else:
             result["ip_addrs"].append(line)
     return result
+
+
+# ─── CPU frequency & RoCE traffic ───────────────────────────────────────
+
+
+def _parse_cpu_freq(output: str) -> float:
+    """Average current CPU frequency in MHz.
+
+    Handles both ``scaling_cur_freq`` (kHz per cpufreq policy) and the
+    ``cpu MHz`` line of /proc/cpuinfo (already MHz). Returns 0.0 when
+    nothing readable; kHz values are always >= 10000 so the split is safe.
+    """
+    freqs_mhz: list[float] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = float(line)
+        except ValueError:
+            # /proc/cpuinfo lines look like "cpu MHz\t: 2700.000"
+            try:
+                value = float(line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                continue
+        if value >= 10000.0:  # scaling_cur_freq in kHz
+            freqs_mhz.append(value / 1000.0)
+        else:  # /proc/cpuinfo "cpu MHz : 2700.000"
+            freqs_mhz.append(value)
+    return sum(freqs_mhz) / len(freqs_mhz) if freqs_mhz else 0.0
+
+
+def _parse_roce_output(
+    output: str,
+) -> dict[tuple[str, str], tuple[int, int, float]]:
+    """Read per-port RoCE/IB RX, TX and link rate for ACTIVE ports.
+
+    Each line is ``roce:<device>:<port>:<rcv>:<xmit>:<rate>`` where rate is
+    the raw `rate` sysfs text like "200 Gb/sec (2X NDR)". InfiniBand data
+    counters are in units of 4 octets (PortRcvData/PortXmitData per the IB
+    spec), so raw values are multiplied by 4. Port capacity is the rate in
+    bytes/second (0 when unreadable). Returns an empty dict when no usable
+    ports were reported.
+    """
+    ports: dict[tuple[str, str], tuple[int, int, float]] = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("roce:"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 5:
+            continue
+        try:
+            rcv = int(parts[3])
+            xmit = int(parts[4])
+        except ValueError:
+            continue
+        cap_bps = 0.0
+        if len(parts) >= 6:
+            try:
+                cap_bps = float(parts[5].split()[0]) * 1_000_000_000 / 8.0
+            except (ValueError, IndexError):
+                cap_bps = 0.0
+        ports[(parts[1], parts[2])] = (rcv * 4, xmit * 4, cap_bps)
+    return ports
+
+
+_PrevPort = Tuple[float, int, int]  # (monotonic time, cumulative rcv, cumulative xmit)
+_prev_roce: Dict[str, Dict[tuple[str, str], _PrevPort]] = {}
+# ssh_target -> {(device, port): baseline} across ACTIVE ports
+
+
+def _update_roce_rates(
+    ssh_target: str, ports: dict[tuple[str, str], tuple[int, int, float]], now: float
+) -> Tuple[float, float]:
+    """Turn cumulative per-port RoCE counters into aggregate (rx_bps, tx_bps).
+
+    Deltas are computed per port so a port entering or leaving the ACTIVE set
+    does not fabricate traffic: a first-seen port only seeds its baseline
+    (zero rate that interval), an absent port is dropped, and a counter reset
+    (reboot/wrap) re-seeds with a zero rate. The baseline is refreshed on every
+    poll, so an idle gap does not stretch the next delta over a longer window.
+    """
+    prev_ports = _prev_roce.get(ssh_target)
+    if prev_ports is None:
+        prev_ports = {}
+        _prev_roce[ssh_target] = prev_ports
+    rx_bps = 0.0
+    tx_bps = 0.0
+    for key, (rcv, xmit, _cap_bps) in ports.items():
+        prev = prev_ports.get(key)
+        if prev is None:
+            prev_ports[key] = (now, rcv, xmit)  # first-seen: seed only, no rate
+            continue
+        prev_time, prev_rcv, prev_xmit = prev
+        if rcv < prev_rcv or xmit < prev_xmit:
+            # Counter reset (reboot/wrap): re-seed and emit no rate rather
+            # than fabricating a negative throughput.
+            prev_ports[key] = (now, rcv, xmit)
+            continue
+        prev_ports[key] = (now, rcv, xmit)
+        dt = now - prev_time
+        if dt > 0:
+            rx_bps += (rcv - prev_rcv) / dt
+            tx_bps += (xmit - prev_xmit) / dt
+    # Ports that are no longer reported are forgotten so a later return
+    # re-seeds instead of counting their lifetime bytes as one interval.
+    for key in [k for k in prev_ports if k not in ports]:
+        del prev_ports[key]
+    return rx_bps, tx_bps
 
 
 def _derive_topology(node_topos: dict[int, dict]) -> TopologyInfo:
@@ -594,6 +714,28 @@ async def _fetch_telemetry(ssh_target: str) -> dict:
         "/proc/pressure/memory 2>/dev/null || true ; "
         "sed -n 's/^full avg10=\\([0-9.]*\\)[^t]* total=\\([0-9]*\\).*/\\1 \\2/p' "
         "/proc/pressure/memory 2>/dev/null || true ; "
+        # SECTION: CPU frequency (cpufreq policy current freq in kHz, falling
+        # back to /proc/cpuinfo "cpu MHz" lines when scaling_cur_freq is absent)
+        'echo "---CPU_FREQ---" ; '
+        "cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null ; "
+        # Fall back to /proc/cpuinfo ONLY when no cpufreq policy exists, so a
+        # single MHz sample is never mixed into per-policy kHz values.
+        '[ -z "$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null)" ] && '
+        "grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null ; "
+        # SECTION: RoCE/IB traffic counters (PortRcvData/PortXmitData per
+        # ACTIVE port, cumulative)
+        'echo "---ROCE---" ; '
+        "for d in /sys/class/infiniband/*; do "
+        '[ -e "$d" ] || continue; '
+        "b=${d##*/}; "
+        'for p in "$d"/ports/*; do '
+        '[ -e "$p/state" ] || continue; '
+        "port=${p##*/}; "
+        # state holds "4: ACTIVE" (numeric code + name); glob-match the name.
+        'case "$(cat "$p/state" 2>/dev/null)" in *ACTIVE*) ;; *) continue ;; esac; '
+        'echo "roce:$b:$port:$(cat "$p/counters/port_rcv_data" 2>/dev/null || echo 0):$(cat "$p/counters/port_xmit_data" 2>/dev/null || echo 0):$(cat "$p/rate" 2>/dev/null || echo 0)"; '
+        "done; "
+        "done; "
         # SECTION: Topology (RoCE/InfiniBand state from sysfs)
         'echo "---TOPOLOGY---" ; '
         "for d in /sys/class/infiniband/*; do "
@@ -707,6 +849,30 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
                     s.mem_used_bytes = (mem_total_kb - mem_avail_kb) * 1024
         except Exception:
             pass  # thrash fields stay at defaults
+
+    # Parse CPU frequency
+    if "cpu_freq" in telemetry:
+        try:
+            freq = _parse_cpu_freq(telemetry["cpu_freq"])
+            if freq > 0:
+                s.cpu_freq_mhz = freq
+        except Exception:
+            pass  # freq stays at 0 (unavailable)
+
+    # Parse RoCE/IB counter deltas into RX/TX rates
+    if "roce_output" in telemetry:
+        try:
+            ports = _parse_roce_output(telemetry["roce_output"])
+            if ports:
+                now = time.monotonic()
+                rx, tx = _update_roce_rates(ssh_target, ports, now)
+                s.roce_rx_bps = rx
+                s.roce_tx_bps = tx
+                # Full-duplex wire capacity: each port can receive and transmit
+                # at its rated speed simultaneously, so 2x the sum of rates.
+                s.roce_capacity_bps = 2.0 * sum(cap for _, _, cap in ports.values())
+        except Exception:
+            pass  # RoCE rates stay at 0
 
     # Parse topology data
     if "topology_output" in telemetry:

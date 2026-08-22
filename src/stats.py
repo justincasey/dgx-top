@@ -70,6 +70,13 @@ class SparkUnitStats:
     online: bool = False
     cpu_cores_total: int = 0
     cpu_cores_util: list[float] = field(default_factory=list)
+    # Average current CPU frequency across cores (MHz); 0 = unavailable.
+    cpu_freq_mhz: float = 0.0
+    # Aggregate RoCE/InfiniBand RX/TX throughput across active ports (bytes/s).
+    roce_rx_bps: float = 0.0
+    roce_tx_bps: float = 0.0
+    # Full-duplex wire capacity across active ports (bytes/s); 0 = unknown.
+    roce_capacity_bps: float = 0.0
     error: str = ""
     # Per-node topology data (raw, for cluster-level derivation)
     topology_ports: list[TopologyPort] = field(default_factory=list)

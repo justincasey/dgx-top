@@ -29,7 +29,9 @@ TITLE_HEIGHT = 2
 # Minimum rows the tallest tile (throughput) needs in each density.
 COMPACT_ROWS = 7
 DENSE_ROWS = 10
-ROOMY_ROWS = 13
+# 14 (not 13): a 13-row roomy tile leaves 11 usable rows after its border,
+# but label+3 headers+3 pairs+cores+the RoCE row need 12.
+ROOMY_ROWS = 14
 # Past this the tiles stop stretching; extra space stays below the grid rather
 # than inflating bars into wallpaper.
 ROOMY_MAX_ROWS = 16
@@ -97,8 +99,37 @@ def _temp_style(c: float, pal: Palette) -> str:
     if c >= TEMP_ALERT:
         return f"bold {pal.error}"
     if c >= TEMP_WARM:
-        return f"bold {pal.fg}"
+        return f"bold {pal.warn}"
     return pal.dim
+
+
+def _fmt_freq(mhz: float, short: bool = False) -> str:
+    """Format a CPU frequency in MHz as ``2.7GHz`` (``2.7G`` when short)."""
+    if mhz <= 0:
+        return ""
+    return f"{mhz / 1000.0:.1f}G" if short else f"{mhz / 1000.0:.1f}GHz"
+
+
+def _fmt_rate(bps: float) -> str:
+    """Format a byte rate as 82K, 1.5M or 3.2G bytes/s."""
+    if bps < 1_000:
+        return f"{bps:.0f}"
+    if bps < 1_000_000:
+        return f"{bps / 1000:.0f}K"
+    if bps < 1_000_000_000:
+        return f"{bps / 1_000_000:.1f}M"
+    return f"{bps / 1_000_000_000:.1f}G"
+
+
+def _roce_util_pct(s: SparkUnitStats) -> float:
+    """RoCE wire utilization: observed (RX+TX) / full-duplex capacity.
+
+    Capacity is 0 until the collector sees active ports, so callers must
+    gate on it before showing a percentage.
+    """
+    if s.roce_capacity_bps <= 0:
+        return 0.0
+    return min(100.0, (s.roce_rx_bps + s.roce_tx_bps) / s.roce_capacity_bps * 100.0)
 
 
 def _fmt_tokens(n: int) -> str:
@@ -433,12 +464,13 @@ class NodeTile(Static):
             yield Static(id=f"node-cpu-row-{idx}")
             yield MeterBar(id=f"node-cpu-bar-{idx}", classes="meter", metric_color="accent")
         yield Static(id=f"node-cpu-grid-{idx}", classes="cores")
+        yield Static(id=f"node-roce-row-{idx}", classes="roce-row")
 
     def on_mount(self):
         self._clear()
 
     def _clear(self):
-        for name in ("gpu-row", "mem-row", "cpu-row", "cpu-grid"):
+        for name in ("gpu-row", "mem-row", "cpu-row", "cpu-grid", "roce-row"):
             self.query_one(f"#node-{name}-{self.idx}", Static).update("")
         for name in ("gpu-bar", "mem-bar", "cpu-bar"):
             self.query_one(f"#node-{name}-{self.idx}", MeterBar).update_pct(0)
@@ -464,8 +496,17 @@ class NodeTile(Static):
         self.query_one(f"#node-label-{idx}", Static).update(
             Text(label, style=f"bold {pal.fg}" if online else pal.muted)
         )
+        # Roomy section labels ride header rows; keep them the same faint grey
+        # as the dense/compact row prefixes (headers hidden in both tiers, but
+        # updating is harmless). Redone each poll so a theme switch repaints.
+        for cls, text in (
+            (".gpu-header", "GPU"),
+            (".memory-header", "MEMORY"),
+            (".cpu-header", "CPU"),
+        ):
+            self.query_one(cls, Static).update(Text(text, style=pal.faint))
 
-        gpu_prefix = self._prefix(density, "G", "GPU", pal.secondary)
+        gpu_prefix = self._prefix(density, "G", "GPU", pal.faint)  # label: faint grey
         if online:
             gpu = s.gpu_util_pct
             self.query_one(f"#node-gpu-row-{idx}", Static).update(
@@ -474,6 +515,7 @@ class NodeTile(Static):
                     Text(f"{gpu:.0f}%", style=pal.secondary),
                     Text(" " if compact else "   "),
                     Text(f"{s.temp_c:.0f}°C", style=_temp_style(s.temp_c, pal)),
+                    *((Text(f" {s.power_w:.0f}W", style=pal.accent),) if s.power_w > 0 else ()),
                 )
             )
             self.query_one(f"#node-gpu-bar-{idx}", MeterBar).update_pct(gpu)
@@ -481,7 +523,7 @@ class NodeTile(Static):
             self.query_one(f"#node-gpu-row-{idx}", Static).update(dash)
             self.query_one(f"#node-gpu-bar-{idx}", MeterBar).update_pct(0)
 
-        mem_prefix = self._prefix(density, "M", "MEM", pal.ok)
+        mem_prefix = self._prefix(density, "M", "MEM", pal.faint)  # label: faint grey
         if s.mem_total_bytes > 0:
             used_gb = s.mem_used_bytes // (1024**3)
             total_gb = s.mem_total_bytes // (1024**3)
@@ -510,17 +552,34 @@ class NodeTile(Static):
             self.query_one(f"#node-mem-row-{idx}", Static).update(dash)
             self.query_one(f"#node-mem-bar-{idx}", MeterBar).update_pct(0)
 
-        cpu_prefix = self._prefix(density, "C", "CPU", pal.accent)
+        cpu_prefix = self._prefix(density, "C", "CPU", pal.faint)  # label: faint grey
         if online and s.cpu_cores_util:
             avg = sum(s.cpu_cores_util) / len(s.cpu_cores_util)
-            self.query_one(f"#node-cpu-row-{idx}", Static).update(
-                Text.assemble(
-                    cpu_prefix,
-                    Text(f"{avg:.0f}%", style=pal.accent),
-                    Text(" " if compact else "   "),
-                    Text(f"{s.cpu_temp_c:.0f}°C", style=_temp_style(s.cpu_temp_c, pal)),
-                )
-            )
+            # Dense folds the RoCE rates onto the CPU row (no dedicated-row
+            # budget in the dense tile), so it uses compact spacing and the
+            # short freq form there — both stable, not rate-dependent, and
+            # short enough for a two-column dense tile (~31 cols).
+            crowded = compact or density == "dense"
+            parts: list[Text] = [
+                cpu_prefix,
+                Text(f"{avg:.0f}%", style=pal.accent),
+                Text(" " if crowded else "   "),
+                Text(f"{s.cpu_temp_c:.0f}°C", style=_temp_style(s.cpu_temp_c, pal)),
+            ]
+            if s.cpu_freq_mhz > 0:
+                parts.append(Text(f" {_fmt_freq(s.cpu_freq_mhz, short=crowded)}", style=pal.muted))
+            if density == "dense" and (s.roce_rx_bps > 0 or s.roce_tx_bps > 0):
+                # The full fold (both rates + %) only fits the 3-column tile;
+                # narrower dense tiles get the utilization headline alone.
+                pct = _roce_util_pct(s)
+                if getattr(self.app, "columns", 1) > 2:
+                    fold = f" R\u2193{_fmt_rate(s.roce_rx_bps)}\u2191{_fmt_rate(s.roce_tx_bps)}" + (
+                        f" {pct:.0f}%" if s.roce_capacity_bps > 0 else ""
+                    )
+                else:
+                    fold = f" R {pct:.0f}%" if s.roce_capacity_bps > 0 else " R"
+                parts.append(Text(fold, style=pal.primary))
+            self.query_one(f"#node-cpu-row-{idx}", Static).update(Text.assemble(*parts))
             self.query_one(f"#node-cpu-bar-{idx}", MeterBar).update_pct(avg)
             # The grid is one row everywhere, so the inter-core spacing is only
             # affordable while the tile shares the width with other columns.
@@ -536,6 +595,28 @@ class NodeTile(Static):
             self.query_one(f"#node-cpu-row-{idx}", Static).update(dash if online else "")
             self.query_one(f"#node-cpu-bar-{idx}", MeterBar).update_pct(0)
             self.query_one(f"#node-cpu-grid-{idx}", Static).update("")
+
+        # RoCE/IB aggregate traffic row: RX into the node, TX out. The value
+        # (both directions) and the wire-utilization percent use the same
+        # purple as the KV capacity figures.
+        roce_label = "R " if compact else "RoCE "
+        if online and (s.roce_rx_bps > 0 or s.roce_tx_bps > 0):
+            pct = _roce_util_pct(s)
+            pct_text = f" {pct:.0f}%" if s.roce_capacity_bps > 0 else ""
+            self.query_one(f"#node-roce-row-{idx}", Static).update(
+                Text.assemble(
+                    Text(roce_label, style=pal.faint),  # label: faint grey
+                    Text(f"\u2193{_fmt_rate(s.roce_rx_bps)}", style=pal.primary),
+                    Text(f" \u2191{_fmt_rate(s.roce_tx_bps)}", style=pal.primary),
+                    Text(pct_text, style=pal.primary),
+                )
+            )
+        else:
+            # No rate to show: the dash placeholder marks the missing value
+            # whether the node is offline or simply carrying zero traffic.
+            self.query_one(f"#node-roce-row-{idx}", Static).update(
+                Text(roce_label + "—", style=pal.faint)
+            )
 
 
 # ─── App ────────────────────────────────────────────────────────────────
@@ -599,7 +680,7 @@ class DGXTop(App):
     }
 
     #kpis.scroll NodeTile {
-        height: 5;
+        height: 6;
     }
 
     .section-header {
@@ -609,20 +690,8 @@ class DGXTop(App):
         text-overflow: ellipsis;
     }
 
-    .gpu-header {
-        color: $secondary 70%;
-    }
-
-    .memory-header {
-        color: $success 70%;
-    }
-
     .kv-header {
         color: $primary 70%;
-    }
-
-    .cpu-header {
-        color: $accent 70%;
     }
 
     ThroughputTile > Static, NodeTile > Static {
@@ -765,6 +834,17 @@ class DGXTop(App):
     Screen.dense .gpu-header,
     Screen.dense .memory-header,
     Screen.dense .cpu-header {
+        display: none;
+    }
+
+    /* Dense tiles carry the RoCE rates on the CPU row and cap their pairs at
+       two rows: the 10-row tile loses two used rows to its border, leaving
+       exactly eight, so a three-row pair would push a metered row out. */
+    Screen.dense .pair-row {
+        max-height: 2;
+    }
+
+    Screen.dense .roce-row {
         display: none;
     }
 

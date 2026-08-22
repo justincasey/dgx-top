@@ -5,6 +5,12 @@ from pathlib import Path
 from config import configure
 
 
+def _plain(widget) -> str:
+    """Renderable plain text: ``Text``/``str`` content either way."""
+    content = widget.content
+    return content.plain if hasattr(content, "plain") else str(content)
+
+
 def _config(path: Path, theme: str | None = None) -> None:
     theme_line = (
         f"""theme = "{theme}"
@@ -196,6 +202,11 @@ def _fake_cluster():
         unit.swap_used_kb = 1 * 1024 * 1024
         unit.cpu_cores_util = [50.0] * 20
         unit.cpu_temp_c = 51.0
+        unit.cpu_freq_mhz = 2700.0
+        unit.power_w = 430.0
+        unit.roce_rx_bps = 3.2e9
+        unit.roce_tx_bps = 1.1e9
+        unit.roce_capacity_bps = 5e10  # (3.2+1.1)e9 / 5e10 -> 9%
         unit.kv_cache_pct = 32.0
         unit.kv_total_tokens = 3_800_000
         unit.kv_cache_used_tokens = 1_230_000
@@ -239,14 +250,15 @@ async def test_compact_tier_fits_a_320x320_viewport(tmp_path: Path, monkeypatch)
         for tile in [throughput, *nodes]:
             assert tile.region.bottom <= 21, f"{tile.id} overflows the viewport"
         for node in nodes:
-            assert node.region.height == 5
+            assert node.region.height == 6
 
         def text(selector: str) -> str:
             return app.query_one(selector, Static).content.plain
 
         # Every metric survives the fold: throughput min/avg/max for both
         # streams, requests/waiting/hit-rate/ratio, KV capacity, and the
-        # per-node GPU/memory/swap/CPU values plus all 20 core cells.
+        # per-node GPU/memory/swap/CPU/power/frequency/RoCE values plus all 20
+        # core cells.
         prompt_stats = text("#tp-prompt-stats")
         assert prompt_stats.startswith("P ") and "7200" in prompt_stats
         gen_stats = text("#tp-gen-stats")
@@ -254,10 +266,68 @@ async def test_compact_tier_fits_a_320x320_viewport(tmp_path: Path, monkeypatch)
         assert text("#kv-header") == "2r  1w  h 45%  3:1"
         assert text("#kv-detail") == "1.2M/3.8M 32%"
         for idx in (0, 1):
-            assert text(f"#node-gpu-row-{idx}") == "G 73% 64°C"
+            assert text(f"#node-gpu-row-{idx}") == "G 73% 64°C 430W"
             assert text(f"#node-mem-row-{idx}") == "M 62G/120G 52% s1.0G"
-            assert text(f"#node-cpu-row-{idx}") == "C 50% 51°C"
+            assert text(f"#node-cpu-row-{idx}") == "C 50% 51°C 2.7G"
+            assert text(f"#node-roce-row-{idx}") == "R ↓3.2G ↑1.1G 9%"
             assert text(f"#node-cpu-grid-{idx}").count("\u25a0") == 20
+
+
+async def test_roce_row_tracks_density_and_uses_kv_purple(tmp_path: Path, monkeypatch):
+    """RoCE value color matches the KV purple; every density shows it.
+
+    Roomy and compact get a dedicated row with rates + utilization; dense
+    folds onto the CPU row (rates+% at 3 columns, % alone at 2 columns).
+    """
+    from textual.widgets import Static
+
+    from app import DGXTop
+    from themes import build_palette, get_theme
+
+    path = tmp_path / "config.toml"
+    _two_node_config(path)
+    configure(path)
+    _stub_polling(monkeypatch)
+
+    purple = build_palette(get_theme("dgx-dark")).primary.lower()
+
+    def purple_spans(widget) -> bool:
+        for sp in widget.content.spans:
+            style = sp.style
+            if style is None:
+                continue
+            if isinstance(style, str):
+                if purple in style.lower():
+                    return True
+                continue
+            color = style.color
+            if color is None:
+                continue
+            value = color.hex if hasattr(color, "hex") else str(color)
+            if value.lower() == purple:
+                return True
+        return False
+
+    app = DGXTop()
+    async with app.run_test(size=(180, 22)) as pilot:
+        await pilot.pause()
+        assert app.density == "roomy"
+        rok = app.query_one("#node-roce-row-0", Static)
+        assert rok.content.plain == "RoCE ↓3.2G ↑1.1G 9%"
+        assert purple_spans(rok)  # the value is the same purple as KV
+
+        # 3-column dense: full fold with rates + percent.
+        await _resize(pilot, 180, 12)
+        assert app.density == "dense"
+        text = app.query_one("#node-cpu-row-0", Static).content.plain
+        assert "R↓3.2G↑1.1G 9%" in text, text
+        assert purple_spans(app.query_one("#node-cpu-row-0", Static))
+
+        # 2-column dense: percent-only fold (rates live on the wider tiers).
+        await _resize(pilot, 70, 24)
+        assert app.density == "dense"
+        text = app.query_one("#node-cpu-row-0", Static).content.plain
+        assert "R 9%" in text and "↓" not in text, text
 
 
 def _stub_polling(monkeypatch) -> None:
@@ -353,6 +423,8 @@ async def test_no_row_is_clipped_at_any_viewport(tmp_path: Path, monkeypatch):
 
     Covers all three densities, all three column tiers and the scrolling floor.
     """
+    from textual.widgets import Static
+
     from app import DGXTop, NodeTile, ThroughputTile
 
     path = tmp_path / "config.toml"
@@ -389,6 +461,21 @@ async def test_no_row_is_clipped_at_any_viewport(tmp_path: Path, monkeypatch):
                         f"{type(child).__name__} in {tile.id} is clipped at "
                         f"{width}x{height} ({app.density})"
                     )
+                    # Glyph-level guard: a Static whose text is wider than the
+                    # tile content truncates silently (the region check above
+                    # can't see it), dropping the metric — e.g. the dense CPU
+                    # row with folded RoCE rates. The spaced core grid is the
+                    # one accepted pre-existing 2-column truncation.
+                    if (
+                        isinstance(child, Static)
+                        and "cores" not in child.classes
+                        and (plain := _plain(child))
+                    ):
+                        assert len(plain) <= max(1, tile.content_size.width), (
+                            f"{child.id} text ({len(plain)} cols) overflows "
+                            f"{tile.id} content width {tile.content_size.width} "
+                            f"at {width}x{height} ({app.density})"
+                        )
 
 
 async def test_history_charts_hold_full_pair_width(tmp_path: Path, monkeypatch):
