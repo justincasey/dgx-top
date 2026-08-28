@@ -35,7 +35,7 @@ def test_help_does_not_require_configuration(capsys):
 def test_themes_lists_default_and_tokyo_family(capsys):
     assert main(["themes"]) == 0
     out = capsys.readouterr().out
-    assert "default theme: dgx-dark" in out
+    assert "default theme: dgx-aeon" in out
     for name in ("tokyo-night", "tokyo-night-storm", "tokyo-night-light", "nord"):
         assert name in out
     assert "tokyo-night-light (light)" in out

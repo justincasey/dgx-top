@@ -3,6 +3,15 @@ poll_interval = 5
 history_length = 40
 # Color theme; run `dgx-top themes` for the full list of supported themes.
 theme = "dgx-dark"
+# Meter treatment for the GPU / memory / KV% bars (one value for all):
+#   gradient = btop-style green→red ramp (default)
+#   spark    = sparkline of the metric's recent history
+#   tick     = dim scale with a single bright marker at the current value
+#   line     = thin hairline fill over a hairline track
+meter_treatment = "gradient"
+# Quiet mode: calm the whole UI — identity hues render neutral and colour
+# appears only on caution/critical. Composes with any meter treatment.
+quiet = false
 
 # ssh_target accepts either user@host or an alias from ~/.ssh/config.
 # vllm_url is accessed directly from the machine running dgx-top.

@@ -88,8 +88,7 @@ class VllmMetricsTests(unittest.TestCase):
         # usage_pct accounts for null block; derive free blocks from total * (1-usage)
         self.assertEqual(stats.kv_cache_free_blocks, int(10000 * (1 - 0.32)))
         self.assertEqual(stats.kv_total_tokens, 10000 * 16)
-        used_blocks = 10000 - int(10000 * (1 - 0.32))
-        self.assertEqual(stats.kv_cache_used_tokens, used_blocks * 16)
+        self.assertEqual(stats.kv_cache_used_tokens, int(10000 * 16 * 0.32))
 
     def test_kv_cache_no_token_derivation_without_block_size(self):
         stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} 0.5\n')
@@ -98,15 +97,88 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.kv_total_tokens, 0)
         self.assertEqual(stats.kv_cache_used_tokens, 0)
 
-    def test_kv_prefix_hit_rate_is_parsed(self):
-        stats = collector._parse_vllm_metrics('vllm:prefix_cache_hit_rate{model_name="a"} 0.875\n')
+    def test_kv_cache_size_tokens_is_authoritative(self):
+        # MLA packs several tokens per block: prefer kv_cache_size_tokens over
+        # num_gpu_blocks * block_size.
+        stats = collector._parse_vllm_metrics(
+            'vllm:cache_config_info{block_size="4",num_gpu_blocks="16677",'
+            'kv_cache_size_tokens="1489151"} 1.0\n'
+            'vllm:kv_cache_usage_perc{model_name="a"} 0.5\n'
+        )
 
-        self.assertAlmostEqual(stats.kv_prefix_hit_rate, 87.5)
+        self.assertEqual(stats.kv_total_tokens, 1489151)
+        self.assertEqual(stats.kv_cache_used_tokens, int(1489151 * 0.5))
 
-    def test_kv_cache_hit_rate_fallback_is_parsed(self):
-        stats = collector._parse_vllm_metrics('vllm:cache_hit_rate{model_name="a"} 0.655\n')
+    def test_prefix_cache_counters_are_parsed(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:prefix_cache_hits_total{model_name="a"} 700.0\n'
+            'vllm:prefix_cache_queries_total{model_name="a"} 1000.0\n'
+        )
 
-        self.assertAlmostEqual(stats.kv_prefix_hit_rate, 65.5)
+        self.assertEqual(stats.prefix_hits_total, 700.0)
+        self.assertEqual(stats.prefix_queries_total, 1000.0)
+
+    def test_prefix_created_series_do_not_pollute_counters(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:prefix_cache_hits_created{model_name="a"} 1.7e9\n'
+            'vllm:external_prefix_cache_hits_total{model_name="a"} 5.0\n'
+        )
+
+        self.assertEqual(stats.prefix_hits_total, 0.0)
+        self.assertEqual(stats.prefix_queries_total, 0.0)
+
+    def test_prefix_hit_rate_cumulative_then_windowed(self):
+        collector._prev_prefix.clear()
+        s = SparkUnitStats(model_hosted=True)
+        s.prefix_hits_total, s.prefix_queries_total = 700.0, 1000.0
+        collector._update_prefix_hit_rate(0, s)
+        self.assertAlmostEqual(s.kv_prefix_hit_rate, 70.0)  # first poll: cumulative
+
+        s2 = SparkUnitStats(model_hosted=True)
+        s2.prefix_hits_total, s2.prefix_queries_total = 790.0, 1100.0
+        collector._update_prefix_hit_rate(0, s2)
+        self.assertAlmostEqual(s2.kv_prefix_hit_rate, 90.0)  # windowed: 90/100
+
+        s3 = SparkUnitStats(model_hosted=True)
+        s3.prefix_hits_total, s3.prefix_queries_total = 790.0, 1100.0
+        collector._update_prefix_hit_rate(0, s3)  # idle window → cumulative fallback
+        self.assertAlmostEqual(s3.kv_prefix_hit_rate, 790 / 1100 * 100)
+
+    def test_prefix_hit_rate_survives_counter_reset(self):
+        collector._prev_prefix.clear()
+        s = SparkUnitStats(model_hosted=True)
+        s.prefix_hits_total, s.prefix_queries_total = 700.0, 1000.0
+        collector._update_prefix_hit_rate(0, s)
+        # vLLM restarted: counters dropped → windowed skipped, cumulative used.
+        s2 = SparkUnitStats(model_hosted=True)
+        s2.prefix_hits_total, s2.prefix_queries_total = 8.0, 10.0
+        collector._update_prefix_hit_rate(0, s2)
+        self.assertAlmostEqual(s2.kv_prefix_hit_rate, 80.0)
+
+    def test_prefix_hit_rate_unavailable_without_queries(self):
+        collector._prev_prefix.clear()
+        s = SparkUnitStats(model_hosted=True)
+        collector._update_prefix_hit_rate(0, s)
+        self.assertEqual(s.kv_prefix_hit_rate, -1.0)
+
+    def test_ttft_histogram_estimates_p50_and_p95(self):
+        """The UI renders a p50—p95 range (§7.5); the tail must separate from
+        the typical when the histogram is bimodal."""
+
+        text = (
+            'vllm:time_to_first_token_seconds_bucket{model_name="a",le="0.5"} 0\n'
+            'vllm:time_to_first_token_seconds_bucket{model_name="a",le="1"} 50\n'
+            'vllm:time_to_first_token_seconds_bucket{model_name="a",le="20"} 100\n'
+            'vllm:time_to_first_token_seconds_bucket{model_name="a",le="+Inf"} 100\n'
+            'vllm:time_to_first_token_seconds_count{model_name="a"} 100\n'
+        )
+
+        stats = collector._parse_vllm_metrics(text)
+
+        # p50 lands in the fast population (~1s); p95 tracks the slow tail.
+        self.assertAlmostEqual(stats.ttft_p50_ms, 1000.0, delta=100.0)
+        self.assertAlmostEqual(stats.ttft_p95_ms, 18100.0, delta=200.0)
+        self.assertGreater(stats.ttft_p95_ms, stats.ttft_p50_ms)
 
     def test_model_hosted_true_when_kv_blocks_exist(self):
         stats = collector._parse_vllm_metrics(
@@ -187,10 +259,14 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.generation_tokens_total, 0.0)
         self.assertFalse(stats.model_hosted)
 
-    def test_nan_prefix_hit_rate_is_ignored(self):
-        stats = collector._parse_vllm_metrics('vllm:prefix_cache_hit_rate{model_name="a"} NaN\n')
+    def test_nan_prefix_counters_are_ignored(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:prefix_cache_hits_total{model_name="a"} NaN\n'
+            'vllm:prefix_cache_queries_total{model_name="a"} NaN\n'
+        )
 
-        self.assertEqual(stats.kv_prefix_hit_rate, -1.0)
+        self.assertEqual(stats.prefix_hits_total, 0.0)
+        self.assertEqual(stats.prefix_queries_total, 0.0)
 
     def test_nan_prompt_tokens_are_ignored(self):
         stats = collector._parse_vllm_metrics('vllm:prompt_tokens{model_name="a"} NaN\n')
@@ -687,34 +763,37 @@ class TelemetryParseTests(unittest.TestCase):
         self.assertEqual(result["cpu_stat"], "cpu  100 200")
         self.assertEqual(result["thrash_output"], "100 200")
 
-    def test_cpu_freq_and_roce_sections_are_parsed(self):
+    def test_sections_are_parsed(self):
         output = (
             "---CPU_STAT---\ncpu  1 2 3\n"
-            "---CPU_FREQ---\n2700000\n2800000\n"
             "---ROCE---\nroce:mlx5_0:1:100:200\n"
             "---TOPOLOGY---\nib:mlx5_0:1:4: ACTIVE:InfiniBand\n"
         )
         result = collector._parse_telemetry_output(output)
 
-        self.assertEqual(result["cpu_freq"], "2700000\n2800000")
+        self.assertEqual(result["cpu_stat"], "cpu  1 2 3")
         self.assertEqual(result["roce_output"], "roce:mlx5_0:1:100:200")
         self.assertEqual(result["topology_output"], "ib:mlx5_0:1:4: ACTIVE:InfiniBand")
 
 
-class CpuFreqParseTests(unittest.TestCase):
-    """Tests for _parse_cpu_freq pure function."""
+class NvidiaSmiParseTests(unittest.TestCase):
+    """Tests for _parse_nvidia_smi pure function."""
 
-    def test_average_of_scaling_cur_freq_khz_values(self):
-        self.assertAlmostEqual(collector._parse_cpu_freq("2700000\n2900000\n2500000\n"), 2700.0)
+    def test_parses_sm_clock_from_field_seven(self):
+        gpu_util, _mem_util, _mem_pct, power, _temp, sm = collector._parse_nvidia_smi(
+            "73, 50, 62000, 120000, 430, 64, 2411, 0x0000000000000000\n"
+        )
+        self.assertEqual(sm, 2411.0)
+        self.assertEqual(gpu_util, 73.0)
+        self.assertEqual(power, 430.0)
 
-    def test_cpuinfo_mhz_values(self):
-        self.assertAlmostEqual(collector._parse_cpu_freq("cpu MHz\t: 2700.000\n"), 2700.0)
-
-    def test_empty_output_returns_zero(self):
-        self.assertEqual(collector._parse_cpu_freq(""), 0.0)
-
-    def test_garbage_lines_are_skipped(self):
-        self.assertEqual(collector._parse_cpu_freq("not a number\n2700000\n"), 2700.0)
+    def test_na_memory_fields_do_not_break_sm_clock(self):
+        # GB10 reports [N/A] for FB memory; SM clock must still parse.
+        _u, _mu, mem_pct, _p, _t, sm = collector._parse_nvidia_smi(
+            "0, 0, [N/A], [N/A], 11, 41, 2411, 0x0\n"
+        )
+        self.assertEqual(mem_pct, 0.0)
+        self.assertEqual(sm, 2411.0)
 
 
 class RoceParseTests(unittest.TestCase):
@@ -820,7 +899,7 @@ class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
         rcv, xmit, cap = ports[("rocep1s0f1", "1")]
         self.assertTrue(rcv > 0 and xmit > 0 and cap > 0)
 
-    async def test_poll_unit_fills_freq_and_roce_from_telemetry(self):
+    async def test_poll_unit_fills_roce_from_telemetry(self):
         units = {
             7: {
                 "label": "test-node",
@@ -834,7 +913,6 @@ class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
         )
         telemetry_mock = AsyncMock(
             return_value={
-                "cpu_freq": "2700000\n2900000\n",
                 "roce_output": "roce:rocep1s0f1:1:80000:70000:200 Gb/sec (2X NDR)\n",
             }
         )
@@ -849,7 +927,6 @@ class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
                     with patch.object(collector.httpx, "AsyncClient") as http_client:
                         stats = await collector.poll_unit(7)
 
-        self.assertAlmostEqual(stats.cpu_freq_mhz, 2800.0)
         self.assertTrue(stats.roce_rx_bps > 0)  # 80000*4 bytes over ~1s
         self.assertTrue(stats.roce_tx_bps > 0)
         # One port at 200 Gb/s -> full-duplex capacity of 2 * 25e9 B/s.

@@ -43,13 +43,16 @@ class SparkUnitStats:
     kv_cache_pct: float = 0.0  # 0-100, from vllm:kv_cache_usage_perc × 100
     kv_total_blocks: int = 0  # from cache_config_info num_gpu_blocks (minus null block)
     kv_block_size: int = 0  # tokens per block
-    kv_total_tokens: int = 0  # total tokens = kv_total_blocks * kv_block_size
+    kv_total_tokens: int = 0  # KV capacity: kv_cache_size_tokens, else blocks*block_size
     kv_prefix_hit_rate: float = -1.0  # prefix cache hit rate 0-100, -1 = unavailable
     kv_cache_free_blocks: int = 0  # free blocks = kv_total_blocks * (1 - usage_pct)
     kv_cache_used_tokens: int = 0  # used token capacity = kv_total_tokens * usage_pct
+    prefix_queries_total: float = 0.0  # cumulative vllm:prefix_cache_queries_total
+    prefix_hits_total: float = 0.0  # cumulative vllm:prefix_cache_hits_total
     requests_running: int = 0
     requests_waiting: int = 0
     ttft_p50_ms: float = 0.0
+    ttft_p95_ms: float = 0.0
     ttft_p99_ms: float = 0.0
     itl_p50_ms: float = 0.0
     itl_p99_ms: float = 0.0
@@ -70,8 +73,8 @@ class SparkUnitStats:
     online: bool = False
     cpu_cores_total: int = 0
     cpu_cores_util: list[float] = field(default_factory=list)
-    # Average current CPU frequency across cores (MHz); 0 = unavailable.
-    cpu_freq_mhz: float = 0.0
+    # Current GPU SM clock (MHz) from nvidia-smi clocks.current.sm; 0 = unavailable.
+    gpu_clock_mhz: float = 0.0
     # Aggregate RoCE/InfiniBand RX/TX throughput across active ports (bytes/s).
     roce_rx_bps: float = 0.0
     roce_tx_bps: float = 0.0

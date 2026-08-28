@@ -1,609 +1,807 @@
+"""Behavioral tests for the tiling dashboard (src/app.py)."""
+
 from __future__ import annotations
 
+import contextlib
+import re
 from pathlib import Path
 
 from config import configure
+from stats import ClusterStats, SparkUnitStats, TopologyInfo
+
+# ─── fixtures ────────────────────────────────────────────────────────
 
 
-def _plain(widget) -> str:
-    """Renderable plain text: ``Text``/``str`` content either way."""
-    content = widget.content
-    return content.plain if hasattr(content, "plain") else str(content)
+def _config(path: Path, theme: str | None = None, n: int = 2) -> None:
+    lines = ["[app]", "poll_interval = 5", "history_length = 25"]
+    if theme:
+        lines.append(f'theme = "{theme}"')
+    lines += [
+        "[[nodes]]",
+        'label = "head"',
+        'ssh_target = "head"',
+        'vllm_url = "http://192.0.2.10:8000"',
+    ]
+    if n == 2:
+        lines += [
+            "[[nodes]]",
+            'label = "worker"',
+            'ssh_target = "worker"',
+            'vllm_url = "http://192.0.2.11:8000"',
+            "worker = true",
+        ]
+    path.write_text("\n".join(lines) + "\n")
 
 
-def _config(path: Path, theme: str | None = None) -> None:
-    theme_line = (
-        f"""theme = "{theme}"
-"""
-        if theme
-        else ""
-    )
-    path.write_text(
-        f"""
-[app]
-poll_interval = 7
-history_length = 25
-{theme_line}
-[[nodes]]
-label = "primary"
-ssh_target = "primary"
-vllm_url = "http://primary.example.com:8000"
-"""
-    )
+def _unit(label: str, worker: bool = False, online: bool = True, hosted: bool = True):
+    u = SparkUnitStats(label=label)
+    u.is_worker = worker
+    u.online = online
+    u.model_hosted = hosted
+    if hosted:
+        u.model_name = "Qwen3.6-27B-Instruct"
+    if online:
+        u.gpu_util_pct = 73.0
+        u.temp_c = 64.0
+        u.power_w = 430.0
+        u.mem_used_bytes = 62 * 1024**3
+        u.mem_total_bytes = 120 * 1024**3
+        u.swap_total_kb = 4 * 1024 * 1024
+        u.swap_used_kb = 1 * 1024 * 1024
+        u.cpu_cores_util = [50.0] * 20
+        u.cpu_temp_c = 51.0
+        u.gpu_clock_mhz = 2411.0
+        u.roce_rx_bps = 3.2e9
+        u.roce_tx_bps = 1.1e9
+        u.roce_capacity_bps = 5e10
+        u.kv_cache_pct = 32.0
+        u.kv_total_tokens = 3_800_000
+        u.kv_cache_used_tokens = 1_230_000
+        u.kv_prefix_hit_rate = 45.0
+        u.requests_running = 2
+        u.requests_waiting = 1
+        u.prompt_gen_ratio = 3.0
+        u.throughput_tok_s = 1200.0
+        u.prompt_throughput_tok_s = 3600.0
+        u.ttft_p50_ms = 700.0
+        u.ttft_p95_ms = 20500.0
+        u.ttft_p99_ms = 20500.0
+    return u
 
 
-def test_app_uses_configured_poll_interval_and_node_count(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    _config(path)
-    settings = configure(path)
-
-    from app import DGXTop
-
-    app = DGXTop()
-    assert app._current_interval() == 7
-    assert len(settings.nodes) == 1
-
-
-def test_default_theme_applies_through_app(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    _config(path)  # no theme key -> default
-    configure(path)
-
-    from app import DGXTop
-
-    app = DGXTop()
-    assert app.theme == "dgx-dark"
-
-
-def test_app_applies_configured_theme(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    _config(path, theme="tokyo-night-storm")
-    configure(path)
-
-    from app import DGXTop
-
-    app = DGXTop()
-    assert app.theme == "tokyo-night-storm"
-    assert app.current_theme.name == "tokyo-night-storm"
-
-
-def test_custom_themes_are_registered(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    _config(path)
-    configure(path)
-
-    from app import DGXTop
-
-    app = DGXTop()
-    assert app.get_theme("dgx-dark") is not None
-    assert app.get_theme("tokyo-night-storm") is not None
-    assert app.get_theme("tokyo-night-light") is not None
-    assert app.get_theme("tokyo-night") is not None  # Textual built-in
-
-
-async def test_meter_bar_keeps_one_base_color_at_all_utilizations():
-    from textual.app import App, ComposeResult
-
-    from app import MeterBar
-    from themes import CUSTOM_THEMES, build_palette, get_theme
-
-    class MeterHarness(App):
-        CSS = "MeterBar { width: 10; height: 1; }"
-
-        def __init__(self):
-            super().__init__()
-            for theme in CUSTOM_THEMES:
-                self.register_theme(theme)
-            self.theme = "dgx-dark"
-
-        def compose(self) -> ComposeResult:
-            yield MeterBar(metric_color="secondary", id="meter")
-
-    app = MeterHarness()
-    async with app.run_test(size=(20, 5)) as pilot:
-        meter = app.query_one("#meter", MeterBar)
-        palette = build_palette(get_theme("dgx-dark"))
-
-        meter.update_pct(25)
-        await pilot.pause()
-        low_style = str(meter.render().spans[0].style)
-
-        meter.update_pct(95)
-        await pilot.pause()
-        high_style = str(meter.render().spans[0].style)
-
-    assert low_style.lower() == palette.secondary.lower()
-    assert high_style.lower() == palette.secondary.lower()
-
-
-def test_cpu_core_cells_keep_one_hue_and_gain_saturation():
-    from app import _grid_cell
-    from themes import build_palette, get_theme
-
-    palette = build_palette(get_theme("dgx-dark"))
-
-    assert str(_grid_cell(0, palette).style) != palette.accent
-    assert str(_grid_cell(100, palette).style).lower() == palette.accent.lower()
-    assert str(_grid_cell(100, palette).style).lower() != palette.error.lower()
-
-
-def test_light_theme_cpu_ramp_remains_distinct():
-    from app import _metric_ramp
-    from themes import build_palette, get_theme
-
-    palette = build_palette(get_theme("tokyo-night-light"))
-
-    assert _metric_ramp(0, palette, "accent") != palette.background
-    assert _metric_ramp(100, palette, "accent") == palette.accent
-
-
-async def test_theme_binding_opens_picker_and_repaints_title(tmp_path: Path):
-    from textual.widgets import Static
-
-    path = tmp_path / "config.toml"
-    _config(path)
-    configure(path)
-
-    from app import DGXTop
-
-    app = DGXTop()
-    async with app.run_test(size=(120, 40)) as pilot:
-        title = app.query_one("#title", Static)
-        assert "[t]heme" in title.content.plain
-        before = [(str(span.style), span.text) for span in title.content.render(app.console)]
-
-        await pilot.press("t")
-        await pilot.pause()
-        assert type(app.screen).__name__ == "CommandPalette"
-        await pilot.press("escape")
-        await pilot.pause()
-
-        app.theme = "tokyo-night-storm"
-        await pilot.pause()
-        after = [(str(span.style), span.text) for span in title.content.render(app.console)]
-
-    assert before != after
-
-
-def _two_node_config(path: Path) -> None:
-    path.write_text(
-        """
-[app]
-poll_interval = 5
-history_length = 25
-
-[[nodes]]
-label = "head"
-ssh_target = "head"
-vllm_url = "http://head.example.com:8000"
-
-[[nodes]]
-label = "worker"
-ssh_target = "worker"
-vllm_url = "http://worker.example.com:8000"
-"""
-    )
-
-
-def _fake_cluster():
-    from stats import ClusterStats, SparkUnitStats, TopologyInfo
-
-    units = []
-    for index, label in enumerate(("head", "worker")):
-        unit = SparkUnitStats(label=label)
-        unit.online = True
-        unit.model_hosted = index == 0
-        unit.model_name = "Qwen3.6-27B-Instruct"
-        unit.gpu_util_pct = 73.0
-        unit.temp_c = 64.0
-        unit.mem_used_bytes = 62 * 1024**3
-        unit.mem_total_bytes = 120 * 1024**3
-        unit.swap_total_kb = 4 * 1024 * 1024
-        unit.swap_used_kb = 1 * 1024 * 1024
-        unit.cpu_cores_util = [50.0] * 20
-        unit.cpu_temp_c = 51.0
-        unit.cpu_freq_mhz = 2700.0
-        unit.power_w = 430.0
-        unit.roce_rx_bps = 3.2e9
-        unit.roce_tx_bps = 1.1e9
-        unit.roce_capacity_bps = 5e10  # (3.2+1.1)e9 / 5e10 -> 9%
-        unit.kv_cache_pct = 32.0
-        unit.kv_total_tokens = 3_800_000
-        unit.kv_cache_used_tokens = 1_230_000
-        unit.kv_prefix_hit_rate = 45.0
-        unit.requests_running = 2
-        unit.requests_waiting = 1
-        unit.prompt_gen_ratio = 3.0
-        unit.throughput_tok_s = 1200.0
-        unit.prompt_throughput_tok_s = 3600.0
-        units.append(unit)
+def _cluster(units=None):
+    if units is None:
+        units = [_unit("head"), _unit("worker", worker=True)]
     return ClusterStats(units=units, topology=TopologyInfo(topology_type="DUAL"))
 
 
-async def test_compact_tier_fits_a_320x320_viewport(tmp_path: Path, monkeypatch):
-    """A ~320x320px viewport (40x21 cells) must show every tile and metric."""
-    from textual.widgets import Static
-
-    import app as app_module
-    from app import DGXTop, NodeTile, ThroughputTile
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-
-    async def fake_poll():
-        return _fake_cluster()
-
-    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
-
-    app = DGXTop()
-    async with app.run_test(size=(40, 21)) as pilot:
-        await pilot.pause()
-
-        assert app.density == "compact"
-        throughput = app.query_one(ThroughputTile)
-        nodes = list(app.query(NodeTile))
-        assert len(nodes) == 2
-        # Throughput is the priority signal: it keeps two-row sparklines and so
-        # gets two rows more than a node tile.
-        assert throughput.region.height == 7
-        for tile in [throughput, *nodes]:
-            assert tile.region.bottom <= 21, f"{tile.id} overflows the viewport"
-        for node in nodes:
-            assert node.region.height == 6
-
-        def text(selector: str) -> str:
-            return app.query_one(selector, Static).content.plain
-
-        # Every metric survives the fold: throughput min/avg/max for both
-        # streams, requests/waiting/hit-rate/ratio, KV capacity, and the
-        # per-node GPU/memory/swap/CPU/power/frequency/RoCE values plus all 20
-        # core cells.
-        prompt_stats = text("#tp-prompt-stats")
-        assert prompt_stats.startswith("P ") and "7200" in prompt_stats
-        gen_stats = text("#tp-gen-stats")
-        assert gen_stats.startswith("G ") and "2400" in gen_stats
-        assert text("#kv-header") == "2r  1w  h 45%  3:1"
-        assert text("#kv-detail") == "1.2M/3.8M 32%"
-        for idx in (0, 1):
-            assert text(f"#node-gpu-row-{idx}") == "G 73% 64°C 430W"
-            assert text(f"#node-mem-row-{idx}") == "M 62G/120G 52% s1.0G"
-            assert text(f"#node-cpu-row-{idx}") == "C 50% 51°C 2.7G"
-            assert text(f"#node-roce-row-{idx}") == "R ↓3.2G ↑1.1G 9%"
-            assert text(f"#node-cpu-grid-{idx}").count("\u25a0") == 20
-
-
-async def test_roce_row_tracks_density_and_uses_kv_purple(tmp_path: Path, monkeypatch):
-    """RoCE value color matches the KV purple; every density shows it.
-
-    Roomy and compact get a dedicated row with rates + utilization; dense
-    folds onto the CPU row (rates+% at 3 columns, % alone at 2 columns).
-    """
-    from textual.widgets import Static
-
-    from app import DGXTop
-    from themes import build_palette, get_theme
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    purple = build_palette(get_theme("dgx-dark")).primary.lower()
-
-    def purple_spans(widget) -> bool:
-        for sp in widget.content.spans:
-            style = sp.style
-            if style is None:
-                continue
-            if isinstance(style, str):
-                if purple in style.lower():
-                    return True
-                continue
-            color = style.color
-            if color is None:
-                continue
-            value = color.hex if hasattr(color, "hex") else str(color)
-            if value.lower() == purple:
-                return True
-        return False
-
-    app = DGXTop()
-    async with app.run_test(size=(180, 22)) as pilot:
-        await pilot.pause()
-        assert app.density == "roomy"
-        rok = app.query_one("#node-roce-row-0", Static)
-        assert rok.content.plain == "RoCE ↓3.2G ↑1.1G 9%"
-        assert purple_spans(rok)  # the value is the same purple as KV
-
-        # 3-column dense: full fold with rates + percent.
-        await _resize(pilot, 180, 12)
-        assert app.density == "dense"
-        text = app.query_one("#node-cpu-row-0", Static).content.plain
-        assert "R↓3.2G↑1.1G 9%" in text, text
-        assert purple_spans(app.query_one("#node-cpu-row-0", Static))
-
-        # 2-column dense: percent-only fold (rates live on the wider tiers).
-        await _resize(pilot, 70, 24)
-        assert app.density == "dense"
-        text = app.query_one("#node-cpu-row-0", Static).content.plain
-        assert "R 9%" in text and "↓" not in text, text
-
-
-def _stub_polling(monkeypatch) -> None:
-    """Serve synthetic telemetry so layout assertions never race a real poll."""
+def _stub(monkeypatch, units=None):
     import app as app_module
 
     async def fake_poll():
-        return _fake_cluster()
+        return _cluster(units)
 
     monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
 
 
-async def _resize(pilot, width: int, height: int) -> None:
+async def _resize(pilot, width, height):
     await pilot.resize_terminal(width, height)
     await pilot.pause()
     await pilot.pause()
 
 
-async def test_medium_tier_shows_every_node_tile(tmp_path: Path, monkeypatch):
-    """The two-column tier must wrap onto a second row, not clip a node."""
-    from app import DGXTop, NodeTile
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    app = DGXTop()
-    async with app.run_test(size=(70, 60)) as pilot:
-        await pilot.pause()
-
-        assert app.query_one("#kpis").has_class("medium")
-        heights = sorted(tile.region.height for tile in app.query(NodeTile))
-        assert heights == [16, 16]
-
-
-async def test_density_steps_down_one_tier_at_a_time(tmp_path: Path, monkeypatch):
-    """Density follows the rows each grid row gets: roomy → dense → compact."""
-    from app import DGXTop
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    app = DGXTop()
-    async with app.run_test(size=(180, 16)) as pilot:
-        await pilot.pause()
-        assert app.density == "roomy"
-
-        await _resize(pilot, 180, 14)
-        assert app.density == "dense"
-
-        await _resize(pilot, 180, 11)
-        assert app.density == "compact"
-
-        # One column of three tiles needs three times the height for the same
-        # density, so the same rows buy a looser layout at three columns.
-        await _resize(pilot, 40, 40)
-        assert app.density == "dense"
-
-        await _resize(pilot, 40, 26)
-        assert app.density == "compact"
-
-        await _resize(pilot, 40, 50)
-        assert app.density == "roomy"
-
-
-async def test_tiles_fill_the_viewport_until_they_cap_out(tmp_path: Path, monkeypatch):
-    """No dead space: the grid stretches to the bottom until tiles cap out."""
-    from app import DGXTop, NodeTile, ThroughputTile
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    app = DGXTop()
-    async with app.run_test(size=(180, 12)) as pilot:
-        await pilot.pause()
-
-        for height, expected in ((12, 10), (14, 12), (16, 14), (40, 16)):
-            await _resize(pilot, 180, height)
-            tiles = list(app.query(ThroughputTile)) + list(app.query(NodeTile))
-            for tile in tiles:
-                assert tile.region.height == expected, (
-                    f"{tile.id} is {tile.region.height} rows at height {height}"
-                )
-
-
-async def test_no_row_is_clipped_at_any_viewport(tmp_path: Path, monkeypatch):
-    """Fluidity invariant: every row stays inside its tile at every size.
-
-    Covers all three densities, all three column tiers and the scrolling floor.
-    """
-    from textual.widgets import Static
-
-    from app import DGXTop, NodeTile, ThroughputTile
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    sizes = (
-        (180, 40),
-        (180, 16),
-        (180, 12),
-        (120, 22),
-        (70, 24),
-        (40, 50),
-        (40, 40),
-        (40, 26),
-        (40, 21),
-        (26, 16),
-    )
-
-    app = DGXTop()
-    async with app.run_test(size=(180, 40)) as pilot:
-        await pilot.pause()
-
-        for width, height in sizes:
-            await _resize(pilot, width, height)
-            # Compact drops the border, so the last usable row is the tile's own
-            # bottom; the bordered densities lose one row to it.
-            border = 0 if app.density == "compact" else 1
-            for tile in list(app.query(ThroughputTile)) + list(app.query(NodeTile)):
-                limit = tile.region.bottom - border
-                for child in tile.walk_children():
-                    assert child.region.bottom <= limit, (
-                        f"{type(child).__name__} in {tile.id} is clipped at "
-                        f"{width}x{height} ({app.density})"
-                    )
-                    # Glyph-level guard: a Static whose text is wider than the
-                    # tile content truncates silently (the region check above
-                    # can't see it), dropping the metric — e.g. the dense CPU
-                    # row with folded RoCE rates. The spaced core grid is the
-                    # one accepted pre-existing 2-column truncation.
-                    if (
-                        isinstance(child, Static)
-                        and "cores" not in child.classes
-                        and (plain := _plain(child))
-                    ):
-                        assert len(plain) <= max(1, tile.content_size.width), (
-                            f"{child.id} text ({len(plain)} cols) overflows "
-                            f"{tile.id} content width {tile.content_size.width} "
-                            f"at {width}x{height} ({app.density})"
-                        )
-
-
-async def test_history_charts_hold_full_pair_width(tmp_path: Path, monkeypatch):
-    """All three history bar charts must span the whole tile width at every tier.
-
-    Each label floats over its chart (``position: absolute``) so it takes no
-    horizontal space and cannot starve the chart. Every chart -- prompt,
-    generation, and KV usage -- must fill the entire tile width, with its label
-    overlaid on top rather than sitting beside it.
-    """
-    from textual.widgets import Sparkline, Static
-
-    from app import DGXTop
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    app = DGXTop()
-    async with app.run_test(size=(180, 40)) as pilot:
-        await pilot.pause()
-
-        # Three columns, two columns, and the compact ~320x320px narrow
-        # single-column tier ((40, 21), the same viewport the compact test uses).
-        for width, height in ((180, 22), (120, 22), (70, 24), (46, 30), (40, 21)):
-            await _resize(pilot, width, height)
-
-            tile = app.query_one("#kpi-throughput")
-            charts = [
-                app.query_one(cid, Sparkline)
-                for cid in ("#tp-prompt-chart", "#tp-gen-chart", "#kv-usage-chart")
-            ]
-            for chart in charts:
-                assert chart.region.width == tile.content_size.width, (
-                    f"{chart.id} is {chart.region.width}/{tile.content_size.width} "
-                    f"at {width}x{height}"
-                )
-            # Each label floats on the top row, left-aligned with the chart, and
-            # the chart plot is offset one row below it so the bars form a clean
-            # rectangle instead of rising past the label. The label shares the
-            # chart's left edge and sits exactly one row above the plot.
-            labels = ("#tp-prompt-stats", "#tp-gen-stats", "#kv-detail")
-            for stats_id, chart in zip(labels, charts):
-                stats = app.query_one(stats_id, Static)
-                assert stats.styles.position == "absolute"
-                assert stats.region.x == chart.region.x, (
-                    f"{stats_id} should share {chart.id}'s left edge, not sit beside "
-                    f"it, got {stats.region} vs {chart.region} at {width}x{height}"
-                )
-                assert stats.region.height == 1 and stats.region.y == chart.region.y - 1, (
-                    f"{stats_id} should be a one-row label directly above {chart.id}, "
-                    f"got {stats.region} vs {chart.region} at {width}x{height}"
-                )
-                assert stats.region.width < chart.region.width, (
-                    f"{stats_id} should be a floating label inside the chart span, "
-                    f"got width {stats.region.width} vs {chart.region.width} "
-                    f"at {width}x{height}"
-                )
-
-
-async def test_dense_layout_fits_a_180_pixel_tall_viewport(tmp_path: Path, monkeypatch):
-    """At three columns the dense layout must fit 12 rows (~180px)."""
-    from app import DGXTop, NodeTile, ThroughputTile
-
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-    _stub_polling(monkeypatch)
-
-    app = DGXTop()
-    async with app.run_test(size=(180, 12)) as pilot:
-        await pilot.pause()
-
-        assert app.density == "dense"
-        kpis = app.query_one("#kpis")
-        assert not kpis.has_class("narrow") and not kpis.has_class("medium")
-        tiles = list(app.query(ThroughputTile)) + list(app.query(NodeTile))
-        for tile in tiles:
-            assert tile.region.height == 10
-            assert tile.region.bottom <= 12, f"{tile.id} overflows the viewport"
-        # Every child row is inside the tile, i.e. nothing is clipped by the
-        # border the way the KV risk row used to be.
-        for tile in tiles:
-            for child in tile.walk_children():
-                assert child.region.bottom <= tile.region.bottom - 1
-
-
-async def test_non_finite_samples_do_not_crash_the_app(tmp_path: Path, monkeypatch):
-    """NaN/Inf metrics must never reach a Sparkline.
-
-    Regression for the "everything goes blank" bug: Textual's Sparkline raises
-    ValueError on non-finite data during the compositor repaint, which exits
-    the whole app. The history guards must drop the bad samples so the app
-    keeps running.
-    """
+def _seed_history(app):
+    """Give the charts real history so sparklines/area chart populate."""
     import collections
-    import math
 
-    import app as app_module
+    app.history["throughput"] = collections.deque([40 + (i * 7) % 60 for i in range(24)], maxlen=25)
+    app.history["prompt-throughput"] = collections.deque(
+        [120 + (i * 11) % 90 for i in range(24)], maxlen=25
+    )
+    app.history["kv-usage-head"] = collections.deque(
+        [18 + (i * 3) % 15 for i in range(24)], maxlen=25
+    )
+    app._update_ui()
+
+
+def _style_at(text, idx):
+    """Rich span styles covering character offset ``idx``."""
+    out = []
+    for sp in text.spans:
+        if sp.start <= idx < sp.end:
+            out.append(str(sp.style))
+    return out
+
+
+# ─── config / theme (module wiring) ──────────────────────────────────
+
+
+def test_app_uses_configured_poll_interval_and_node_count(tmp_path: Path):
     from app import DGXTop
-    from stats import ClusterStats, SparkUnitStats, TopologyInfo
 
-    path = tmp_path / "config.toml"
-    _two_node_config(path)
-    configure(path)
-
-    async def bad_cluster():
-        bad = SparkUnitStats(label="head", model_hosted=True)
-        bad.kv_cache_pct = float("nan")
-        bad.throughput_tok_s = float("inf")
-        bad.prompt_throughput_tok_s = float("nan")
-        bad.kv_total_tokens = 3_800_000
-        bad.kv_cache_used_tokens = 1_230_000
-        bad.requests_running = 1
-        worker = SparkUnitStats(label="worker", online=False)
-        return ClusterStats(units=[bad, worker], topology=TopologyInfo(topology_type="SINGLE"))
-
-    monkeypatch.setattr(app_module, "poll_cluster", bad_cluster)
-
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
     app = DGXTop()
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        await pilot.pause()
+    assert app._current_interval() == 5
+    assert len(app.settings.nodes) == 2
+    # bindings intact (AC12)
+    keys = {b.key for b in app.BINDINGS}
+    assert {"plus", "minus", "t", "q", "r"} <= keys
 
-        # Pre-fix the repaint with the NaN in the chart raises and exits.
-        assert app.is_running
-        assert all(math.isfinite(v) for v in app.history["throughput"])
-        assert all(math.isfinite(v) for v in app.history["prompt-throughput"])
-        # The NaN KV sample was dropped entirely, not painted as a value.
-        assert app.history["kv-usage-head"] == collections.deque()
+
+async def test_default_theme_and_custom_registration(tmp_path: Path):
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)):
+        assert app.current_theme.name == "dgx-aeon"
+
+
+# ─── AC1: caret title-in-border header fidelity ──────────────────────
+
+
+async def test_node_box_header_matches_caret_pattern(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+    from themes import build_palette
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        pal = build_palette(app.current_theme)
+        node = app.query_one("#node-1", NodeBox)
+        text = node.render()
+        top = text.plain.split("\n")[0]
+        # exact structural pattern from the requested example, and exact width
+        assert re.match(r"^╭─┤ \^ \w+ (host|worker) ├─+┤ [0-9.]+ ├─╮$", top), top
+        assert len(top) == node.content_size.width
+        # worker caret/role are the warn (orange) identity colour
+        caret_idx = top.index("^")
+        assert any(pal.warn.lower() in s.lower() for s in _style_at(text, caret_idx))
+
+
+# ─── AC2: heavy focused vs light node charsets ───────────────────────
+
+
+async def test_serving_heavy_vs_node_light_charsets(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox, ServingBox
+    from themes import build_palette
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        pal = build_palette(app.current_theme)
+        serv = app.query_one("#serving", ServingBox).render()
+        node = app.query_one("#node-0", NodeBox).render()
+        s_top = serv.plain.split("\n")[0]
+        n_top = node.plain.split("\n")[0]
+        # serving uses the same light charset as node containers
+        assert s_top.startswith("╭─") and serv.plain.split("\n")[-1].startswith("╰")
+        assert n_top.startswith("╭─") and node.plain.split("\n")[-1].startswith("╰")
+        # both borders are now dim grey (the focus cyan was removed)
+        assert any(pal.dim.lower() in s.lower() for s in _style_at(serv, 0))
+        assert not any(pal.cyan.lower() in s.lower() for s in _style_at(serv, 0))
+        assert any(pal.dim.lower() in s.lower() for s in _style_at(node, 0))
+
+
+# ─── AC3: tiling geometry ────────────────────────────────────────────
+
+
+async def test_tiling_geometry_side_by_side(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        assert app.mode == "tiling"
+        serv = app.query_one("#serving", ServingBox).region
+        n0 = app.query_one("#node-0", NodeBox).region
+        n1 = app.query_one("#node-1", NodeBox).region
+        # SERVING left of the node column, node windows stacked with a gap
+        assert serv.x == 0 and n0.x > serv.right
+        assert n1.y >= n0.bottom + 1  # one blank gap row between stacked windows
+        # both windows span into the right half; nothing exceeds the viewport
+        for r in (serv, n0, n1):
+            assert r.bottom <= 40
+
+
+# ─── AC4/AC10: every metric survives width sweep, never scroll ───────
+
+
+async def test_every_metric_survives_and_never_scrolls(tmp_path: Path, monkeypatch):
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        for w, h in [(132, 44), (100, 40), (80, 40), (63, 40), (50, 40)]:
+            await _resize(pilot, w, h)
+            blob = "\n".join(
+                wid.render().plain
+                for wid in app.screen.query("Waybar, ServingBox, NodeBox, StatusBar")
+            )
+            for token in (
+                "gpu",
+                "mem",
+                "cpu",
+                "roce",
+                "kv",
+                "cache",
+                "ttft",
+                "73%",
+                "64°C",
+                "430W",
+                "32%",
+            ):
+                assert token in blob or token.replace("gpu", "g") in blob, (w, h, token)
+            assert app.screen.max_scroll_y == 0, (w, h)
+
+
+async def test_floor_never_scrolls_or_clips(tmp_path: Path, monkeypatch):
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        for w in (40, 50, 63, 80, 96, 132):
+            await _resize(pilot, w, 8)
+            assert app.floor, (w, "should be floor at h=8")
+            assert app.screen.max_scroll_y == 0, (w, "scroll")
+            vis = [
+                wid
+                for wid in app.screen.query("Waybar, ServingBox, NodeBox, StatusBar")
+                if wid.region.height
+            ]
+            for wid in vis:
+                r = wid.region
+                assert r.bottom <= 8, (w, wid.id, r.bottom)
+            # No two visible widgets may share screen space: max_scroll_y==0 and
+            # bottom<=h both hold even when widgets overlap exactly, so assert
+            # rectangle disjointness directly.
+            for i, a in enumerate(vis):
+                for b in vis[i + 1 :]:
+                    ra, rb = a.region, b.region
+                    separated = (
+                        ra.x + ra.width <= rb.x
+                        or rb.x + rb.width <= ra.x
+                        or ra.y + ra.height <= rb.y
+                        or rb.y + rb.height <= ra.y
+                    )
+                    assert separated, (w, a.id, b.id, ra, rb)
+
+
+async def test_density_ladder_steps_down(tmp_path: Path, monkeypatch):
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        seen = []
+        for h in (44, 30, 20, 12, 8):
+            await _resize(pilot, 132, h)
+            tier = "floor" if app.floor else ("rail" if app.rail else app.density)
+            seen.append(tier)
+        order = ["roomy", "dense", "compact", "rail", "floor"]
+        ranks = [order.index(t) for t in seen]
+        assert ranks == sorted(ranks), seen  # monotonically denser
+        assert seen[0] == "roomy" and seen[-1] == "floor"
+
+
+# ─── AC5: gradient meters vs single-hue KV ───────────────────────────
+
+
+async def test_node_meter_is_gradient_kv_is_single_hue(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        node = app.query_one("#node-0", NodeBox).render()
+        gpu_meter = node.plain.split("\n")[2]  # top, gpu, meter
+        base = sum(len(line) + 1 for line in node.plain.split("\n")[:2])
+        fill_positions = [base + i for i, ch in enumerate(gpu_meter) if ch == "█"]
+        colors = {tuple(_style_at(node, p)) for p in fill_positions}
+        assert len(colors) > 1, "gpu gradient meter should ramp per cell"
+
+        serv = app.query_one("#serving", ServingBox).render()
+        lines = serv.plain.split("\n")
+        kv_line_idx = next(i for i, ln in enumerate(lines) if "kv%" in ln)
+        kbase = sum(len(line) + 1 for line in lines[:kv_line_idx])
+        kv_line = lines[kv_line_idx]
+        kfill = [kbase + i for i, ch in enumerate(kv_line) if ch == "█"]
+        kcolors = {tuple(_style_at(serv, p)) for p in kfill}
+        assert len(kcolors) == 1, "kv meter is single hue"
+
+
+# ─── AC6: serving area chart ─────────────────────────────────────────
+
+
+async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
+        assert not any("last 24 samples" in ln for ln in lines)  # chart label removed
+        chart_rows = [ln for ln in lines if any(c in ln for c in "▁▂▃▄▅▆▇█")]
+        # gen/prompt/kv sparklines + a multi-row area chart
+        assert len(chart_rows) >= 3
+
+
+# ─── AC7: waybar ─────────────────────────────────────────────────────
+
+
+async def test_waybar_shows_cluster_chrome(tmp_path: Path, monkeypatch):
+    from app import DGXTop, Waybar
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        wb = app.query_one("#waybar", Waybar)
+        text = wb.render()
+        plain = text.plain
+        # workspace chips + aggregate temp/power/clock removed; only online count
+        assert "● 2/2" in plain
+        assert "°C" not in plain and "W" not in plain
+        assert " 2 3" not in plain
+        assert "Qwen3.6-27B-Instruct" in plain
+        assert len(plain) == wb.content_size.width
+
+
+# ─── AC8: CPU frequency renders MHz ──────────────────────────────────
+
+
+def test_fmt_freq_renders_mhz():
+    from app import _fmt_freq
+
+    assert _fmt_freq(2808.0) == "2808MHz"
+    assert _fmt_freq(3900.0) == "3900MHz"
+    assert _fmt_freq(0) == ""
+
+
+async def test_node_gpu_row_shows_sm_clock(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        node = app.query_one("#node-0", NodeBox).render().plain
+        gpu_line = next(ln for ln in node.split("\n") if "gpu" in ln)
+        assert "2411MHz" in gpu_line
+
+
+# ─── AC9: bottom bar only in the most compressed tiers ───────────────
+
+
+async def test_statusbar_only_in_compressed_tiers(tmp_path: Path, monkeypatch):
+    from app import DGXTop, StatusBar
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        sb = app.query_one("#statusbar", StatusBar)
+        await _resize(pilot, 132, 44)
+        assert not (app.rail or app.floor)
+        assert sb.styles.display == "none"
+        await _resize(pilot, 50, 12)
+        assert app.rail
+        assert sb.styles.display == "block"
+        await _resize(pilot, 40, 8)
+        assert app.floor
+        assert sb.styles.display == "block"
+
+
+# ─── AC8: status bar mode badge + offline flip ───────────────────────
+
+
+async def test_statusbar_badge_and_offline_flip(tmp_path: Path, monkeypatch):
+    from app import DGXTop, StatusBar
+    from themes import build_palette
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await _resize(pilot, 132, 12)  # statusbar renders only in compressed tiers
+        pal = build_palette(app.current_theme)
+        sb = app.query_one("#statusbar", StatusBar).render()
+        assert "HEALTHY" in sb.plain and "KV 32%" in sb.plain
+        badge_idx = sb.plain.index("HEALTHY")
+        assert any(f"on {pal.ok}".lower() in s.lower() for s in _style_at(sb, badge_idx))
+
+    _stub(
+        monkeypatch, units=[_unit("head"), _unit("worker", worker=True, online=False, hosted=False)]
+    )
+    app2 = DGXTop()
+    async with app2.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await _resize(pilot, 132, 12)
+        pal = build_palette(app2.current_theme)
+        sb = app2.query_one("#statusbar", StatusBar).render()
+        assert "WARN" in sb.plain
+        w_idx = sb.plain.index("WARN")
+        assert any(f"on {pal.warn}".lower() in s.lower() for s in _style_at(sb, w_idx))
+
+
+# ─── AC9: offline node ───────────────────────────────────────────────
+
+
+async def test_offline_node_dashes_and_glyph(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(
+        monkeypatch, units=[_unit("head"), _unit("worker", worker=True, online=False, hosted=False)]
+    )
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        lines = app.query_one("#node-1", NodeBox).render().plain.split("\n")
+        top = lines[0]
+        assert "✗" in top and "worker" in top  # glyph state, label kept
+        for label in ("gpu", "mem", "cpu", "roce"):
+            row = next(ln for ln in lines if ln.lstrip("│ ").startswith(label))
+            assert "—" in row, (label, row)
+        assert top.startswith("╭─") and lines[-1].startswith("╰")
+
+
+# ─── AC11: non-finite gating + theme repaint ─────────────────────────
+
+
+async def test_non_finite_samples_do_not_crash(tmp_path: Path, monkeypatch):
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+
+    bad = _unit("head")
+    bad.kv_cache_pct = float("nan")
+    bad.throughput_tok_s = float("inf")
+    _stub(monkeypatch, units=[bad, _unit("worker", worker=True)])
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        # renders without raising; charts never see NaN/Inf
+        app.query_one("#serving").render()
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_theme_switch_repaints(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+    from themes import build_palette
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        app.theme = "tokyo-night"
+        await pilot.pause()
+        pal = build_palette(app.current_theme)
+        node = app.query_one("#node-0", NodeBox).render()
+        # host caret repaints to tokyo-night cyan
+        top = node.plain.split("\n")[0]
+        assert any(pal.cyan.lower() in s.lower() for s in _style_at(node, top.index("^")))
+
+
+# ─── helper units ────────────────────────────────────────────────────
+
+
+def test_ttft_tail_thresholds():
+    from app import _ttft_tail
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    assert _ttft_tail(0.9, pal)[0] == ""
+    assert _ttft_tail(3.0, pal)[0] == "!"
+    assert _ttft_tail(9.0, pal)[0] == "!!"
+
+
+def test_ramp_moves_green_to_red():
+    from app import _ramp
+
+    low = _ramp(0)
+    high = _ramp(100)
+    assert low != high
+    assert low.lower().startswith("#9e") or low.lower() == "#9ece6a"  # green
+    assert high.lower() == "#f7768e"  # red
+
+
+def test_box_lines_are_exact_width():
+    from app import _box_lines
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    from rich.text import Text
+
+    rows = [Text("gpu 73%"), Text("mem 50%")]
+    for focused in (True, False):
+        lines = _box_lines(
+            40, [("^", ""), (" head", ""), (" host", "")], [("1.2.3.4", "")], rows, focused, pal
+        )
+        assert all(len(ln.plain) == 40 for ln in lines), [ln.plain for ln in lines]
+
+
+def test_box_clamps_overlong_title():
+    from rich.text import Text
+
+    from app import _box_lines
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    lines = _box_lines(
+        24,
+        [("^", ""), (" a-very-long-node-name", ""), (" worker", "")],
+        [("198.51.100.200", "")],
+        [Text("x")],
+        False,
+        pal,
+    )
+    assert all(len(ln.plain) == 24 for ln in lines)
+
+
+# ─── meter treatments + quiet mode ───────────────────────────────────
+
+
+def _config_treated(path: Path, treatment: str, quiet: bool = False) -> None:
+    lines = [
+        "[app]",
+        "poll_interval = 5",
+        "history_length = 25",
+        f'meter_treatment = "{treatment}"',
+        f"quiet = {'true' if quiet else 'false'}",
+        "[[nodes]]",
+        'label = "head"',
+        'ssh_target = "head"',
+        'vllm_url = "http://192.0.2.10:8000"',
+        "[[nodes]]",
+        'label = "worker"',
+        'ssh_target = "worker"',
+        'vllm_url = "http://192.0.2.11:8000"',
+        "worker = true",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _meter_row(app, idx=0):
+    """(row_text, absolute_offset, node_text) of node idx's GPU meter row."""
+    from app import NodeBox
+
+    node = app.query_one(f"#node-{idx}", NodeBox).render()
+    lines = node.plain.split("\n")
+    # top rule, gpu headline, meter
+    row_idx = 2
+    base = sum(len(ln) + 1 for ln in lines[:row_idx])
+    return lines[row_idx], base, node
+
+
+@contextlib.asynccontextmanager
+async def _treated_app(tmp_path, monkeypatch, treatment, quiet=False):
+    from app import DGXTop
+
+    _config_treated(tmp_path / "config.toml", treatment, quiet)
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        yield app, pilot
+
+
+async def test_line_treatment_renders(tmp_path: Path, monkeypatch):
+    from app import ServingBox
+
+    async with _treated_app(tmp_path, monkeypatch, "line") as (app, pilot):
+        await pilot.pause()
+        _seed_history(app)
+        row, _, node = _meter_row(app)
+        assert "━" in row and "─" in row, row
+        assert "█" not in row and "▓" not in row
+        serv = app.query_one("#serving", ServingBox).render()
+        kv_row = next(ln for ln in serv.plain.split("\n") if "kv%" in ln)
+        assert "━" in kv_row, kv_row
+
+
+async def test_tick_treatment_renders(tmp_path: Path, monkeypatch):
+    from app import ServingBox
+
+    async with _treated_app(tmp_path, monkeypatch, "tick") as (app, pilot):
+        await pilot.pause()
+        _seed_history(app)
+        row, _, _ = _meter_row(app)
+        assert row.strip(), "tick row renders"
+        from app import _meter_line
+        from themes import build_palette, get_theme
+
+        pal = build_palette(get_theme("dgx-aeon"))
+        text = _meter_line("tick", 50, 20, pal, pal.blue)
+        assert text.plain.count("━") == 1, "exactly one bright marker"
+        assert "╾" in text.plain and "┈" in text.plain, "dim scale on both sides"
+        serv = app.query_one("#serving", ServingBox).render()
+        kv_row = next(ln for ln in serv.plain.split("\n") if "kv%" in ln)
+        assert kv_row.strip() != ""
+
+
+async def test_spark_treatment_renders(tmp_path: Path, monkeypatch):
+    from app import ServingBox
+
+    async with _treated_app(tmp_path, monkeypatch, "spark") as (app, pilot):
+        await pilot.pause()
+        _seed_history(app)
+        row, _, _ = _meter_row(app)
+        spark_chars = set("▁▂▃▄▅▆▇█")
+        assert any(ch in spark_chars for ch in row), row
+        serv = app.query_one("#serving", ServingBox).render()
+        kv_row = next(ln for ln in serv.plain.split("\n") if "kv%" in ln)
+        assert any(ch in spark_chars for ch in kv_row), kv_row
+
+
+async def test_gpu_mem_history_recorded(tmp_path: Path, monkeypatch):
+    from app import NodeBox
+
+    async with _treated_app(tmp_path, monkeypatch, "line") as (app, pilot):
+        await pilot.pause()
+        _seed_history(app)
+        assert len(app.history["gpu-head"]) >= 1  # recorded on each poll
+        assert 0 <= app.history["gpu-head"][0] <= 100
+        assert 0 <= app.history["mem-head"][0] <= 100
+        node = app.query_one("#node-0", NodeBox)
+        assert node._gpu_history, "gpu history passed into NodeBox"
+        assert node._mem_history
+
+
+async def test_quiet_palette_and_ramp():
+    from app import _ramp
+    from themes import build_palette, get_theme
+
+    loud = build_palette(get_theme("dgx-aeon"))
+    quiet = build_palette(get_theme("dgx-aeon"), quiet=True)
+    assert quiet.quiet is True and loud.quiet is False
+    for role in ("accent", "ok", "blue", "cyan"):
+        assert getattr(quiet, role) == quiet.fg, role
+    assert _ramp(40, quiet) == quiet.fg
+    assert _ramp(80, quiet) == quiet.warn
+    assert _ramp(95, quiet) == "#f7768e"
+    # loud ramp unchanged
+    assert _ramp(40, loud) == _ramp(40)
+
+
+async def test_quiet_composes_with_treatment(tmp_path: Path, monkeypatch):
+    from app import _palette_for
+
+    async with _treated_app(tmp_path, monkeypatch, "line", quiet=True) as (app, pilot):
+        await pilot.pause()
+        _seed_history(app)
+        assert _palette_for(app).quiet is True
+        row, _, node = _meter_row(app)
+        assert "━" in row
+        # healthy values stay neutral: no accent hue anywhere on the meter row
+        offset = node.plain.index(row)
+        spans = [sp for sp in node.spans if sp.start >= offset and sp.end <= offset + len(row)]
+        assert all("f7768e" not in str(sp.style) for sp in spans)
+
+
+async def test_meter_escalates_to_crit(tmp_path: Path, monkeypatch):
+    from app import NodeBox
+
+    async with _treated_app(tmp_path, monkeypatch, "line") as (app, pilot):
+        await pilot.pause()
+        unit = _unit("head")
+        unit.gpu_util_pct = 94.0
+        app.cluster = _cluster([unit, _unit("worker", worker=True)])
+        app._update_ui()
+        node = app.query_one("#node-0", NodeBox).render()
+        assert "f7768e" in str(node.spans), "94% meter escalates to crit red"
+
+
+# ─── serving top-row alignment ────────────────────────────────────────
+
+
+async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
+    """AC: gen/prompt/kv/kv% graphs share one width and tails align; blank
+    spacer rows separate the graph rows; nothing overflows the box."""
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#serving", ServingBox)
+        box.update_throughput(
+            [40 + (i * 7) % 60 for i in range(24)], [120 + (i * 11) % 90 for i in range(24)], []
+        )
+        box.update_kv(
+            32.0,
+            req=2,
+            wait=1,
+            used_tok=1_230_000,
+            total_tok=3_800_000,
+            prefix_hit=45.0,
+            kv_history=[18 + (i * 3) % 15 for i in range(24)],
+            ttft_p50_ms=700.0,
+            ttft_p95_ms=20500.0,
+        )
+        await pilot.pause()
+        width = box.content_size.width
+        lines = box.render().plain.split("\n")
+        interior = lines[1:-1]  # strip heavy borders
+        assert all(len(ln) == width for ln in interior), "row not padded to box width"
+        by_label = {}
+        for i, ln in enumerate(interior):
+            m = re.match(r"^\u2502 (gen    |prompt |kv     |kv%    )", ln)
+            if m:
+                by_label.setdefault(m.group(1), []).append((i, ln))
+        assert set(by_label) == {"gen    ", "prompt ", "kv     ", "kv%    "}
+        graph_glyphs = set("\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588\u2593\u2591")
+        starts, lens = set(), set()
+        for label, entries in by_label.items():
+            i, ln = entries[0]
+            cols = [j for j, ch in enumerate(ln) if ch in graph_glyphs]
+            assert cols, f"no graph glyphs on {label!r}"
+            starts.add(min(cols))
+            lens.add(max(cols) - min(cols) + 1)
+            assert cols == list(range(min(cols), max(cols) + 1)), f"ragged graph {label!r}"
+        assert len(lens) == 1, f"graph lengths differ: {lens}"
+        assert len(starts) == 1, f"graph starts differ: {starts}"
+        # blank spacer row between the gen/prompt/kv graph rows
+        gen_i = by_label["gen    "][0][0]
+        prompt_i = by_label["prompt "][0][0]
+        kv_i = by_label["kv     "][0][0]
+        assert prompt_i - gen_i == 2 and kv_i - prompt_i == 2
+
+        def blank(ln: str) -> bool:
+            return ln[1:-1].strip() == ""
+
+        kvp_i = by_label["kv%    "][0][0]
+        assert kv_i - prompt_i == 2 and kvp_i - kv_i == 2
+        assert (
+            blank(interior[gen_i + 1])
+            and blank(interior[prompt_i + 1])
+            and blank(interior[kv_i + 1])
+        )
+        # the widest tail (gen) reaches the interior's right edge
+        assert len(by_label["gen    "][0][1][1:-1].rstrip()) == width - 3
