@@ -126,6 +126,8 @@ worker = true
 | `poll_interval`  | Initial polling interval in seconds, from 1 to 60                           |
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
+| `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
+| `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 
 The SSH target and vLLM URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
 
