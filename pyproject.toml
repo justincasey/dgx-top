@@ -7,7 +7,7 @@ name = "dgx-top"
 version = "0.1.0"
 description = "Agentless terminal monitoring for NVIDIA DGX Spark clusters"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "dgx-top contributors" }]
 keywords = ["dgx", "nvidia", "spark", "vllm", "monitoring", "tui"]
@@ -29,7 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.23",
     "ruff>=0.9",
 ]
@@ -54,7 +54,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
