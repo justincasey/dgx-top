@@ -95,22 +95,25 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
         block counts as fully allocated, which is the correct framing for
         capacity planning (the scheduler cannot use partial blocks).
 
-      - vllm:cache_config_info{..., num_gpu_blocks="N", block_size="BS", ...}
-        Static config set at startup. num_gpu_blocks is the total including the
-        null block, so usable = num_gpu_blocks - 1.
+      - vllm:cache_config_info{..., num_gpu_blocks="N", block_size="BS",
+        kv_cache_size_tokens="T", ...} Static config set at startup. Prefer the
+        authoritative kv_cache_size_tokens for capacity (MLA packs several
+        tokens per block, so num_gpu_blocks × block_size undercounts); fall back
+        to the block product when the field is absent or "None".
 
-      - vllm:prefix_cache_hit_rate or vllm:cache_hit_rate (Gauge): 0-1.
+      - vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total
+        (cumulative Counters): hit rate is derived per poll window in
+        _update_prefix_hit_rate (no *_hit_rate gauge exists on modern vLLM).
 
-    Derived token counts: we compute total_tokens = usable_blocks * block_size
-    and used_tokens = total_tokens * usage_pct/100. These represent the
-    *block-allocated token capacity*, not actual stored token count (which
-    would require per-block hash-table inspection). For capacity planning this
-    is the correct metric: "how much of my pool is consumed" at scheduler
-    granularity.
+    Derived token counts: total_tokens (above) and used_tokens =
+    total_tokens * usage_fraction. These are *block-allocated token capacity*,
+    not actual stored tokens; the correct "how much of my pool is consumed"
+    framing for capacity planning.
     """
     s = SparkUnitStats()
     lines = text.strip().splitlines()
     # Cache config — block_size and total_blocks from cache_config_info at startup
+    size_tokens = 0
     for line in lines:
         if "vllm:cache_config_info{" in line:
             m = re.search(r'num_gpu_blocks="(\d+)"', line)
@@ -119,8 +122,13 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
             m = re.search(r'block_size="(\d+)"', line)
             if m:
                 s.kv_block_size = int(m.group(1))
-        if s.kv_total_blocks > 0 and s.kv_block_size > 0:
-            s.kv_total_tokens = s.kv_total_blocks * s.kv_block_size
+            m = re.search(r'kv_cache_size_tokens="(\d+)"', line)
+            if m:
+                size_tokens = int(m.group(1))
+    if size_tokens > 0:
+        s.kv_total_tokens = size_tokens
+    elif s.kv_total_blocks > 0 and s.kv_block_size > 0:
+        s.kv_total_tokens = s.kv_total_blocks * s.kv_block_size
     # KV cache usage — block-level allocation fraction. This is from
     # BlockPool.get_usage(): 1.0 - (free_blocks / (total_gpu_blocks - 1)).
     # vLLM reserves 1 null block, which is already netted out by vLLM
@@ -137,24 +145,23 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
                     s.kv_cache_pct = pct
                     # Derive block and token counts from the usage percentage.
                     # usage_pct already accounts for the null block subtraction.
-                    if s.kv_block_size > 0 and s.kv_total_blocks > 0:
+                    if s.kv_total_tokens > 0:
                         val = float(parts[-1])
                         s.kv_cache_free_blocks = int(s.kv_total_blocks * (1 - val))
-                        used_blocks = s.kv_total_blocks - s.kv_cache_free_blocks
-                        s.kv_cache_used_tokens = used_blocks * s.kv_block_size
+                        s.kv_cache_used_tokens = int(s.kv_total_tokens * val)
     for line in lines:
-        if line.startswith("vllm:prefix_cache_hit_rate"):
+        if line.startswith("vllm:prefix_cache_hits_total"):
             parts = line.split()
             if len(parts) >= 2:
-                hit = float(parts[-1]) * 100
-                if math.isfinite(hit):
-                    s.kv_prefix_hit_rate = hit
-        elif line.startswith("vllm:cache_hit_rate"):
+                v = float(parts[-1])
+                if math.isfinite(v):
+                    s.prefix_hits_total = v
+        elif line.startswith("vllm:prefix_cache_queries_total"):
             parts = line.split()
             if len(parts) >= 2:
-                hit = float(parts[-1]) * 100
-                if math.isfinite(hit):
-                    s.kv_prefix_hit_rate = hit
+                v = float(parts[-1])
+                if math.isfinite(v):
+                    s.prefix_queries_total = v
 
     # Requests running
     for line in lines:
@@ -178,6 +185,7 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     if ttft_lines:
         buckets, count = _parse_prometheus_histogram(ttft_lines, "vllm:time_to_first_token_seconds")
         s.ttft_p50_ms = _estimate_quantile(buckets, count, 0.50) * 1000
+        s.ttft_p95_ms = _estimate_quantile(buckets, count, 0.95) * 1000
         s.ttft_p99_ms = _estimate_quantile(buckets, count, 0.99) * 1000
 
     # ITL histogram
@@ -248,11 +256,11 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     return s
 
 
-def _parse_nvidia_smi(output: str) -> Tuple[float, float, float, float, float]:
-    """Parse nvidia-smi output: gpu_util_pct, mem_util_pct, mem_pct, power_w, temp_c."""
+def _parse_nvidia_smi(output: str) -> Tuple[float, float, float, float, float, float]:
+    """Parse nvidia-smi: gpu_util_pct, mem_util_pct, mem_pct, power_w, temp_c, sm_clock_mhz."""
     lines = output.strip().splitlines()
     if not lines:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     parts = lines[0].split(", ")
     if len(parts) >= 8:
 
@@ -268,9 +276,10 @@ def _parse_nvidia_smi(output: str) -> Tuple[float, float, float, float, float]:
         mem_total = _safe_float(parts[3])
         power = _safe_float(parts[4])
         temp = _safe_float(parts[5])
+        sm_clock = _safe_float(parts[6])
         mem_pct = (mem_used / mem_total * 100) if mem_total > 0 else 0.0
-        return gpu_util, mem_util, mem_pct, power, temp
-    return 0.0, 0.0, 0.0, 0.0, 0.0
+        return gpu_util, mem_util, mem_pct, power, temp, sm_clock
+    return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 
 _prev_cpu_ticks: Dict[str, Tuple[int, ...]] = {}
@@ -460,11 +469,6 @@ def _parse_telemetry_output(stdout: str) -> dict:
                 result[prev_section] = "\n".join(prev_sections)
             prev_section = "topology_output"
             prev_sections = []
-        elif line == "---CPU_FREQ---":
-            if prev_section is not None:
-                result[prev_section] = "\n".join(prev_sections)
-            prev_section = "cpu_freq"
-            prev_sections = []
         elif line == "---ROCE---":
             if prev_section is not None:
                 result[prev_section] = "\n".join(prev_sections)
@@ -532,34 +536,7 @@ def _parse_topology_output(output: str) -> dict:
     return result
 
 
-# ─── CPU frequency & RoCE traffic ───────────────────────────────────────
-
-
-def _parse_cpu_freq(output: str) -> float:
-    """Average current CPU frequency in MHz.
-
-    Handles both ``scaling_cur_freq`` (kHz per cpufreq policy) and the
-    ``cpu MHz`` line of /proc/cpuinfo (already MHz). Returns 0.0 when
-    nothing readable; kHz values are always >= 10000 so the split is safe.
-    """
-    freqs_mhz: list[float] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            value = float(line)
-        except ValueError:
-            # /proc/cpuinfo lines look like "cpu MHz\t: 2700.000"
-            try:
-                value = float(line.split(":", 1)[1].strip())
-            except (ValueError, IndexError):
-                continue
-        if value >= 10000.0:  # scaling_cur_freq in kHz
-            freqs_mhz.append(value / 1000.0)
-        else:  # /proc/cpuinfo "cpu MHz : 2700.000"
-            freqs_mhz.append(value)
-    return sum(freqs_mhz) / len(freqs_mhz) if freqs_mhz else 0.0
+# ─── RoCE traffic ───────────────────────────────────────────────────────
 
 
 def _parse_roce_output(
@@ -748,14 +725,6 @@ async def _fetch_telemetry(ssh_target: str) -> dict:
         "/proc/pressure/memory 2>/dev/null || true ; "
         "sed -n 's/^full avg10=\\([0-9.]*\\)[^t]* total=\\([0-9]*\\).*/\\1 \\2/p' "
         "/proc/pressure/memory 2>/dev/null || true ; "
-        # SECTION: CPU frequency (cpufreq policy current freq in kHz, falling
-        # back to /proc/cpuinfo "cpu MHz" lines when scaling_cur_freq is absent)
-        'echo "---CPU_FREQ---" ; '
-        "cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null ; "
-        # Fall back to /proc/cpuinfo ONLY when no cpufreq policy exists, so a
-        # single MHz sample is never mixed into per-policy kHz values.
-        '[ -z "$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null)" ] && '
-        "grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null ; "
         # SECTION: RoCE/IB traffic counters (PortRcvData/PortXmitData per
         # ACTIVE port, cumulative)
         'echo "---ROCE---" ; '
@@ -832,12 +801,15 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
     # Parse GPU stats
     if "gpu_output" in telemetry:
         try:
-            gpu_util, mem_util, mem_pct, power, temp = _parse_nvidia_smi(telemetry["gpu_output"])
+            gpu_util, mem_util, mem_pct, power, temp, sm_clock = _parse_nvidia_smi(
+                telemetry["gpu_output"]
+            )
             s.gpu_util_pct = gpu_util
             s.mem_util_pct = mem_util
             s.power_w = power
             s.temp_c = temp
             s.gpu_mem_pct = mem_pct
+            s.gpu_clock_mhz = sm_clock
         except Exception as e:
             errors.append(f"GPU: {e}")
     else:
@@ -883,15 +855,6 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
                     s.mem_used_bytes = (mem_total_kb - mem_avail_kb) * 1024
         except Exception:
             pass  # thrash fields stay at defaults
-
-    # Parse CPU frequency
-    if "cpu_freq" in telemetry:
-        try:
-            freq = _parse_cpu_freq(telemetry["cpu_freq"])
-            if freq > 0:
-                s.cpu_freq_mhz = freq
-        except Exception:
-            pass  # freq stays at 0 (unavailable)
 
     # Parse RoCE/IB counter deltas into RX/TX rates
     if "roce_output" in telemetry:
@@ -987,6 +950,34 @@ def _update_prompt_throughput(unit_id: int, s: SparkUnitStats, now: float) -> No
             if math.isfinite(rate):
                 s.prompt_throughput_tok_s = rate
     _prev_prompt_tokens[unit_id] = (now, s.prompt_tokens_total)
+
+
+_prev_prefix: Dict[int, Tuple[float, float]] = {}  # unit_id -> (queries_total, hits_total)
+
+
+def _update_prefix_hit_rate(unit_id: int, s: SparkUnitStats) -> None:
+    """Derive prefix-cache hit rate (%) from the cumulative counters.
+
+    Windowed (delta hits / delta queries) when this poll saw new queries;
+    otherwise the cumulative lifetime ratio, so an idle window still shows a
+    number instead of flickering to '—'. Leaves -1 only when the server has
+    served no prefix-cache queries at all."""
+    if not s.model_hosted or s.prefix_queries_total <= 0:
+        _prev_prefix.pop(unit_id, None)
+        return
+    rate = -1.0
+    prev = _prev_prefix.get(unit_id)
+    if prev is not None:
+        prev_q, prev_h = prev
+        dq = s.prefix_queries_total - prev_q
+        dh = s.prefix_hits_total - prev_h
+        if dq > 0 and 0 <= dh <= dq:
+            rate = dh / dq * 100.0
+    if rate < 0:
+        rate = s.prefix_hits_total / s.prefix_queries_total * 100.0
+    if math.isfinite(rate):
+        s.kv_prefix_hit_rate = rate
+    _prev_prefix[unit_id] = (s.prefix_queries_total, s.prefix_hits_total)
 
 
 _prev_thrash: Dict[str, tuple] = {}  # host -> (timestamp, pswpin, pswpout, pgmajfault,
@@ -1120,6 +1111,7 @@ async def poll_cluster() -> ClusterStats:
     for unit_id, s in zip(unit_ids, results):
         _update_throughput(unit_id, s, now)
         _update_prompt_throughput(unit_id, s, now)
+        _update_prefix_hit_rate(unit_id, s)
         # Compute prompt:generated ratio (Spark Monitor insight)
         if s.prompt_throughput_tok_s > 0 and s.throughput_tok_s > 0:
             ratio = s.prompt_throughput_tok_s / s.throughput_tok_s

@@ -27,3 +27,14 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
+
+# Docs: the agent-workflows pipeline artifacts (specs, knowledge, architecture,
+# AARs) are tracked; HTML prototypes stay local.
+*.html
+docs/after-actions/
+docs/architecture/
+docs/knowledge/
+docs/specs/
+
+# Harness
+.agent-workflows.yml

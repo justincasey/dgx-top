@@ -64,10 +64,10 @@ vllm_url = "http://extra.example.com:8000"
         load_config(_write(tmp_path, text))
 
 
-def test_default_theme_is_dgx_dark(tmp_path: Path):
+def test_default_theme_is_dgx_aeon(tmp_path: Path):
     settings = load_config(_write(tmp_path))
 
-    assert settings.theme == "dgx-dark"
+    assert settings.theme == "dgx-aeon"
 
 
 def test_theme_option_is_loaded(tmp_path: Path):
@@ -99,3 +99,39 @@ def test_empty_theme_override_is_rejected(tmp_path: Path):
 def test_theme_override_is_validated(tmp_path: Path):
     with pytest.raises(ConfigError, match=r"unknown theme 'nope'"):
         load_config(_write(tmp_path), theme="nope")
+
+
+def _with_app_line(line: str) -> str:
+    return VALID_CONFIG.replace("history_length = 60", f"history_length = 60\n{line}")
+
+
+def test_meter_treatment_validation(tmp_path: Path):
+    for treatment in ("gradient", "spark", "tick", "line"):
+        path = tmp_path / f"{treatment}.toml"
+        path.write_text(_with_app_line(f'meter_treatment = "{treatment}"'))
+        assert load_config(path).meter_treatment == treatment
+
+    path = tmp_path / "bogus.toml"
+    path.write_text(_with_app_line('meter_treatment = "blocks"'))
+    with pytest.raises(ConfigError, match="meter_treatment"):
+        load_config(path)
+
+    # default preserves the current gradient look
+    assert load_config(_write(tmp_path)).meter_treatment == "gradient"
+
+
+def test_quiet_validation(tmp_path: Path):
+    path = tmp_path / "quiet.toml"
+    path.write_text(_with_app_line("quiet = true"))
+    assert load_config(path).quiet is True
+
+    path = tmp_path / "notquiet.toml"
+    path.write_text(_with_app_line("quiet = false"))
+    assert load_config(path).quiet is False
+
+    path = tmp_path / "bogus.toml"
+    path.write_text(_with_app_line('quiet = "yes"'))
+    with pytest.raises(ConfigError, match="quiet"):
+        load_config(path)
+
+    assert load_config(_write(tmp_path)).quiet is False

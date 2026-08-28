@@ -14,8 +14,10 @@
 - Prompt-to-generation ratio
 - Running and waiting requests
 - KV-cache utilization, block-allocated token capacity, and prefix-cache hit rate
-- GPU utilization, temperature, memory, and power draw
-- CPU utilization, temperature, frequency, and per-core activity
+- Time-to-first-token p50–p95, with the tail taking warn past 2s and an `!!`
+  alarm past 8s
+- GPU utilization, temperature, SM clock, memory, and power draw
+- CPU utilization, temperature, and per-core activity
 - Memory-pressure and thrashing risk from Linux PSI, swap, reclaim, and fault counters
 - InfiniBand/RoCE link state and throughput (RX/TX rates and wire utilization) derived from sysfs without requiring `ibstat`
 
@@ -100,7 +102,7 @@ ssh spark-worker true
 [app]
 poll_interval = 5
 history_length = 40
-theme = "dgx-dark"  # or any name from `dgx-top themes`
+# theme = "dgx-aeon"  # default; any name from `dgx-top themes` works
 
 [[nodes]]
 label = "spark-1"
@@ -152,12 +154,13 @@ dgx-top --theme tokyo-night-storm
 ```
 
 Every Textual built-in theme is supported out of the box — including the full
-Tokyo Night family — plus the classic `dgx-dark` default:
+Tokyo Night family — plus the AEON dashboard themes `dgx-aeon` (the default)
+and the classic `dgx-dark`:
 
-- **Dark:** `dgx-dark` (default), `tokyo-night`, `tokyo-night-storm`, `nord`,
-  `gruvbox`, `dracula`, `monokai`, `catppuccin-mocha`, `catppuccin-macchiato`,
-  `catppuccin-frappe`, `rose-pine`, `rose-pine-moon`, `solarized-dark`,
-  `atom-one-dark`, `textual-dark`, `flexoki`, `ansi-dark`
+- **Dark:** `dgx-aeon` (default), `dgx-dark`, `tokyo-night`, `tokyo-night-storm`,
+  `nord`, `gruvbox`, `dracula`, `monokai`, `catppuccin-mocha`,
+  `catppuccin-macchiato`, `catppuccin-frappe`, `rose-pine`, `rose-pine-moon`,
+  `solarized-dark`, `atom-one-dark`, `textual-dark`, `flexoki`, `ansi-dark`
 - **Light:** `tokyo-night-light`, `catppuccin-latte`, `solarized-light`,
   `rose-pine-dawn`, `atom-one-light`, `textual-light`, `ansi-light`
 
@@ -169,6 +172,47 @@ with the available options when the configuration is loaded.
 Press `t` in the dashboard to open a fuzzy theme picker. Highlighting an entry
 previews it live and `enter` keeps it; `escape` restores the previous theme. The
 switch is session-only — set `theme` in the configuration file to make it stick.
+
+### Design system
+
+The dashboard renders a **tiling-desktop** language (Tokyo Night
+foundation): every panel is a hand-painted box-drawing window on a strict
+character grid — no CSS borders. The focused SERVING window uses the **heavy**
+charset `┏━┓┃┣┫` (a neon glow rendered in weight); node windows use the
+**light** charset `╭─╮│├┤`. Each window's title is inset into the top rule as a
+btop-style caret tab, with a right-edge meta tab flush at the corner:
+
+```
+╭─┤ ^ worker-node worker ├────────────┤ 192.0.2.11 ├─╮
+```
+
+The caret and role are cyan for the host, orange for a worker; the SERVING
+title carries the model in magenta, and every window border is dim grey. A
+**waybar** rides the top (model/topology · online count). A **lualine** status
+bar (`● HEALTHY` mode badge · model · cluster context · tok/s · KV% · keys)
+appears only in the most compressed layouts.
+
+The semantic palette maps every theme onto these roles:
+
+| Role | dgx-aeon | Meaning |
+| --- | --- | --- |
+| `bg` | `#0B0E14` | Canvas; never drawn explicitly |
+| `fg` | `#C8D0DA` | Primary text and the values you scan for |
+| `dim` | `#6B7484` | Chrome: labels, units, separators, unfocused borders |
+| `track` | derived | Meter remainder (`▓`) |
+| `panel`/`panel_hi` | derived | Status-bar segment fills |
+| `accent` | `#7C5CFF` | Orchestrating identity: KV, RoCE, model |
+| `blue` | `#4AA3FF` | GPU utilization |
+| `cyan` | `#57D4F0` | Focus borders and the host caret |
+| `warn` | `#E8863B` | CPU, worker, and caution |
+| `ok` | `#3FD07F` | Health: live dots, MEM %, cache hits |
+
+Utilization meters are btop gradient bars — each `█` cell ramps
+green → yellow → orange → red by fill position; identity metrics (KV) keep a
+single hue over a dim `▓` track. Alarm state never depends on color alone:
+`✗` marks an unreachable node, `!!` a TTFT p95 past 8s and `!` past 2s, and the
+value is bold. `dgx-aeon` is the default; `tokyo-night` renders the design's
+exact reference hues.
 
 ## Preflight checks
 
@@ -182,60 +226,37 @@ No collected telemetry or endpoint response body is written to disk.
 
 ## Layout and small terminals
 
-The dashboard is fluid in both axes. Width picks the column count:
+The dashboard is fluid in both axes. Width picks the arrangement of the
+SERVING window and the one or two node windows:
 
-| Width       | Layout                                             |
-| ----------- | -------------------------------------------------- |
-| `>= 90`     | Throughput and both nodes side by side (3 columns)  |
-| `46`–`89`   | Throughput spans two columns, nodes below           |
-| `< 46`      | Everything stacked in one column                    |
+| Width | Layout |
+| --- | --- |
+| `>= 96` | **Tiling**: the focused SERVING window (~56%) beside the node column (~44%); node windows stacked with a one-row gap |
+| `63`–`95` | SERVING full-width hero on top; the node windows sit side by side (duo) below |
+| `< 63` | Single column: SERVING, then each node window, full width |
 
-Height picks the **density**. dgx-top divides the rows left over after the title
-by the number of grid rows the column tier needs, then takes the loosest layout
-that fits — so it degrades one step at a time instead of snapping between
-extremes, and one column simply needs three times the height for the same
-density.
+Height picks how tight it gets. Every candidate tier — `roomy` → `dense` →
+`compact` → `rail` → `floor` — has an exact total height for the current width
+(calibrated to the real rendered heights), and the densest tier that fits wins,
+so the dashboard degrades one step at a time and **never scrolls**
+(`overflow-y: hidden`); the floor tier guarantees a fit down to an 8-row
+viewport at every width:
 
-| Rows per tile | Density   | Look                                                     |
-| ------------- | --------- | -------------------------------------------------------- |
-| `>= 14`       | `roomy`   | `GPU`/`MEMORY`/`CPU` get their own header lines           |
-| `10`–`13`     | `dense`   | Those headers become `GPU`/`MEM`/`CPU` row prefixes       |
-| `< 10`        | `compact` | One-letter prefixes, meters folded onto their value rows  |
+| Tier | Look |
+| --- | --- |
+| `roomy` | Full metric rows, gradient meters, two-row core grid, a five-row SERVING area chart |
+| `dense` | The same rows with a four-row chart |
+| `compact` | One-letter node labels, fused SERVING rows, a two-row chart |
+| `rail` | Waybar hidden, SERVING chart dropped, windows kept |
+| `floor` | The never-scroll bottom: each node folds to one fused line, SERVING to four bare rows, no window frames |
 
-Within a density nothing is left stranded: the sparklines and meters are elastic,
-so a viewport between two breakpoints grows the waveforms and thickens the bars
-instead of leaving dead space. Growth is bounded — charts stop at eight rows,
-meters at two, tiles at 16 — so a tall terminal stays a dashboard rather than
-turning into wallpaper. Below the compact minimum the grid stops stretching and
-the screen scrolls rather than clipping anything.
-
-Three columns of `dense` tiles fit 12 terminal rows (about 180 pixels); a
-one-column `compact` stack fits a 320x320-pixel viewport, roughly 40x21 cells:
-
-```
-dgx-top ⚡DUAL 5s  +- t r q
-P 0·3600·7200 ▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅
-G 0·1200·2400 ▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅
-2r  1w  h 45%  3:1
-1.2M/3.8M 32%
-████░░░░░░░░░░░░░░░░  ▂▃▅▂▇▃▅▁▂▃▅▂▇▃▅▁▂▃▅
-spark-head Qwen3.6-2…
-G 73% 64°C ██████████████████░░░░░░░░░░░
-M 62G/120G 52% s1.0G ██████████░░░░░░░░░
-C 48% 51°C █████████████░░░░░░░░░░░░░░░░
-■■■■■■■■■■■■■■■■■■■■
-```
-
-No metric is dropped at any size; compact relocates them:
-
-- Section labels shorten to one letter: `G` GPU, `M` memory, `C` CPU,
-  `P` prompt throughput, `G` generation throughput.
-- Node value rows share their line with their meter.
-- `min avg max` labels collapse to a fixed `min·avg·max` order.
-- Throughput has priority: its two sparklines keep full height. The
-  `THROUGHPUT` row disappears and its ratio joins the KV request row.
-- Swap shortens to `s1.0G`, and the CPU core grid drops its inter-core spacing
-  while still showing every core.
+**Bounded fill, then breathe.** The fit selector guarantees the natural content
+fits; the SERVING window carries a real gradient area chart of the generation
+history, and leftover viewport rows frame the dashboard with calm, symmetric
+breathing room rather than stretching any panel into a slab. Every metric is
+kept at every size — the tiers relocate them (node labels shorten to `g`/`m`/`c`;
+the SERVING rows fuse; at the floor each node collapses to a single
+`● head g73%64° m62G52% c50%51° r9%` line) but nothing is dropped.
 
 ## Controls
 

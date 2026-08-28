@@ -28,12 +28,17 @@ class NodeConfig:
     worker: bool = False
 
 
+METER_TREATMENTS = {"gradient", "spark", "tick", "line"}
+
+
 @dataclass(frozen=True)
 class Settings:
     nodes: tuple[NodeConfig, ...]
     poll_interval: int = 5
     history_length: int = 40
     theme: str = DEFAULT_THEME
+    meter_treatment: str = "gradient"
+    quiet: bool = False
 
 
 def _parse_theme(app: dict, override: str | None) -> str:
@@ -129,7 +134,22 @@ def load_config(path: str | Path | None = None, theme: str | None = None) -> Set
         raise ConfigError("app.poll_interval must be an integer from 1 to 60")
     if not isinstance(history_length, int) or not 10 <= history_length <= 1000:
         raise ConfigError("app.history_length must be an integer from 10 to 1000")
-    return Settings(nodes, poll_interval, history_length, _parse_theme(app, theme))
+    meter_treatment = app.get("meter_treatment", "gradient")
+    if not isinstance(meter_treatment, str) or meter_treatment not in METER_TREATMENTS:
+        raise ConfigError(
+            "app.meter_treatment must be one of: " + ", ".join(sorted(METER_TREATMENTS))
+        )
+    quiet = app.get("quiet", False)
+    if not isinstance(quiet, bool):
+        raise ConfigError("app.quiet must be true or false")
+    return Settings(
+        nodes,
+        poll_interval,
+        history_length,
+        _parse_theme(app, theme),
+        meter_treatment,
+        quiet,
+    )
 
 
 _SETTINGS: Settings | None = None
