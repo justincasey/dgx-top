@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: System :: Monitoring",
 ]
 dependencies = [
-    "textual>=1.0.0,<9",
+    "textual==8.2.8",
     "httpx>=0.25.0",
     "rich>=13.0.0",
     "tomli>=2.0.0; python_version < '3.11'",
@@ -44,7 +44,7 @@ Issues = "https://github.com/justincasey/dgx-top/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["app", "cli", "collector", "config", "preflight", "stats", "themes"]
+py-modules = ["app", "cli", "collector", "config", "input_driver", "preflight", "stats", "themes"]
 
 [tool.setuptools.data-files]
 "share/dgx-top" = ["src/config.example.toml"]

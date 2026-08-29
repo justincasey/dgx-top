@@ -9,11 +9,13 @@ from urllib.parse import urlparse
 from rich.text import Text
 from textual.app import App, Binding
 from textual.containers import Vertical
+from textual.drivers.linux_driver import LinuxDriver
 from textual.reactive import reactive
 from textual.widgets import Static
 
 from collector import _init_model_names, poll_cluster
 from config import default_config_path, get_settings
+from input_driver import ResilientLinuxDriver
 from stats import ClusterStats, SparkUnitStats
 from themes import CUSTOM_THEMES, Palette, build_palette
 
@@ -1228,6 +1230,11 @@ class DGXTop(App):
         self._serv_h = 0
         self._node_h = 0
         self._pad = 0
+
+    def get_driver_class(self):
+        """Use resilient input unless Textual selected an explicit driver."""
+        driver_class = super().get_driver_class()
+        return ResilientLinuxDriver if driver_class is LinuxDriver else driver_class
 
     def compose(self):
         yield Waybar(id="waybar")
