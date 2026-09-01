@@ -26,7 +26,7 @@
 **Control machine**
 
 - macOS or Linux
-- Python 3.9 or newer
+- Python 3.10 or newer
 - OpenSSH client
 - Network access to each configured vLLM HTTP endpoint
 
@@ -42,7 +42,7 @@
 ## Quick start
 
 Run from source — no global or tool install needed. `uv` is the only extra
-requirement besides Python 3.9+ and an OpenSSH client; `uv sync` installs the
+requirement besides Python 3.10+ and an OpenSSH client; `uv sync` installs the
 project and its dependencies into a local `.venv`.
 
 ```bash
