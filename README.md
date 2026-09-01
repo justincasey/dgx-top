@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/justincasey/dgx-top/actions/workflows/ci.yml/badge.svg)](https://github.com/justincasey/dgx-top/actions/workflows/ci.yml)
 
-`dgx-top` is an agentless terminal dashboard for monitoring one- or two-node NVIDIA DGX Spark clusters running vLLM. It combines hardware telemetry collected over SSH with vLLM's HTTP metrics—nothing is installed on the Spark nodes.
+`dgx-top` is an agentless terminal dashboard for monitoring one- to twelve-node NVIDIA DGX Spark clusters running vLLM. It combines hardware telemetry collected over SSH with vLLM's HTTP metrics—nothing is installed on the Spark nodes.
 
 ## What it shows
 
@@ -228,21 +228,22 @@ No collected telemetry or endpoint response body is written to disk.
 
 ## Layout and small terminals
 
-The dashboard is fluid in both axes. Width picks the arrangement of the
-SERVING window and the one or two node windows:
+The dashboard is fluid in both axes. A full-width **SERVING hero** sits on top
+and a **node grid** fills the rest; the grid's column count and per-tile mode are
+chosen so the cluster always fills the space with the most detail it can carry:
 
-| Width | Layout |
+| Composition | Layout |
 | --- | --- |
-| `>= 96` | **Tiling**: the focused SERVING window (~56%) beside the node column (~44%); node windows stacked with a one-row gap |
-| `63`–`95` | SERVING full-width hero on top; the node windows sit side by side (duo) below |
-| `< 63` | Single column: SERVING, then each node window, full width |
+| Wide + many nodes | SERVING hero on top, every node in a **single narrow row** — a 12-Spark cluster shows 12 compact strips side by side, each favoring GPU %, memory and online state |
+| Wide + few nodes | SERVING hero on top, all nodes as full **card** tiles in one row |
+| Narrow + many nodes | SERVING hero on top, node **cards tile into rows** below, each tile held at a minimum width so its metrics stay readable |
 
 Height picks how tight it gets. Every candidate tier — `roomy` → `dense` →
 `compact` → `rail` → `floor` — has an exact total height for the current width
-(calibrated to the real rendered heights), and the densest tier that fits wins,
-so the dashboard degrades one step at a time and **never scrolls**
-(`overflow-y: hidden`); the floor tier guarantees a fit down to an 8-row
-viewport at every width:
+and node count (calibrated to the real rendered heights), and the densest tier
+that fits wins, so the dashboard degrades one step at a time and **never
+scrolls** (`overflow-y: hidden`); the floor tier packs every node into a compact
+bare line and fits down to an 8-row viewport:
 
 | Tier | Look |
 | --- | --- |
@@ -256,9 +257,25 @@ viewport at every width:
 fits; the SERVING window carries a real gradient area chart of the generation
 history, and leftover viewport rows frame the dashboard with calm, symmetric
 breathing room rather than stretching any panel into a slab. Every metric is
-kept at every size — the tiers relocate them (node labels shorten to `g`/`m`/`c`;
-the SERVING rows fuse; at the floor each node collapses to a single
-`● head g73%64° m62G52% c50%51° r9%` line) but nothing is dropped.
+kept at every size for a fixed node set — the tiers relocate them (node labels
+shorten to `g`/`m`/`c`; the SERVING rows fuse; at the floor each node collapses
+to a single fused line). Only at the densest cluster strips (many nodes across a
+wide terminal) do per-node tiles favor the operationally critical signals —
+GPU %, memory and online state — while the SERVING hero keeps the aggregate
+throughput, KV and latency.
+
+## Synthetic data
+
+Run a whole cluster offline with no SSH or vLLM access:
+
+```bash
+uv run dgx-top --simulate 12
+```
+
+`--simulate N` (1-12) generates N synthetic Sparks whose metrics evolve between
+polls, so you can design or verify layouts and colour treatments without real
+nodes. A `--simulate` run ignores the configured `[[nodes]]`; the `[app]` block
+still applies.
 
 ## Controls
 

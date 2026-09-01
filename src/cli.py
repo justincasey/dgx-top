@@ -15,7 +15,7 @@ from preflight import run_preflight
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dgx-top",
-        description="Terminal monitoring for one- or two-node NVIDIA DGX Spark clusters.",
+        description="Terminal monitoring for 1-12 node NVIDIA DGX Spark clusters.",
     )
     parser.add_argument(
         "--config",
@@ -28,6 +28,12 @@ def _parser() -> argparse.ArgumentParser:
         help="color theme override (default: the theme from the configuration file)",
     )
     subparsers = parser.add_subparsers(dest="command")
+    parser.add_argument(
+        "--simulate",
+        type=int,
+        metavar="N",
+        help="run with N synthetic Spark nodes (no SSH/HTTP); N is 1-12",
+    )
     init_parser = subparsers.add_parser("init", help="create an editable example configuration")
     init_parser.add_argument("--force", action="store_true", help="replace an existing file")
     subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and vLLM")
@@ -74,9 +80,15 @@ def main(argv: list[str] | None = None) -> int:
         return _list_themes()
     try:
         if args.command == "check":
+            if args.simulate:
+                print(
+                    "`check` verifies real SSH/HTTP endpoints; it cannot run with --simulate.",
+                    file=sys.stderr,
+                )
+                return 2
             settings = load_config(args.config, theme=args.theme)
             return asyncio.run(run_preflight(settings))
-        configure(args.config, theme=args.theme)
+        configure(args.config, theme=args.theme, simulate=args.simulate)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2

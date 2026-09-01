@@ -104,6 +104,54 @@ def _seed_history(app):
     app._update_ui()
 
 
+def _config_cluster(path: Path, n: int, theme: str | None = None) -> None:
+    """Write a config with ``n`` nodes labelled ``node-1..node-n``."""
+    lines = ["[app]", "poll_interval = 5", "history_length = 25"]
+    if theme:
+        lines.append(f'theme = "{theme}"')
+    for i in range(1, n + 1):
+        lines += [
+            "[[nodes]]",
+            f'label = "node-{i}"',
+            f'ssh_target = "node-{i}"',
+            f'vllm_url = "http://192.0.2.{i}:8000"',
+        ]
+        if i > 1:
+            lines.append("worker = true")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _cluster_n(n: int) -> ClusterStats:
+    units = [_unit(f"node-{i}", worker=(i > 1)) for i in range(1, n + 1)]
+    return ClusterStats(
+        units=units, topology=TopologyInfo(topology_type="SWITCHED" if n >= 3 else "DUAL")
+    )
+
+
+def _stub_n(monkeypatch, n: int) -> None:
+    import app as app_module
+
+    async def fake_poll():
+        return _cluster_n(n)
+
+    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
+
+
+def _seed_history_n(app, n: int) -> None:
+    """Give every hosted node's KV series real history."""
+    import collections
+
+    app.history["throughput"] = collections.deque([40 + (i * 7) % 60 for i in range(24)], maxlen=25)
+    app.history["prompt-throughput"] = collections.deque(
+        [120 + (i * 11) % 90 for i in range(24)], maxlen=25
+    )
+    for i in range(1, n + 1):
+        app.history[f"kv-usage-node-{i}"] = collections.deque(
+            [18 + (i * 3) % 15 for i in range(24)], maxlen=25
+        )
+    app._update_ui()
+
+
 def _style_at(text, idx):
     """Rich span styles covering character offset ``idx``."""
     out = []
@@ -194,7 +242,7 @@ async def test_serving_heavy_vs_node_light_charsets(tmp_path: Path, monkeypatch)
 # ─── AC3: tiling geometry ────────────────────────────────────────────
 
 
-async def test_tiling_geometry_side_by_side(tmp_path: Path, monkeypatch):
+async def test_serving_hero_on_top_with_node_grid_below(tmp_path: Path, monkeypatch):
     from app import DGXTop, NodeBox, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -203,14 +251,13 @@ async def test_tiling_geometry_side_by_side(tmp_path: Path, monkeypatch):
     app = DGXTop()
     async with app.run_test(size=(132, 40)) as pilot:
         await pilot.pause()
-        assert app.mode == "tiling"
         serv = app.query_one("#serving", ServingBox).region
         n0 = app.query_one("#node-0", NodeBox).region
         n1 = app.query_one("#node-1", NodeBox).region
-        # SERVING left of the node column, node windows stacked with a gap
-        assert serv.x == 0 and n0.x > serv.right
-        assert n1.y >= n0.bottom + 1  # one blank gap row between stacked windows
-        # both windows span into the right half; nothing exceeds the viewport
+        # SERVING is a full-width hero on top; the node grid is below.
+        assert serv.x == 0 and serv.width == 132
+        assert n0.y >= serv.bottom + 1
+        assert n0.y == n1.y  # both nodes share one grid row (2 columns)
         for r in (serv, n0, n1):
             assert r.bottom <= 40
 
@@ -421,10 +468,10 @@ async def test_statusbar_only_in_compressed_tiers(tmp_path: Path, monkeypatch):
         await _resize(pilot, 132, 44)
         assert not (app.rail or app.floor)
         assert sb.styles.display == "none"
-        await _resize(pilot, 50, 12)
+        await _resize(pilot, 132, 20)  # rail: 2-card grid + fused serving
         assert app.rail
         assert sb.styles.display == "block"
-        await _resize(pilot, 40, 8)
+        await _resize(pilot, 132, 8)  # floor: never-scroll bottom
         assert app.floor
         assert sb.styles.display == "block"
 
@@ -805,3 +852,134 @@ async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
         )
         # the widest tail (gen) reaches the interior's right edge
         assert len(by_label["gen    "][0][1][1:-1].rstrip()) == width - 3
+
+
+# ─── cluster scaling: 1-12 nodes, fluid node grid ────────────────────
+
+
+async def test_config_and_compose_twelve_nodes(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config_cluster(tmp_path / "config.toml", 12)
+    configure(tmp_path / "config.toml")
+    _stub_n(monkeypatch, 12)
+    app = DGXTop()
+    async with app.run_test(size=(180, 50)) as pilot:
+        await pilot.pause()
+        assert len(app.settings.nodes) == 12
+        assert len(list(app.query(NodeBox))) == 12
+
+
+async def test_twelve_nodes_single_row_at_wide(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config_cluster(tmp_path / "config.toml", 12)
+    configure(tmp_path / "config.toml")
+    _stub_n(monkeypatch, 12)
+    app = DGXTop()
+    async with app.run_test(size=(180, 50)) as pilot:
+        await pilot.pause()
+        assert app.cols == 12
+        assert app.node_mode == "strip"
+        nodes = [app.query_one(f"#node-{i}", NodeBox).region for i in range(12)]
+        # all 12 occupy a single row with no overlap
+        assert len({n.y for n in nodes}) == 1
+        xs = sorted(n.x for n in nodes)
+        assert xs == sorted(set(xs))
+        assert all(n.bottom <= 50 for n in nodes)
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_nodes_wrap_at_narrow_with_min_width(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config_cluster(tmp_path / "config.toml", 12)
+    configure(tmp_path / "config.toml")
+    _stub_n(monkeypatch, 12)
+    app = DGXTop()
+    async with app.run_test(size=(50, 40)) as pilot:
+        await pilot.pause()
+        nodes = [app.query_one(f"#node-{i}", NodeBox).region for i in range(12)]
+        assert len({n.y for n in nodes}) > 1  # wrapped into multiple rows
+        for n in nodes:
+            assert n.width >= 10  # each tile keeps a useful minimum width
+
+
+async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatch):
+    from app import DGXTop
+
+    for n in (2, 5, 12):
+        _config_cluster(tmp_path / "config.toml", n)
+        configure(tmp_path / "config.toml")
+        _stub_n(monkeypatch, n)
+        app = DGXTop()
+        async with app.run_test(size=(180, 50)) as pilot:
+            await pilot.pause()
+            for w, h in [
+                (180, 50),
+                (132, 40),
+                (100, 40),
+                (90, 42),
+                (80, 30),
+                (70, 50),
+                (63, 20),
+                (50, 40),
+                (45, 42),
+                (40, 8),
+            ]:
+                await _resize(pilot, w, h)
+                assert app.screen.max_scroll_y == 0, (n, w, h)
+                vis = [
+                    wid
+                    for wid in app.screen.query("Waybar, ServingBox, NodeBox, StatusBar")
+                    if wid.region.height
+                ]
+                for wid in vis:
+                    assert wid.region.bottom <= h, (n, w, h, wid.id, wid.region.bottom)
+                for i, a in enumerate(vis):
+                    for b in vis[i + 1 :]:
+                        ra, rb = a.region, b.region
+                        separated = (
+                            ra.x + ra.width <= rb.x
+                            or rb.x + rb.width <= ra.x
+                            or ra.y + ra.height <= rb.y
+                            or rb.y + rb.height <= ra.y
+                        )
+                        assert separated, (n, w, h, a.id, b.id, ra, rb)
+
+
+async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
+    from app import DGXTop
+
+    _config_cluster(tmp_path / "config.toml", 12)
+    configure(tmp_path / "config.toml")
+    _stub_n(monkeypatch, 12)
+    app = DGXTop()
+    async with app.run_test(size=(180, 60)) as pilot:
+        await pilot.pause()
+        seen = []
+        for h in (60, 45, 35, 25, 15, 8):
+            await _resize(pilot, 180, h)
+            tier = "floor" if app.floor else ("rail" if app.rail else app.density)
+            seen.append(tier)
+        order = ["roomy", "dense", "compact", "rail", "floor"]
+        ranks = [order.index(t) for t in seen]
+        assert ranks == sorted(ranks), seen  # monotonically denser
+        assert seen[0] == "roomy" and seen[-1] == "floor"
+
+
+async def test_strip_tile_shows_prioritized_stats(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config_cluster(tmp_path / "config.toml", 12)
+    configure(tmp_path / "config.toml")
+    _stub_n(monkeypatch, 12)
+    app = DGXTop()
+    async with app.run_test(size=(180, 50)) as pilot:
+        await pilot.pause()
+        assert app.node_mode == "strip"
+        line = app.query_one("#node-0", NodeBox).render().plain
+        # a strip is a single width-fit line with the prioritized GPU stat
+        assert "\n" not in line
+        assert "73%" in line
+        assert app.screen.max_scroll_y == 0
