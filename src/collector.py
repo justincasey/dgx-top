@@ -8,7 +8,9 @@ from typing import Dict, List, Tuple
 
 import httpx
 
+import config
 from config import NVIDIA_SMI_CMD, SPARK_UNITS
+from simulation import simulate_cluster
 from stats import (
     ClusterStats,
     SparkUnitStats,
@@ -23,6 +25,8 @@ _model_names: dict[int, str] = {}
 
 async def _init_model_names() -> None:
     """Fetch model names from all Spark units once at startup."""
+    if config.SIMULATION_NODES:
+        return
 
     async def fetch_one(client: httpx.AsyncClient, uid: int, vllm_url: str) -> None:
         try:
@@ -1103,6 +1107,8 @@ def _update_thrash_rates(host: str, data: dict, now: float) -> dict:
 
 async def poll_cluster() -> ClusterStats:
     """Poll N Spark units in parallel."""
+    if config.SIMULATION_NODES:
+        return simulate_cluster(config.SIMULATION_NODES)
     unit_ids = sorted(SPARK_UNITS.keys())
     tasks = [poll_unit(uid) for uid in unit_ids]
     results = await asyncio.gather(*tasks)

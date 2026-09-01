@@ -59,3 +59,9 @@ vllm_url = "http://primary.example.com:8000"
 
     assert main(["--config", str(path), "--theme", "neon", "check"]) == 2
     assert "unknown theme" in capsys.readouterr().err
+
+
+def test_check_with_simulate_is_rejected(capsys):
+    """`check` verifies real SSH/HTTP endpoints and must refuse --simulate."""
+    assert main(["--simulate", "5", "check"]) == 2
+    assert "cannot run with" in capsys.readouterr().err

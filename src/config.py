@@ -30,6 +30,9 @@ class NodeConfig:
 
 METER_TREATMENTS = {"gradient", "spark", "tick", "line"}
 
+MAX_NODES = 12
+"""Largest cluster dgx-top displays (one or more Sparks)."""
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -101,30 +104,22 @@ def _parse_node(raw: object, node_number: int) -> NodeConfig:
     return NodeConfig(label, ssh_target, vllm_url, worker)
 
 
-def load_config(path: str | Path | None = None, theme: str | None = None) -> Settings:
-    config_path = Path(path).expanduser() if path else default_config_path()
-    if not config_path.is_file():
-        raise ConfigError(
-            f"configuration not found: {config_path}\n"
-            "Run `dgx-top init` (or `uv run dgx-top init` from the source tree) to create it, "
-            "then edit the node settings."
+def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
+    """Build ``n`` offline-equivalent NodeConfigs for simulation mode."""
+    return tuple(
+        NodeConfig(
+            label=f"spark-{i}",
+            ssh_target=f"sim-{i}",
+            vllm_url=f"http://sim-{i}:8000",
+            worker=(i > 1),
         )
-    try:
-        with config_path.open("rb") as handle:
-            raw = tomllib.load(handle)
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"invalid TOML in {config_path}: {exc}") from exc
+        for i in range(1, n + 1)
+    )
 
-    raw_nodes = raw.get("nodes")
-    if not isinstance(raw_nodes, list) or not raw_nodes:
-        raise ConfigError("configuration must define at least one [[nodes]] table")
-    if len(raw_nodes) > 2:
-        raise ConfigError("this release supports one or two displayed nodes")
-    nodes = tuple(_parse_node(node, index) for index, node in enumerate(raw_nodes, 1))
-    labels = [node.label.casefold() for node in nodes]
-    if len(set(labels)) != len(labels):
-        raise ConfigError("node labels must be unique")
 
+def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, bool]:
+    """Validate the ``[app]`` block and return (poll_interval, history_length,
+    theme, meter_treatment, quiet)."""
     app = raw.get("app", {})
     if not isinstance(app, dict):
         raise ConfigError("[app] must be a TOML table")
@@ -142,8 +137,7 @@ def load_config(path: str | Path | None = None, theme: str | None = None) -> Set
     quiet = app.get("quiet", False)
     if not isinstance(quiet, bool):
         raise ConfigError("app.quiet must be true or false")
-    return Settings(
-        nodes,
+    return (
         poll_interval,
         history_length,
         _parse_theme(app, theme),
@@ -152,17 +146,64 @@ def load_config(path: str | Path | None = None, theme: str | None = None) -> Set
     )
 
 
+def load_config(
+    path: str | Path | None = None,
+    theme: str | None = None,
+    simulate: int | None = None,
+) -> Settings:
+    config_path = Path(path).expanduser() if path else default_config_path()
+    raw: dict = {}
+    if config_path.is_file():
+        try:
+            with config_path.open("rb") as handle:
+                raw = tomllib.load(handle)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"invalid TOML in {config_path}: {exc}") from exc
+
+    if simulate is not None:
+        if not isinstance(simulate, int) or simulate < 1 or simulate > MAX_NODES:
+            raise ConfigError(f"simulate must be an integer from 1 to {MAX_NODES}")
+        app_settings = _parse_app(raw, theme)
+        return Settings(_synthetic_nodes(simulate), *app_settings)
+
+    if not config_path.is_file():
+        raise ConfigError(
+            f"configuration not found: {config_path}\n"
+            "Run `dgx-top init` (or `uv run dgx-top init` from the source tree) to create it, "
+            "then edit the node settings."
+        )
+    raw_nodes = raw.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise ConfigError("configuration must define at least one [[nodes]] table")
+    if len(raw_nodes) > MAX_NODES:
+        raise ConfigError(f"configuration supports up to {MAX_NODES} displayed nodes")
+    nodes = tuple(_parse_node(node, index) for index, node in enumerate(raw_nodes, 1))
+    labels = [node.label.casefold() for node in nodes]
+    if len(set(labels)) != len(labels):
+        raise ConfigError("node labels must be unique")
+
+    app_settings = _parse_app(raw, theme)
+    return Settings(nodes, *app_settings)
+
+
 _SETTINGS: Settings | None = None
 SPARK_UNITS: dict[int, dict[str, object]] = {}
 HISTORY_LEN = 40
+SIMULATION_NODES: int | None = None
+"""When set, ``collector.poll_cluster`` returns synthetic data for this many
+units instead of SSH/HTTP polling. Owned here (not in the collector) so
+``configure(simulate=N)`` is the single source of truth."""
 
 
-def configure(path: str | Path | None = None, theme: str | None = None) -> Settings:
+def configure(
+    path: str | Path | None = None, theme: str | None = None, simulate: int | None = None
+) -> Settings:
     """Load settings and update compatibility globals used by the collector."""
-    global _SETTINGS, HISTORY_LEN
-    settings = load_config(path, theme=theme)
+    global _SETTINGS, HISTORY_LEN, SIMULATION_NODES
+    settings = load_config(path, theme=theme, simulate=simulate)
     _SETTINGS = settings
     HISTORY_LEN = settings.history_length
+    SIMULATION_NODES = simulate
     SPARK_UNITS.clear()
     SPARK_UNITS.update(
         {
