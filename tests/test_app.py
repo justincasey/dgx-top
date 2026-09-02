@@ -278,23 +278,20 @@ async def test_every_metric_survives_and_never_scrolls(tmp_path: Path, monkeypat
         for w, h in [(132, 44), (100, 40), (80, 40), (63, 40), (50, 40)]:
             await _resize(pilot, w, h)
             blob = "\n".join(
-                wid.render().plain
-                for wid in app.screen.query("Waybar, ServingBox, NodeBox, StatusBar")
+                wid.render().plain for wid in app.screen.query("Waybar, ServingBox, NodeBox")
             )
+            # The refinement drops the low-value graphics/stats at density:
+            # node cards keep the gpu/mem/cpu values and the serving keeps gen/
+            # requests/ttft/kv%. RoCE, power and the window stat are dropped.
             for token in (
-                "gpu",
-                "mem",
-                "cpu",
-                "roce",
-                "kv",
-                "cache",
-                "ttft",
                 "73%",
-                "64°C",
-                "430W",
+                "52%",
+                "50%",
                 "32%",
+                "kv",
+                "ttft",
             ):
-                assert token in blob or token.replace("gpu", "g") in blob, (w, h, token)
+                assert token in blob, (w, h, token)
             assert app.screen.max_scroll_y == 0, (w, h)
 
 
@@ -312,9 +309,7 @@ async def test_floor_never_scrolls_or_clips(tmp_path: Path, monkeypatch):
             assert app.floor, (w, "should be floor at h=8")
             assert app.screen.max_scroll_y == 0, (w, "scroll")
             vis = [
-                wid
-                for wid in app.screen.query("Waybar, ServingBox, NodeBox, StatusBar")
-                if wid.region.height
+                wid for wid in app.screen.query("Waybar, ServingBox, NodeBox") if wid.region.height
             ]
             for wid in vis:
                 r = wid.region
@@ -455,8 +450,8 @@ async def test_node_gpu_row_shows_sm_clock(tmp_path: Path, monkeypatch):
 # ─── AC9: bottom bar only in the most compressed tiers ───────────────
 
 
-async def test_statusbar_only_in_compressed_tiers(tmp_path: Path, monkeypatch):
-    from app import DGXTop, StatusBar
+async def test_waybar_always_visible_carries_base_stats(tmp_path: Path, monkeypatch):
+    from app import DGXTop, Waybar
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
@@ -464,23 +459,23 @@ async def test_statusbar_only_in_compressed_tiers(tmp_path: Path, monkeypatch):
     app = DGXTop()
     async with app.run_test(size=(132, 44)) as pilot:
         await pilot.pause()
-        sb = app.query_one("#statusbar", StatusBar)
-        await _resize(pilot, 132, 44)
-        assert not (app.rail or app.floor)
-        assert sb.styles.display == "none"
-        await _resize(pilot, 132, 20)  # rail: 2-card grid + fused serving
-        assert app.rail
-        assert sb.styles.display == "block"
-        await _resize(pilot, 132, 8)  # floor: never-scroll bottom
-        assert app.floor
-        assert sb.styles.display == "block"
+        wb = app.query_one("#waybar", Waybar)
+        # The footer is gone: the header is the only chrome and stays visible in
+        # every tier, carrying the base serving stats (gen, KV, online).
+        for w, h in [(132, 44), (100, 40), (63, 20), (40, 8)]:
+            await _resize(pilot, w, h)
+            assert wb.styles.display == "block", (w, "waybar should never hide")
+            text = wb.render().plain
+            assert "tok/s" in text, (w, text)
+            assert "KV 32%" in text, (w, text)
+            assert "● 2/2" in text, (w, text)
 
 
-# ─── AC8: status bar mode badge + offline flip ───────────────────────
+# ─── AC8: waybar WARN marker + offline flip ──────────────────────────
 
 
-async def test_statusbar_badge_and_offline_flip(tmp_path: Path, monkeypatch):
-    from app import DGXTop, StatusBar
+async def test_waybar_warn_marker_on_offline_or_hot(tmp_path: Path, monkeypatch):
+    from app import DGXTop, Waybar
     from themes import build_palette
 
     _config(tmp_path / "config.toml")
@@ -489,12 +484,10 @@ async def test_statusbar_badge_and_offline_flip(tmp_path: Path, monkeypatch):
     app = DGXTop()
     async with app.run_test(size=(132, 40)) as pilot:
         await pilot.pause()
-        await _resize(pilot, 132, 12)  # statusbar renders only in compressed tiers
         pal = build_palette(app.current_theme)
-        sb = app.query_one("#statusbar", StatusBar).render()
-        assert "HEALTHY" in sb.plain and "KV 32%" in sb.plain
-        badge_idx = sb.plain.index("HEALTHY")
-        assert any(f"on {pal.ok}".lower() in s.lower() for s in _style_at(sb, badge_idx))
+        wb = app.query_one("#waybar", Waybar).render()
+        assert "KV 32%" in wb.plain
+        assert " ! " not in wb.plain  # healthy cluster: no warn marker
 
     _stub(
         monkeypatch, units=[_unit("head"), _unit("worker", worker=True, online=False, hosted=False)]
@@ -502,12 +495,11 @@ async def test_statusbar_badge_and_offline_flip(tmp_path: Path, monkeypatch):
     app2 = DGXTop()
     async with app2.run_test(size=(132, 40)) as pilot:
         await pilot.pause()
-        await _resize(pilot, 132, 12)
         pal = build_palette(app2.current_theme)
-        sb = app2.query_one("#statusbar", StatusBar).render()
-        assert "WARN" in sb.plain
-        w_idx = sb.plain.index("WARN")
-        assert any(f"on {pal.warn}".lower() in s.lower() for s in _style_at(sb, w_idx))
+        wb = app2.query_one("#waybar", Waybar).render()
+        assert " ! " in wb.plain
+        w_idx = wb.plain.index(" ! ")
+        assert any(f"on {pal.warn}".lower() in s.lower() for s in _style_at(wb, w_idx))
 
 
 # ─── AC9: offline node ───────────────────────────────────────────────
@@ -799,7 +791,7 @@ async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
         await pilot.pause()
         box = app.query_one("#serving", ServingBox)
         box.update_throughput(
-            [40 + (i * 7) % 60 for i in range(24)], [120 + (i * 11) % 90 for i in range(24)], []
+            [40 + (i * 7) % 60 for i in range(24)], [120 + (i * 11) % 90 for i in range(24)]
         )
         box.update_kv(
             32.0,
@@ -870,7 +862,7 @@ async def test_config_and_compose_twelve_nodes(tmp_path: Path, monkeypatch):
         assert len(list(app.query(NodeBox))) == 12
 
 
-async def test_twelve_nodes_single_row_at_wide(tmp_path: Path, monkeypatch):
+async def test_twelve_nodes_wrap_to_usable_cards_at_wide(tmp_path: Path, monkeypatch):
     from app import DGXTop, NodeBox
 
     _config_cluster(tmp_path / "config.toml", 12)
@@ -879,13 +871,15 @@ async def test_twelve_nodes_single_row_at_wide(tmp_path: Path, monkeypatch):
     app = DGXTop()
     async with app.run_test(size=(180, 50)) as pilot:
         await pilot.pause()
-        assert app.cols == 12
-        assert app.node_mode == "strip"
+        # The refinement keeps the node card as long as possible: 12 nodes that
+        # cannot fit a usable single row wrap into usable cards (each tile held
+        # at the card minimum), never a single narrow strip row.
+        assert app.node_mode == "card"
+        assert app.cols < 12
         nodes = [app.query_one(f"#node-{i}", NodeBox).region for i in range(12)]
-        # all 12 occupy a single row with no overlap
-        assert len({n.y for n in nodes}) == 1
-        xs = sorted(n.x for n in nodes)
-        assert xs == sorted(set(xs))
+        assert len({n.y for n in nodes}) > 1  # wrapped into multiple rows
+        for n in nodes:
+            assert n.width >= 22  # each tile keeps a usable card width
         assert all(n.bottom <= 50 for n in nodes)
         assert app.screen.max_scroll_y == 0
 
@@ -918,11 +912,15 @@ async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatc
             for w, h in [
                 (180, 50),
                 (132, 40),
+                (103, 40),  # lands a 1fr column on the card-format boundary
                 (100, 40),
                 (90, 42),
                 (80, 30),
+                (77, 40),  # boundary width (ceil(col) reaches NODE_FULL_MIN)
+                (76, 40),
                 (70, 50),
                 (63, 20),
+                (51, 40),  # boundary width (ceil(col) reaches NODE_FULL_MIN)
                 (50, 40),
                 (45, 42),
                 (40, 8),
@@ -931,7 +929,7 @@ async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatc
                 assert app.screen.max_scroll_y == 0, (n, w, h)
                 vis = [
                     wid
-                    for wid in app.screen.query("Waybar, ServingBox, NodeBox, StatusBar")
+                    for wid in app.screen.query("Waybar, ServingBox, NodeBox")
                     if wid.region.height
                 ]
                 for wid in vis:
@@ -968,18 +966,74 @@ async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
         assert seen[0] == "roomy" and seen[-1] == "floor"
 
 
-async def test_strip_tile_shows_prioritized_stats(tmp_path: Path, monkeypatch):
+async def test_condensed_table_row_shows_gpu_mem_cpu(tmp_path: Path, monkeypatch):
     from app import DGXTop, NodeBox
 
     _config_cluster(tmp_path / "config.toml", 12)
     configure(tmp_path / "config.toml")
     _stub_n(monkeypatch, 12)
     app = DGXTop()
-    async with app.run_test(size=(180, 50)) as pilot:
+    async with app.run_test(size=(240, 8)) as pilot:
         await pilot.pause()
-        assert app.node_mode == "strip"
+        assert app.floor and app.node_mode == "table"
         line = app.query_one("#node-0", NodeBox).render().plain
-        # a strip is a single width-fit line with the prioritized GPU stat
-        assert "\n" not in line
-        assert "73%" in line
+        assert "\n" not in line  # one aligned row, no window frame
+        # a condensed table row favours gpu/mem/cpu with the short identity
+        assert "73%" in line  # gpu util
+        assert "52%" in line  # mem util
+        assert "50%" in line  # cpu util
         assert app.screen.max_scroll_y == 0
+
+
+async def test_node_text_card_drops_meters(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await _resize(pilot, 50, 40)
+        assert app.node_mode == "card"
+        node = app.query_one("#node-0", NodeBox).render().plain
+        # text card: gpu/mem/cpu values survive, but the metre/core-grid/RoCE
+        # graphs are dropped.
+        assert "73%" in node and "52%" in node and "50%" in node
+        assert "roce" not in node
+        assert not any(ch in node for ch in "▁▂▃▄▅▆▇█▓")
+
+
+async def test_serving_never_mentions_window(tmp_path: Path, monkeypatch):
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        for w, h in [(132, 44), (100, 40), (80, 40), (50, 20), (40, 8)]:
+            await _resize(pilot, w, h)
+            blob = app.query_one("#serving", ServingBox).render().plain
+            assert "window" not in blob.lower(), (w, h, blob)
+
+
+async def test_serving_wins_gen_reqs_ttft(tmp_path: Path, monkeypatch):
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        for w, h in [(132, 44), (100, 40), (80, 40), (50, 20), (40, 8)]:
+            await _resize(pilot, w, h)
+            blob = app.query_one("#serving", ServingBox).render().plain
+            # the base serving surface always keeps gen, the requests line
+            # (concurrency) and ttft.
+            assert "gen" in blob, (w, h, blob)
+            assert "req" in blob or "requests" in blob, (w, h, blob)
+            assert "ttft" in blob, (w, h, blob)

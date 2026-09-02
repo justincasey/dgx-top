@@ -189,10 +189,12 @@ btop-style caret tab, with a right-edge meta tab flush at the corner:
 ```
 
 The caret and role are cyan for the host, orange for a worker; the SERVING
-title carries the model in magenta, and every window border is dim grey. A
-**waybar** rides the top (model/topology · online count). A **lualine** status
-bar (`● HEALTHY` mode badge · model · cluster context · tok/s · KV% · keys)
-appears only in the most compressed layouts.
+title carries the model in magenta, and every window border is dim grey. The
+**waybar** rides the top and is the **only chrome**: a warn marker when a node
+is unreachable or hot, the centred model/topology, gen `tok/s`, KV% and the
+`● online/total` chip, each giving way (drop-to-fit) before the base serving
+stats disappear. The footer status bar is dropped at every size — the header
+carries gen, KV% and the online count even in the compressed table view.
 
 The semantic palette maps every theme onto these roles:
 
@@ -234,35 +236,35 @@ chosen so the cluster always fills the space with the most detail it can carry:
 
 | Composition | Layout |
 | --- | --- |
-| Wide + many nodes | SERVING hero on top, every node in a **single narrow row** — a 12-Spark cluster shows 12 compact strips side by side, each favoring GPU %, memory and online state |
+| Wide + many nodes | SERVING hero on top, node **cards tile into rows**, each held at the card minimum — a 12-Spark cluster wraps into usable cards rather than a single cramped strip row |
 | Wide + few nodes | SERVING hero on top, all nodes as full **card** tiles in one row |
-| Narrow + many nodes | SERVING hero on top, node **cards tile into rows** below, each tile held at a minimum width so its metrics stay readable |
+| Narrow + many nodes | SERVING hero on top, node **cards tile into rows** below, each tile held at a minimum width so its metrics stay readable; when no usable card fits, every node collapses to a **condensed table row** |
 
 Height picks how tight it gets. Every candidate tier — `roomy` → `dense` →
 `compact` → `rail` → `floor` — has an exact total height for the current width
 and node count (calibrated to the real rendered heights), and the densest tier
 that fits wins, so the dashboard degrades one step at a time and **never
 scrolls** (`overflow-y: hidden`); the floor tier packs every node into a compact
-bare line and fits down to an 8-row viewport:
+condensed table row and fits down to an 8-row viewport:
 
 | Tier | Look |
 | --- | --- |
 | `roomy` | Full metric rows, gradient meters, two-row core grid, a five-row SERVING area chart |
 | `dense` | The same rows with a four-row chart |
-| `compact` | One-letter node labels, fused SERVING rows, a two-row chart |
-| `rail` | Waybar hidden, SERVING chart dropped, windows kept |
-| `floor` | The never-scroll bottom: each node folds to one fused line, SERVING to four bare rows, no window frames |
+| `compact` | Node cards drop the meter/core-grid/RoCE graphs and run gpu/mem/cpu text; SERVING drops the area chart and favours gen (the last chart visual) + requests + ttft |
+| `rail` | SERVING chart gone (gen/req/ttft/kv% remain); node cards stay text; the waybar stays visible carrying gen/kv/online |
+| `floor` | The never-scroll bottom: each node becomes one **condensed table row** (`● 3  87%  62%  61%`), SERVING to gen/req/ttft, no window frames |
 
 **Bounded fill, then breathe.** The fit selector guarantees the natural content
 fits; the SERVING window carries a real gradient area chart of the generation
 history, and leftover viewport rows frame the dashboard with calm, symmetric
-breathing room rather than stretching any panel into a slab. Every metric is
-kept at every size for a fixed node set — the tiers relocate them (node labels
-shorten to `g`/`m`/`c`; the SERVING rows fuse; at the floor each node collapses
-to a single fused line). Only at the densest cluster strips (many nodes across a
-wide terminal) do per-node tiles favor the operationally critical signals —
-GPU %, memory and online state — while the SERVING hero keeps the aggregate
-throughput, KV and latency.
+breathing room rather than stretching any panel into a slab. As the layout
+densifies, lower-value data is dropped rather than crammed: node cards favour
+`gpu · mem · cpu` and shed the meters/core grid/RoCE for plain text; the
+SERVING surface favours gen, the requests line (concurrency) and TTFT, dropping
+the window stat first and the large area chart before the gen sparkline. The
+base surface — node gpu/mem/cpu and serving gen/req/ttft (+ KV% through rail) —
+never disappears at any size.
 
 ## Synthetic data
 
