@@ -32,11 +32,10 @@ TEMP_WARM = 60
 # viewport width and node count so a 12-Spark cluster fills a single narrow row
 # on a wide terminal and wraps into card tiles on a narrow one.
 WAYBAR_HEIGHT = 1
-STATUS_HEIGHT = 1
 GRID_GUTTER = 1  # row gutter in the node grid; columns are contiguous
-NODE_CARD_MIN = 22  # a compact card shows gpu/mem/cpu/roce rows + meters
-NODE_STRIP_MIN = 11  # a strip shows one prioritized util line, no frame
-NODE_FLOOR_MIN = 10  # a floor bare-line tile (used to pack many nodes)
+NODE_CARD_MIN = 22  # a usable card (text) shows gpu/mem/cpu; below this -> table
+NODE_FULL_MIN = 26  # a tile at/above this keeps the meter/core/RoCE grammar
+NODE_FLOOR_MIN = 10  # a condensed table tile (used to pack many nodes)
 SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 
 # Bounded growth (bounded + breathe): a taller SERVING window is filled with a
@@ -44,29 +43,25 @@ SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 # CHART_MAX_ROWS and the core grid never exceeds CORES_MAX_ROWS rows.
 CORES_MAX_ROWS = 2
 # Fixed area-chart rows per density (the SERVING window's tall focused chart).
-CHART_ROWS = {"roomy": 5, "dense": 4, "compact": 2, "rail": 0, "floor": 0}
+# The large area chart is dropped at compact and below; the inline gen
+# sparkline is the last chart visual left, per the density-refinement request.
+CHART_ROWS = {"roomy": 5, "dense": 4, "compact": 0, "rail": 0, "floor": 0}
 
-# Natural interior rows per node window (borders excluded) by density. The
-# core grid is width-driven (ceil(20 / per-row)), so these are the measured
-# numbers the density calibration relies on; density selects via the fit-Driven
-# ladder in _apply_tier.
-# Interior rows per node window (borders excluded). gpu+meter+mem+meter+cpu +
-# up to CORES_MAX_ROWS core rows + roce; the estimate reserves 2 core rows so
-# the fit ladder is conservative (a 1-core-row render just yields extra pad).
-NODE_ROWS_ROOMY = 8
-NODE_ROWS_DENSE = 8
-NODE_ROWS_COMPACT = 8  # reserves 2 core rows (narrow cards still emit 2)
-NODE_ROWS_RAIL = 8  # rail cards share the compact grammar
-NODE_ROWS_FLOOR = 1  # one fused identity+metrics line, no window frame
+# Interior rows per node tile (borders excluded). A full card keeps the
+# meter/core-grid/RoCE grammar; a text card drops the graphs and runs
+# gpu/mem/cpu only. The estimator mirrors the render width fold (floor-fit
+# duality lesson).
+NODE_ROWS_FULL = 8  # full card interior (gpu/meter+mem/meter+cpu+core+roce)
+NODE_ROWS_TEXT = 3  # text card interior (gpu, mem, cpu; no meter/core/RoCE)
 
 # Natural interior rows per SERVING window by density (borders excluded).
-# roomy/dense = the full design row set + area chart; compact = the fused
-# narrow grammar + a 2-row chart; rail = fused grammar, no chart; floor = four
-# bare rows with no window frame. Wide/narrow interiors are derived in
-# _serving_rows_for as base rows + CHART_ROWS (roomy 12+5, dense 12+4,
-# compact 6+2); rail and floor are fixed.
-SERVING_ROWS_RAIL = 6
-SERVING_ROWS_FLOOR = 4
+# roomy/dense = the wide design row set (no window stat) + area chart; compact =
+# the prioritized narrow grammar + the inline gen sparkline (no area chart);
+# rail = prioritized grammar, no cache; floor = base gen/req/ttft.
+WIDE_BASE = 11  # gen/prompt/kv/kv% rows + requests/cache/ttft (no window)
+NARROW_BASE = 5  # gen, requests, ttft, kv%, cache
+SERVING_ROWS_RAIL = 4  # gen, requests, ttft, kv%
+SERVING_ROWS_FLOOR = 3  # gen, requests, ttft
 
 # Box-painting charsets — HEAVY is the focused window ("neon glow" in pure
 # text), LIGHT is every unfocused window (the option-F grammar).
@@ -307,11 +302,12 @@ def _area_chart_lines(data: list[float], rows: int, width: int, pal: Palette) ->
     return out
 
 
-# ─── Chrome: waybar + lualine status bar ─────────────────────────────
+# ─── Chrome: waybar (the only chrome; footer removed) ────────────────
 
 
 class Waybar(Static):
-    """One-line waybar chrome: centred cluster title · online count."""
+    """One-line waybar chrome: mode marker · centred cluster title · gen · KV ·
+    online count (drop-to-fit; the base serving stats survive compression)."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -328,83 +324,43 @@ class Waybar(Static):
         if width <= 0:
             return Text()
         pal = _palette_for(self.app)
-        online = sum(1 for u in self._cluster.units if u.online) if self._cluster else 0
-        total = len(self._cluster.units) if self._cluster else 0
-        hosted = self._cluster.hosted_units if self._cluster else []
+        c = self._cluster
+        if c is None:
+            return _fit(Text("…"), width)
+        online = sum(1 for u in c.units if u.online)
+        total = len(c.units)
+        hosted = c.hosted_units
         model = hosted[0].model_name if hosted and hosted[0].model_name else "…"
-        topo = (
-            self._cluster.topology.topology_type
-            if self._cluster and self._cluster.topology
-            else "…"
+        topo = c.topology.topology_type if c and c.topology else "…"
+        risky = any((not u.online) or (u.temp_c >= TEMP_ALERT) for u in c.units)
+        gen = Text(f" {c.total_throughput:.0f} tok/s ", style=f"bold {pal.fg}")
+        kv = Text(f" KV {c.kv_cache_pct:.0f}% ", style=f"bold {pal.accent}")
+        chip = Text(
+            f" ● {online}/{total} ",
+            style=f"bold {pal.ok}" if online == total else f"bold {pal.warn}",
         )
-        left = Text(" ")
-        right = Text.assemble(
-            Text(
-                f" ● {online}/{total} ",
-                style=f"bold {pal.ok}" if online == total else f"bold {pal.warn}",
-            ),
-        )
-        title = f"{topo} · {model}"
-        midw = width - left.cell_len - right.cell_len
-        if midw < 1:
-            # No room for the centred title; keep the chip and stats (drop-to-fit).
-            return _fit(Text.assemble(left, right), width)
-        mid = title if len(title) <= midw else title[: max(0, midw - 1)] + "…"
-        pad = max(0, midw - len(mid))
-        mid_text = Text(" " * (pad // 2) + mid, style=pal.dim)
-        return _fit(Text.assemble(left, mid_text, right), width)
-
-
-class StatusBar(Static):
-    """One-line lualine status bar: mode badge · model · context · tok/s · KV · keys."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cluster: ClusterStats | None = None
-        self._interval = 5
-
-    def update_cluster(self, stats: ClusterStats, interval: int) -> None:
-        self._cluster = stats
-        self._interval = interval
-        self.refresh()
-
-    def render(self) -> Text:
-        width = self.content_size.width
-        if width <= 0:
-            return Text()
-        pal = _palette_for(self.app)
-        units = self._cluster.units if self._cluster else []
-        hosted = self._cluster.hosted_units if self._cluster else []
-        n = len(units)
-        risky = any((not u.online) or (u.temp_c >= TEMP_ALERT) for u in units)
-        gpu = any((u.gpu_util_pct >= 99) for u in units if not u.is_worker)
-        model = hosted[0].model_name if hosted and hosted[0].model_name else "no model"
-        topo = (
-            self._cluster.topology.topology_type
-            if self._cluster and self._cluster.topology
-            else "…"
-        )
-        gen = f"{self._cluster.total_throughput:.0f}" if self._cluster else "—"
-        kvp = f"{self._cluster.kv_cache_pct:.0f}" if self._cluster else "—"
-        mode = "WARN" if (risky or gpu) else "HEALTHY"
-        mode_col = pal.warn if (risky or gpu) else pal.ok
-        badge = Text(
-            " ● HEALTHY " if mode == "HEALTHY" else " !  WARN ",
-            style=f"bold {pal.bg} on {mode_col}",
-        )
-        branch = Text(" " + model + " ", style=f"bold {pal.accent} on {pal.panel_hi}")
-        ctx = f" ~/cluster · {n} sparks · {topo} · poll {self._interval}s "
-        context = Text(ctx, style=f"{pal.dim} on {pal.panel}")
-        stats = Text(f" {gen} tok/s ", style=f"bold {pal.fg} on {pal.panel_hi}")
-        kv = Text(f" KV {kvp}% ", style=f"bold {pal.accent} on {pal.panel_hi}")
-        keys = Text("  +- t r q", style=pal.dim)
-        segments = [badge, branch, context, stats, kv, keys]
-        # Drop the dimmest segments (keys, context, kv, stats) until the bar fits.
-        for di in (5, 2, 4, 3):
-            if sum(p.cell_len for p in segments if p is not None) <= width:
+        badge = Text(" ! ", style=f"bold {pal.bg} on {pal.warn}") if risky else Text("")
+        # The online chip is the last thing kept; KV drops before gen, and the
+        # centred title drops before any stat — so the base serving stats (gen,
+        # KV, online) always survive the compressed/table layouts.
+        stats = [gen, kv, chip]
+        avail = width - badge.cell_len
+        for idx in (1, 0):  # drop KV before gen; the chip is never dropped
+            if sum(s.cell_len for s in stats) <= avail:
                 break
-            segments[di] = None
-        return _fit(Text.assemble(*[p for p in segments if p is not None]), width)
+            if idx < len(stats):
+                stats.pop(idx)
+        right = Text.assemble(*stats)
+        title = f"{topo} · {model}"
+        midw = width - badge.cell_len - right.cell_len
+        if midw >= 4:
+            mid = title if len(title) <= midw else title[: max(0, midw - 1)] + "…"
+            pad = max(0, midw - len(mid))
+            mid_text = Text(" " * (pad // 2) + mid, style=pal.dim)
+            out = Text.assemble(badge, mid_text, right)
+        else:
+            out = Text.assemble(badge, right)
+        return _fit(out, width)
 
 
 # ─── Shared metric formatting (ported from the AEON row grammar) ──────
@@ -462,64 +418,6 @@ def _ttft_tail(seconds: float, pal: Palette) -> tuple[str, str]:
     return "", f"bold {pal.fg}"
 
 
-def _micro_line(s: SparkUnitStats, pal: Palette, budget: int) -> Text:
-    """Floor-tier fused metrics line for one node (no window frame).
-
-    gpu util+temp · mem pct · cpu util+temp · roce util, single-char labels.
-    Sections drop right-to-left so a narrow tile truncates cleanly.
-    """
-    if s.online:
-        avg = sum(s.cpu_cores_util) / len(s.cpu_cores_util) if s.cpu_cores_util else 0.0
-        has_mem = s.mem_total_bytes > 0
-        sections = [
-            Text.assemble(
-                Text("g", style=pal.dim),
-                Text(f"{s.gpu_util_pct:.0f}%", style=f"bold {pal.fg}"),
-                Text(f"{s.temp_c:.0f}°", style=_temp_style(s.temp_c, pal)),
-            ),
-            (
-                Text.assemble(
-                    Text("m", style=pal.dim),
-                    Text(f"{s.mem_used_bytes // (1024**3):.0f}G", style=f"bold {pal.fg}"),
-                    Text(
-                        f"{s.mem_used_bytes / s.mem_total_bytes * 100:.0f}%",
-                        style=f"bold {pal.ok}",
-                    ),
-                )
-                if has_mem
-                else Text.assemble(Text("m", style=pal.dim), Text("—", style=pal.dim))
-            ),
-            Text.assemble(
-                Text("c", style=pal.dim),
-                Text(f"{avg:.0f}%", style=f"bold {pal.warn}"),
-                Text(f"{s.cpu_temp_c:.0f}°", style=_temp_style(s.cpu_temp_c, pal)),
-            ),
-            (
-                Text.assemble(
-                    Text("r", style=pal.dim),
-                    Text(f"{_roce_util_pct(s):.0f}%", style=f"bold {pal.accent}"),
-                )
-                if s.roce_capacity_bps > 0
-                else Text.assemble(Text("r", style=pal.dim), Text("—", style=pal.dim))
-            ),
-        ]
-    else:
-        sections = [
-            Text.assemble(Text(label, style=pal.dim), Text("—", style=pal.dim))
-            for label in ("g", "m", "c", "r")
-        ]
-    out = Text.assemble()
-    for i, sec in enumerate(sections):
-        trial = out.copy()
-        if i:
-            trial.append(" ", style=pal.dim)
-        trial.append_text(sec)
-        if trial.cell_len > budget:
-            break
-        out = trial
-    return out
-
-
 # ─── ServingBox — the focused SERVING window ─────────────────────────
 
 
@@ -532,7 +430,6 @@ class ServingBox(Static):
         super().__init__(*args, **kwargs)
         self._gen_data: list[float] = []
         self._prompt_data: list[float] = []
-        self._node_rates: list[tuple[str, float]] = []
         self._kv_data: list[float] = []
         self._kv: dict | None = None
 
@@ -540,11 +437,9 @@ class ServingBox(Static):
         self,
         gen_vals: list[float],
         prompt_vals: list[float],
-        node_rates: list[tuple[str, float]] | None = None,
     ):
         self._gen_data = list(gen_vals)
         self._prompt_data = list(prompt_vals)
-        self._node_rates = node_rates or []
         self.refresh()
 
     def update_kv(
@@ -584,7 +479,7 @@ class ServingBox(Static):
         if getattr(self.app, "floor", False):
             return Text("\n").join(_fit(r, width) for r in self._floor_rows(pal, width))
         tier = "rail" if getattr(self.app, "rail", False) else _density(self)
-        interior = self._interior_rows(pal, width, _density(self))
+        interior = self._interior_rows(pal, width, _density(self), tier)
         rows = list(interior)
         chart_rows = CHART_ROWS.get(tier, 0)
         if chart_rows:
@@ -600,10 +495,10 @@ class ServingBox(Static):
         ]
         return Text("\n").join(_box_lines(width, title, rtab, rows, False, pal))
 
-    def _interior_rows(self, pal: Palette, width: int, density: str) -> list[Text]:
+    def _interior_rows(self, pal: Palette, width: int, density: str, tier: str) -> list[Text]:
         narrow = density == "compact" or width < SERVING_NARROW_WIDTH
         if narrow:
-            return self._narrow_rows(pal, width)
+            return self._narrow_rows(pal, width, tier)
         return self._wide_rows(pal, width)
 
     def _wide_rows(self, pal: Palette, width: int) -> list[Text]:
@@ -712,7 +607,6 @@ class ServingBox(Static):
             r.append(self._requests_row(pal, s, width))
         r.append(self._cache_row(pal, s, width))
         r.append(self._ttft_row(pal, s, width))
-        r.append(self._window_row(pal, s, width))
         return r
 
     def _requests_row(self, pal, s, width) -> Text:
@@ -756,29 +650,15 @@ class ServingBox(Static):
             row.append(f" {marker}", style=tail_style)
         return row
 
-    def _window_row(self, pal, s, width) -> Text:
-        p50 = s.get("ttft_p50_ms", 0.0)
-        p95 = s.get("ttft_p95_ms", 0.0)
-        row = Text.assemble(Text("window    ", style=pal.dim))
-        if p95 <= 0:
-            row.append("—", style=pal.dim)
-        else:
-            row.append(
-                f"{p50 / 1000:.1f}–{p95 / 1000:.1f}s over {len(self._gen_data)} samples",
-                style=pal.dim,
-            )
-        return row
-
-    def _narrow_rows(self, pal: Palette, width: int) -> list[Text]:
-        """Fused narrow grammar (compact width): every metric retained."""
+    def _narrow_rows(self, pal: Palette, width: int, tier: str) -> list[Text]:
+        """Prioritized narrow grammar (compact): gen · requests · ttft · kv% ·
+        cache. The inline gen sparkline is the last chart visual; the window
+        stat and the per-node serving rates are dropped (aggregate gen is the
+        priority)."""
         gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
-        prompt_avg = sum(self._prompt_data) / len(self._prompt_data) if self._prompt_data else 0.0
         s = self._kv or {}
-        kv_pct = s.get("pct", 0.0)
-        used = s.get("used_tok", 0)
-        total = s.get("total_tok", 0)
         r = []
-        # gen — the prompt rate rides this line at tight widths
+        # gen — value + inline sparkline (the last chart visual at compact).
         gen = Text.assemble(
             Text("gen ", style=pal.dim),
             Text(f"{gen_avg:.0f}", style=f"bold {pal.ok}")
@@ -786,81 +666,56 @@ class ServingBox(Static):
             else Text("—", style=pal.dim),
             Text(" tok/s", style=pal.dim),
         )
-        if prompt_avg > 0:
-            gen.append(" · prompt ", style=pal.dim)
-            gen.append(f"{prompt_avg:.0f}", style=f"bold {pal.fg}")
+        if self._gen_data and width > 26:
+            spark_w = min(18, max(4, width - 22))
+            gen.append(" ", style=pal.dim)
+            gen.append(_spark_line(self._gen_data, pal.ok, spark_w))
         r.append(gen)
-        # kv — capacity + pct; requests ride here when tight
-        kv = Text.assemble(Text("kv ", style=pal.dim))
-        if total:
-            kv.append(f"{_fmt_tokens(used)}", style=f"bold {pal.accent}")
-            kv.append(f"→{_fmt_tokens(total)}", style=pal.accent)
-            kv.append(f" {kv_pct:.0f}%", style=pal.accent)
-        else:
-            kv.append(f"{kv_pct:.0f}%", style=pal.accent)
-        if s.get("req", 0) > 0 or s.get("wait", 0) > 0:
-            kv.append(" ", style=pal.dim)
-            kv.append(f"{s['req']}r", style=f"bold {pal.fg}")
-            kv.append(
-                f" {s['wait']}w", style=pal.dim if s.get("wait", 0) == 0 else f"bold {pal.warn}"
+        # requests — running/waiting concurrency.
+        r.append(
+            Text.assemble(
+                Text("req ", style=pal.dim),
+                Text(f"{s.get('req', 0)}r", style=f"bold {pal.fg}"),
+                Text(" · ", style=pal.dim),
+                Text(
+                    f"{s.get('wait', 0)}w waiting",
+                    style=pal.dim if s.get("wait", 0) == 0 else f"bold {pal.warn}",
+                ),
             )
-        r.append(kv)
-        mw = min(22, max(4, width - 12))
-        if self._kv is None:
-            r.append(Text.assemble(Text("kv% ", style=pal.dim), Text("—", style=pal.dim)))
-        else:
-            r.append(
-                Text.assemble(
-                    Text("kv% ", style=pal.dim),
-                    _bar_line(kv_pct, mw, pal.accent, pal)
-                    if _treatment(self) == "gradient"
-                    else _meter_line(
-                        _treatment(self), kv_pct, mw, pal, pal.accent, list(self._kv_data)
-                    ),
-                    Text(f" {kv_pct:.0f}%", style=pal.accent),
-                )
-            )
-        # nodes — label-less swatches with rates
-        nodes = Text.assemble(Text("nodes ", style=pal.dim))
-        if self._node_rates:
-            for i, (_label, rate) in enumerate(self._node_rates):
-                if i:
-                    nodes.append(" ", style=pal.dim)
-                nodes.append(
-                    Text("██" if i == 0 else "▓▓", style=pal.accent if i == 0 else pal.warn)
-                )
-                nodes.append(f" {rate:.0f}", style=f"bold {pal.fg}")
-        else:
-            nodes.append("—", style=pal.dim)
-        r.append(nodes)
-        # cache + fused ttft
-        hit = s.get("prefix_hit", -1.0)
-        cache = Text.assemble(Text("cache ", style=pal.dim))
-        if hit >= 0:
-            cache.append(f"{hit:.0f}%", style=f"bold {pal.ok}")
-        else:
-            cache.append("—", style=pal.dim)
+        )
+        # ttft — p50—p95 plus the tail marker.
         p50 = s.get("ttft_p50_ms", 0.0)
         p95 = s.get("ttft_p95_ms", 0.0)
+        ttft = Text.assemble(Text("ttft ", style=pal.dim))
         if p95 > 0:
             marker, tail_style = _ttft_tail(p95 / 1000.0, pal)
-            cache.append(" · ttft ", style=pal.dim)
-            cache.append(f"{p50 / 1000:.1f}—{p95 / 1000:.1f}s", style=f"bold {pal.fg}")
-        r.append(cache)
-        # window over samples
-        w = Text.assemble(Text("window ", style=pal.dim))
-        if p95 > 0:
-            w.append(
-                f"{p50 / 1000:.1f}–{p95 / 1000:.1f}s over {len(self._gen_data)} samples",
-                style=pal.dim,
-            )
+            ttft.append(f"{p50 / 1000:.1f}—{p95 / 1000:.1f}s", style=f"bold {pal.fg}")
+            if marker:
+                ttft.append(f" {marker}", style=tail_style)
         else:
-            w.append("—", style=pal.dim)
-        r.append(w)
+            ttft.append("—", style=pal.dim)
+        r.append(ttft)
+        # kv% — plain value (the meter is dropped from the narrow grammar).
+        r.append(
+            Text.assemble(
+                Text("kv ", style=pal.dim),
+                Text(f"{s.get('pct', 0.0):.0f}%", style=f"bold {pal.accent}"),
+            )
+        )
+        # cache — dropped at rail so the base gen/req/ttft surface is minimal.
+        if tier != "rail":
+            hit = s.get("prefix_hit", -1.0)
+            cache = Text.assemble(Text("cache ", style=pal.dim))
+            cache.append(
+                f"{hit:.0f}%" if hit >= 0 else "—",
+                style=f"bold {pal.ok}" if hit >= 0 else pal.dim,
+            )
+            r.append(cache)
         return r
 
     def _floor_rows(self, pal: Palette, width: int) -> list[Text]:
-        """Never-scroll floor: four bare text rows, no window frame."""
+        """Never-scroll floor: the base serving surface (gen · requests ·
+        ttft) with no window frame."""
         gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
         s = self._kv or {}
         r = []
@@ -872,37 +727,28 @@ class ServingBox(Static):
             Text(" tok/s", style=pal.dim),
         )
         r.append(gen)
-        nodes = Text.assemble(Text("nodes ", style=pal.dim))
-        if self._node_rates:
-            for i, (_label, rate) in enumerate(self._node_rates):
-                if i:
-                    nodes.append(" ", style=pal.dim)
-                nodes.append(
-                    Text("██" if i == 0 else "▓▓", style=pal.accent if i == 0 else pal.warn)
-                )
-                nodes.append(f" {rate:.0f}", style=f"bold {pal.fg}")
-        else:
-            nodes.append("—", style=pal.dim)
-        r.append(nodes)
-        kv = Text.assemble(Text("kv ", style=pal.dim))
-        if s.get("total_tok", 0):
-            kv.append(f"{_fmt_tokens(s['used_tok'])}", style=f"bold {pal.accent}")
-            kv.append(f"→{_fmt_tokens(s['total_tok'])}", style=pal.accent)
-            kv.append(f" {s['pct']:.0f}%", style=pal.accent)
-        else:
-            kv.append(f"{s.get('pct', 0.0):.0f}%", style=pal.accent)
-        r.append(kv)
-        hit = s.get("prefix_hit", -1.0)
-        cache = Text.assemble(Text("cache ", style=pal.dim))
-        cache.append(
-            f"{hit:.0f}%" if hit >= 0 else "—", style=f"bold {pal.ok}" if hit >= 0 else pal.dim
+        r.append(
+            Text.assemble(
+                Text("req ", style=pal.dim),
+                Text(f"{s.get('req', 0)}r", style=f"bold {pal.fg}"),
+                Text(" · ", style=pal.dim),
+                Text(
+                    f"{s.get('wait', 0)}w waiting",
+                    style=pal.dim if s.get("wait", 0) == 0 else f"bold {pal.warn}",
+                ),
+            )
         )
         p50 = s.get("ttft_p50_ms", 0.0)
         p95 = s.get("ttft_p95_ms", 0.0)
+        ttft = Text.assemble(Text("ttft ", style=pal.dim))
         if p95 > 0:
-            cache.append(" · ttft ", style=pal.dim)
-            cache.append(f"{p50 / 1000:.1f}—{p95 / 1000:.1f}s", style=f"bold {pal.fg}")
-        r.append(cache)
+            marker, tail_style = _ttft_tail(p95 / 1000.0, pal)
+            ttft.append(f"{p50 / 1000:.1f}—{p95 / 1000:.1f}s", style=f"bold {pal.fg}")
+            if marker:
+                ttft.append(f" {marker}", style=tail_style)
+        else:
+            ttft.append("—", style=pal.dim)
+        r.append(ttft)
         return r
 
 
@@ -912,7 +758,7 @@ class ServingBox(Static):
 def _short_label(label: str) -> str:
     """A 1-3 cell identity for a node: the trailing number of a ``name-N``
     label (e.g. ``spark-3`` -> ``3``), else the first three characters.
-    Used at strip width where a full label cannot fit in the tile."""
+    Used at the condensed-table width where a full label cannot fit."""
     match = re.match(r"^(.*?)(\d+)$", label)
     if match:
         return match.group(2)
@@ -921,9 +767,11 @@ def _short_label(label: str) -> str:
 
 class NodeBox(Static):
     """A per-node window: light border, caret title (host=cyan, worker=orange)
-    inset in the top rule, the configured host as the right meta tab, configurable
-    meters (gradient/spark/tick/line), a ramped core grid and the RoCE row. Folds to a bare fused line in
-    the floor tier."""
+    inset in the top rule, the configured host as the right meta tab,
+    configurable meters (gradient/spark/tick/line), a ramped core grid and the
+    RoCE row — when the tile is wide enough. A narrow card drops the graphs and
+    runs gpu/mem/cpu text only; the table mode collapses the node to a single
+    aligned row."""
 
     def __init__(self, idx: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -958,17 +806,11 @@ class NodeBox(Static):
             s = SparkUnitStats(label=node_cfg.label, is_worker=getattr(node_cfg, "worker", False))
         pal = _palette_for(self.app)
         width = max(1, self.content_size.width)
-        if getattr(self.app, "floor", False):
-            head = Text.assemble(
-                Text("● " if s.online else "✗ ", style=pal.ok if s.online else pal.warn),
-                Text(s.label + " ", style=f"bold {pal.fg}"),
-            )
-            budget = max(1, width - head.cell_len)
-            return _fit(Text.assemble(head, _micro_line(s, pal, budget)), width)
-        if getattr(self.app, "node_mode", "") == "strip" or width < NODE_STRIP_MIN:
-            return self._strip_line(s, pal, width)
+        if getattr(self.app, "node_mode", "") == "table":
+            return self._table_row(s, pal, width)
         density = _density(self)
-        rows = self._interior_rows(s, pal, width, density)
+        full = density in ("roomy", "dense") and width >= NODE_FULL_MIN
+        rows = self._interior_rows(s, pal, width, density, text=not full)
         role = "host" if not s.is_worker else "worker"
         role_style = pal.cyan if not s.is_worker else pal.warn
         caret_style = role_style if s.online else pal.warn
@@ -983,29 +825,90 @@ class NodeBox(Static):
         rtab = [(host, pal.dim)] if host else None
         return Text("\n").join(_box_lines(width, title, rtab, rows, False, pal))
 
-    def _strip_line(self, s: SparkUnitStats, pal: Palette, width: int) -> Text:
-        """One prioritized line for a narrow strip tile: online glyph, short
-        label, then GPU util (headline) and mem/cpu when room allows — the
-        stats a dense cluster view favors. No window frame; always width-fit."""
-        head = Text.assemble(
+    def _table_row(self, s: SparkUnitStats, pal: Palette, width: int) -> Text:
+        """One aligned condensed-table row: online glyph, short label, then
+        right-aligned GPU / MEM / CPU util. No window frame; _fit truncation
+        keeps the label and GPU first when the tile is tight."""
+        if s.online:
+            gpu = f"{s.gpu_util_pct:.0f}%"
+            mem = f"{s.mem_used_bytes / s.mem_total_bytes * 100:.0f}%" if s.mem_total_bytes else "—"
+            cpu = (
+                f"{sum(s.cpu_cores_util) / len(s.cpu_cores_util):.0f}%" if s.cpu_cores_util else "—"
+            )
+        else:
+            gpu = mem = cpu = "—"
+        parts = [
             Text("● " if s.online else "✗ ", style=pal.ok if s.online else pal.warn),
             Text(_short_label(s.label), style=f"bold {pal.fg}"),
             Text("  ", style=""),
-            Text(f"{s.gpu_util_pct:.0f}%", style=f"bold {pal.blue}"),
-        )
+            Text(f"{gpu:>4}", style=f"bold {pal.blue}"),
+            Text(" ", style=pal.dim),
+            Text(f"{mem:>4}", style=f"bold {pal.ok}" if s.online else pal.dim),
+            Text(" ", style=pal.dim),
+            Text(f"{cpu:>4}", style=f"bold {pal.warn}" if s.online else pal.dim),
+        ]
+        out = Text.assemble()
+        for part in parts:
+            if out.cell_len + part.cell_len > width:
+                break  # drop trailing fields (cpu, then mem) cleanly, no ellipsis
+            out.append_text(part)
+        return _fit(out, width)
+
+    def _text_rows(self, s: SparkUnitStats, pal: Palette, width: int) -> list[Text]:
+        """Text-only node card: gpu/mem/cpu values with no meter, core grid or
+        RoCE — the graph is dropped once the tile is tight; the card frame is
+        retained."""
+        dash = Text("—", style=pal.dim)
+        rows: list[Text] = []
+        # GPU: util + temp (power/clock drop out in text mode).
+        if s.online:
+            segs = [
+                Text("g ", style=pal.dim),
+                Text(f"{s.gpu_util_pct:.0f}%", style=f"bold {pal.blue}"),
+            ]
+            if s.temp_c:
+                segs += [
+                    Text(" · ", style=pal.dim),
+                    Text(f"{s.temp_c:.0f}°", style=_temp_style(s.temp_c, pal)),
+                ]
+            rows.append(Text.assemble(*segs))
+        else:
+            rows.append(Text.assemble(Text("g ", style=pal.dim), dash))
+        # MEM: used + pct.
         if s.online and s.mem_total_bytes > 0:
-            mem_pct = s.mem_used_bytes / s.mem_total_bytes * 100
-            head.append(" ", style=pal.dim)
-            head.append(f"{mem_pct:.0f}%", style=f"bold {pal.ok}")
+            used_gb = s.mem_used_bytes // (1024**3)
+            used_pct = s.mem_used_bytes / s.mem_total_bytes * 100
+            rows.append(
+                Text.assemble(
+                    Text("m ", style=pal.dim),
+                    Text(f"{used_gb}G", style=f"bold {pal.fg}"),
+                    Text(f" {used_pct:.0f}%", style=f"bold {pal.ok}"),
+                )
+            )
+        else:
+            rows.append(Text.assemble(Text("m ", style=pal.dim), dash))
+        # CPU: util + temp.
         if s.online and s.cpu_cores_util:
             avg = sum(s.cpu_cores_util) / len(s.cpu_cores_util)
-            head.append(" ", style=pal.dim)
-            head.append(f"{avg:.0f}%", style=f"bold {pal.warn}")
-        return _fit(head, width)
+            segs = [
+                Text("c ", style=pal.dim),
+                Text(f"{avg:.0f}%", style=f"bold {pal.warn}"),
+            ]
+            if s.cpu_temp_c:
+                segs += [
+                    Text(" · ", style=pal.dim),
+                    Text(f"{s.cpu_temp_c:.0f}°", style=_temp_style(s.cpu_temp_c, pal)),
+                ]
+            rows.append(Text.assemble(*segs))
+        else:
+            rows.append(Text.assemble(Text("c ", style=pal.dim), dash))
+        return rows
 
     def _interior_rows(
-        self, s: SparkUnitStats, pal: Palette, width: int, density: str
+        self, s: SparkUnitStats, pal: Palette, width: int, density: str, text: bool = False
     ) -> list[Text]:
+        if text:
+            return self._text_rows(s, pal, width)
         compact = density == "compact" or (width - 4) <= 18
         iw = max(1, width - 4)
         mw = min(20, max(4, iw - 6))
@@ -1135,59 +1038,61 @@ def _palette_for(app: "DGXTop") -> Palette:
 # ─── Fit-driven layout ───────────────────────────────────────────────
 
 
-def _node_rows(tier: str) -> int:
-    return {
-        "roomy": NODE_ROWS_ROOMY,
-        "dense": NODE_ROWS_DENSE,
-        "compact": NODE_ROWS_COMPACT,
-        "rail": NODE_ROWS_RAIL,
-        "floor": NODE_ROWS_FLOOR,
-    }[tier]
-
-
 def _serving_rows_for(width: int, tier: str) -> int:
-    """SERVING interior rows for (width, tier). The fused narrow grammar
-    (6 metric rows) is used below SERVING_NARROW_WIDTH and the compact/rail
-    tiers; the wide grammar (12 rows) elsewhere; rail/floor are fixed."""
+    """SERVING interior rows for (width, tier). The prioritized compact grammar
+    (gen/requests/ttft/kv% [+cache]) is used below SERVING_NARROW_WIDTH and at
+    the compact tier; the wide grammar (no window stat) elsewhere; rail drops
+    cache; floor is the base gen/req/ttft surface."""
     if tier == "rail":
         return SERVING_ROWS_RAIL
     if tier == "floor":
         return SERVING_ROWS_FLOOR
-    base = 6 if (width < SERVING_NARROW_WIDTH or tier == "compact") else 12
+    base = NARROW_BASE if (width < SERVING_NARROW_WIDTH or tier == "compact") else WIDE_BASE
     chart = CHART_ROWS.get(tier, 0)
     return base + chart
 
 
-def _node_tile_rows(tier: str, node_mode: str) -> int:
-    """Rendered height of one node tile: a 1-row fused strip, or a framed
-    card of NODE_ROWS interior rows plus 2 border rows."""
-    if node_mode == "strip" or tier == "floor":
+def _node_tile_rows(tier: str, node_mode: str, tile_w: int) -> int:
+    """Rendered height of one node tile: a 1-row condensed-table row, a framed
+    full card (meters + core grid + RoCE) if the tile is wide enough and the
+    tier is roomy/dense, else a framed text card (gpu/mem/cpu only). The
+    estimator passes the *widest* grid column (ceil of the column width) so the
+    full/text decision matches what NodeBox.render actually does."""
+    if node_mode == "table" or tier == "floor":
         return 1
-    return _node_rows(tier) + 2
+    if tile_w >= NODE_FULL_MIN and tier in ("roomy", "dense"):
+        return NODE_ROWS_FULL + 2
+    return NODE_ROWS_TEXT + 2
 
 
 def _floor_cols(grid_w: int, n: int) -> int:
-    """Columns for the floor tier, whose bare 1-row tiles pack tightly."""
+    """Columns for the floor tier, whose condensed 1-row table tiles pack
+    tightly."""
     return min(n, max(1, grid_w // NODE_FLOOR_MIN))
 
 
 def _node_layout(grid_w: int, n: int) -> tuple[int, str]:
-    """(columns, node-tile mode) for a full-width grid of ``n`` nodes."""
+    """(columns, node-tile mode) for a full-width grid of ``n`` nodes. Cards
+    wrap into usable tiles whenever a single row is too narrow; the table mode
+    is selected only at the floor (see _apply_tier)."""
     if n <= 4:
         return min(n, max(1, grid_w // NODE_CARD_MIN)), "card"
     single = grid_w // n
     if single >= NODE_CARD_MIN:
         return n, "card"
-    if single >= NODE_STRIP_MIN:
-        return n, "strip"
     return min(n, max(1, grid_w // NODE_CARD_MIN)), "card"
 
 
 def _layout_height(nodes: int, width: int, cols: int, tier: str, node_mode: str) -> int:
     """Full viewport height (rows) a (cols, tier, node_mode) layout needs."""
-    chrome = WAYBAR_HEIGHT if tier not in ("rail", "floor") else STATUS_HEIGHT
+    chrome = WAYBAR_HEIGHT
     serv_ir = _serving_rows_for(width, tier)
-    tile = _node_tile_rows(tier, node_mode)
+    # Textual distributes the `width % cols` remainder to the trailing 1fr
+    # columns, so the widest column can be one cell wider than `width // cols`.
+    # Reserve the widest column's card grammar (full vs text) so the estimator
+    # never under-calls the render and clips the grid (never-clip invariant).
+    tile_w = -(-width // cols) if cols else width
+    tile = _node_tile_rows(tier, node_mode, tile_w)
     grid_rows = -(-nodes // cols) if cols else nodes
     gutter = 0 if tier == "floor" else GRID_GUTTER  # bare floor lines pack tight
     grid_h = grid_rows * tile + max(0, grid_rows - 1) * gutter
@@ -1209,7 +1114,6 @@ class DGXTop(App):
     }
 
     #waybar { height: 1; padding: 0; text-wrap: nowrap; text-overflow: clip; }
-    #statusbar { height: 1; padding: 0; dock: bottom; display: none; text-wrap: nowrap; text-overflow: clip; }
 
     /* Windows paint exact-width lines; never let Textual reflow/wrap them
        (a measurement-pass width mismatch would otherwise double a box's
@@ -1236,8 +1140,8 @@ class DGXTop(App):
     #body.floor #node-col { margin: 0; grid-gutter: 0; }
     #node-col > NodeBox { height: auto; margin: 0; }
 
-    /* The waybar is hidden in rail/floor from _apply_tier (it is a sibling of
-       #body, so a descendant selector could not reach it). */
+    /* The waybar is the only chrome and stays visible in every tier (it is a
+       sibling of #body, so a descendant selector could not reach it). */
     """
 
     BINDINGS = [
@@ -1284,7 +1188,6 @@ class DGXTop(App):
             with Vertical(id="node-col"):
                 for index, _node in enumerate(self.settings.nodes):
                     yield NodeBox(index, id=f"node-{index}")
-        yield StatusBar(id="statusbar")
 
     def on_mount(self):
         self._poll_timer = self.set_interval(self._current_interval(), self._poll)
@@ -1299,8 +1202,9 @@ class DGXTop(App):
         for tier in ("roomy", "dense", "compact", "rail"):
             if height >= _layout_height(n, width, cols, tier, node_mode):
                 return tier
-        # Floor packs bare 1-row tiles into more columns to fit every node.
-        if height >= _layout_height(n, width, _floor_cols(width, n), "floor", "floor"):
+        # The floor packs condensed 1-row table tiles into more columns so
+        # every node fits with no scroll.
+        if height >= _layout_height(n, width, _floor_cols(width, n), "floor", "table"):
             return "floor"
         return "floor"
 
@@ -1310,7 +1214,7 @@ class DGXTop(App):
         tier = self._pick_tier(n, width, height, cols, node_mode)
         if tier == "floor":
             cols = _floor_cols(width, n)
-            node_mode = "floor"
+            node_mode = "table"
         rail = tier == "rail"
         floor = tier == "floor"
         density = "compact" if tier in ("compact", "rail", "floor") else tier
@@ -1343,10 +1247,6 @@ class DGXTop(App):
         node_col = self.query_one("#node-col", Vertical)
         node_col.styles.grid_size_columns = cols
         node_col.styles.grid_columns = " ".join(["1fr"] * cols)
-        self.query_one("#waybar", Waybar).styles.display = "none" if (rail or floor) else "block"
-        self.query_one("#statusbar", StatusBar).styles.display = (
-            "block" if (rail or floor) else "none"
-        )
         self._apply_fill(serv_h, node_h, pad)
         self._update_ui()
 
@@ -1357,7 +1257,7 @@ class DGXTop(App):
         space); leftover viewport height frames the dashboard (bounded +
         breathe). Rail/floor are top-anchored (pad 0). Returns ``(0, 0, pad)``
         — the first two are legacy slots."""
-        chrome = WAYBAR_HEIGHT if tier not in ("rail", "floor") else STATUS_HEIGHT
+        chrome = WAYBAR_HEIGHT
         avail = height - chrome
         body = _layout_height(n, width, cols, tier, node_mode) - chrome
         pad = 0 if tier in ("rail", "floor") else max(0, (avail - body) // 2)
@@ -1467,7 +1367,6 @@ class DGXTop(App):
         serving.update_throughput(
             gen_vals=list(self.history["throughput"]),
             prompt_vals=list(self.history["prompt-throughput"]),
-            node_rates=[(u.label, u.throughput_tok_s) for u in hosted_units],
         )
         kv_key = f"kv-usage-{hosted_units[0].label}" if hosted_units else ""
         serving.update_kv(
@@ -1485,7 +1384,6 @@ class DGXTop(App):
 
         interval = self._current_interval()
         self.query_one("#waybar", Waybar).update_cluster(stats, interval)
-        self.query_one("#statusbar", StatusBar).update_cluster(stats, interval)
 
         topo_type = stats.topology.topology_type if stats.topology else "UNKNOWN"
         if topo_type != self._current_topology:
