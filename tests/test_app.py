@@ -242,7 +242,9 @@ async def test_serving_heavy_vs_node_light_charsets(tmp_path: Path, monkeypatch)
 # ─── AC3: tiling geometry ────────────────────────────────────────────
 
 
-async def test_serving_hero_on_top_with_node_grid_below(tmp_path: Path, monkeypatch):
+async def test_tiled_serving_left_nodes_right_at_wide(tmp_path: Path, monkeypatch):
+    """Above TILING_WIDTH the SERVING card tiles beside the node column (node
+    cards to the RIGHT of the serving card, sharing its top row)."""
     from app import DGXTop, NodeBox, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -251,13 +253,38 @@ async def test_serving_hero_on_top_with_node_grid_below(tmp_path: Path, monkeypa
     app = DGXTop()
     async with app.run_test(size=(132, 40)) as pilot:
         await pilot.pause()
+        assert app.tiled
+        serv = app.query_one("#serving", ServingBox).region
+        nodes = [app.query_one(f"#node-{i}", NodeBox).region for i in range(2)]
+        # SERVING is the left column; every node card sits to its right.
+        assert serv.x == 0 and serv.width == 132 * 56 // 100
+        for r in nodes:
+            assert r.x > serv.right
+            assert r.right <= 132
+        assert nodes[0].y == serv.y  # the first card shares serving's top row
+        assert nodes[1].y > nodes[0].y  # two-node cluster stacks in the column
+        for r in (serv, *nodes):
+            assert r.bottom <= 40
+
+
+async def test_stacked_hero_above_node_grid_below_96(tmp_path: Path, monkeypatch):
+    """Below TILING_WIDTH the SERVING hero stays full-width on top and the
+    node cards wrap below (the stacked arrangement)."""
+    from app import DGXTop, NodeBox, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(90, 40)) as pilot:
+        await pilot.pause()
+        assert not app.tiled
         serv = app.query_one("#serving", ServingBox).region
         n0 = app.query_one("#node-0", NodeBox).region
         n1 = app.query_one("#node-1", NodeBox).region
-        # SERVING is a full-width hero on top; the node grid is below.
-        assert serv.x == 0 and serv.width == 132
+        assert serv.x == 0 and serv.width == 90  # full-width hero on top
         assert n0.y >= serv.bottom + 1
-        assert n0.y == n1.y  # both nodes share one grid row (2 columns)
+        assert n0.y == n1.y  # both nodes share one grid row
         for r in (serv, n0, n1):
             assert r.bottom <= 40
 
@@ -330,23 +357,24 @@ async def test_floor_never_scrolls_or_clips(tmp_path: Path, monkeypatch):
 
 
 async def test_density_ladder_steps_down(tmp_path: Path, monkeypatch):
+    """Every tier of the ladder is reached as height shrinks. At width 90
+    (below TILING_WIDTH) the stacked arrangement exposes the full roomy →
+    dense → compact → rail → floor sequence, each one row denser than the
+    previous at the calibrated heights."""
     from app import DGXTop
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
-    async with app.run_test(size=(132, 44)) as pilot:
+    async with app.run_test(size=(90, 44)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (44, 30, 20, 12, 8):
-            await _resize(pilot, 132, h)
+        for h in (44, 29, 20, 17, 8):
+            await _resize(pilot, 90, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
-        order = ["roomy", "dense", "compact", "rail", "floor"]
-        ranks = [order.index(t) for t in seen]
-        assert ranks == sorted(ranks), seen  # monotonically denser
-        assert seen[0] == "roomy" and seen[-1] == "floor"
+        assert seen == ["roomy", "dense", "compact", "rail", "floor"], seen
 
 
 # ─── AC5: gradient meters vs single-hue KV ───────────────────────────
@@ -933,7 +961,9 @@ async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatc
                     if wid.region.height
                 ]
                 for wid in vis:
-                    assert wid.region.bottom <= h, (n, w, h, wid.id, wid.region.bottom)
+                    r = wid.region
+                    assert r.bottom <= h, (n, w, h, wid.id, r.bottom)
+                    assert r.x + r.width <= w, (n, w, h, wid.id, r)  # no horizontal clip
                 for i, a in enumerate(vis):
                     for b in vis[i + 1 :]:
                         ra, rb = a.region, b.region
@@ -947,6 +977,9 @@ async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatc
 
 
 async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
+    """A 12-node cluster steps through the whole ladder as height shrinks
+    (at width 180 the wide tiled roomy and the denser stacked tiers both
+    appear)."""
     from app import DGXTop
 
     _config_cluster(tmp_path / "config.toml", 12)
@@ -956,14 +989,11 @@ async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
     async with app.run_test(size=(180, 60)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (60, 45, 35, 25, 15, 8):
+        for h in (60, 30, 24, 20, 8):
             await _resize(pilot, 180, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
-        order = ["roomy", "dense", "compact", "rail", "floor"]
-        ranks = [order.index(t) for t in seen]
-        assert ranks == sorted(ranks), seen  # monotonically denser
-        assert seen[0] == "roomy" and seen[-1] == "floor"
+        assert seen == ["roomy", "dense", "compact", "rail", "floor"], seen
 
 
 async def test_condensed_table_row_shows_gpu_mem_cpu(tmp_path: Path, monkeypatch):
@@ -1017,6 +1047,55 @@ async def test_serving_never_mentions_window(tmp_path: Path, monkeypatch):
             await _resize(pilot, w, h)
             blob = app.query_one("#serving", ServingBox).render().plain
             assert "window" not in blob.lower(), (w, h, blob)
+
+
+async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
+    """AC2: the graphs survive an extra tier. At compact the node cards still
+    carry the meters + core grid (RoCE is the first graph to go) and the
+    serving keeps a multi-row gen area chart."""
+    from app import DGXTop, NodeBox, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        await _resize(pilot, 132, 20)
+        assert app.density == "compact" and not app.rail and not app.floor
+        assert app._chart_rows >= 2, app._chart_rows  # area chart survives compact
+        serv_lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
+        chart_glyphs = set("▁▂▃▄▅▆▇█")
+        assert sum(1 for ln in serv_lines if any(c in chart_glyphs for c in ln)) >= 3
+        node = app.query_one("#node-0", NodeBox).render().plain
+        assert "73%" in node and "52%" in node and "50%" in node
+        assert any(c in node for c in "█▓━╾┈"), "meter glyphs survive compact"
+        assert "■" in node, "core grid survives compact"
+        assert "roce" not in node, "RoCE drops before the meters"
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_serving_chart_grows_with_height(tmp_path: Path, monkeypatch):
+    """AC3: the serving area chart grows into the leftover height instead of a
+    symmetric pad (bounded by the tier max)."""
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(90, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        await _resize(pilot, 90, 44)
+        assert not app.tiled
+        assert app._chart_rows >= 12, app._chart_rows
+        body = app.query_one("#body")
+        assert body.region.y <= 3, body.region  # leftover consumed, not padded
+        await _resize(pilot, 132, 44)
+        assert app.tiled and app._chart_rows >= 10, app._chart_rows
+        assert app.screen.max_scroll_y == 0
 
 
 async def test_serving_wins_gen_reqs_ttft(tmp_path: Path, monkeypatch):

@@ -27,31 +27,38 @@ log = logging.getLogger("dgx-top")
 TEMP_ALERT = 80
 TEMP_WARM = 60
 
-# Fluid node-grid layout: SERVING hero full-width on top, node grid below. The
-# grid picks a column count and a node-tile mode (card/compact/strip) from the
-# viewport width and node count so a 12-Spark cluster fills a single narrow row
-# on a wide terminal and wraps into card tiles on a narrow one.
+# Fluid layout: two arrangements chosen by width. At/above TILING_WIDTH the
+# SERVING card tiles beside a node column (the reference tiling desktop);
+# below it the SERVING hero sits full-width on top and the node grid wraps
+# below. In both, the grid picks a column count and a node-tile grammar from
+# the available width so a 1-12 Spark cluster keeps the most detail it can
+# carry.
 WAYBAR_HEIGHT = 1
 GRID_GUTTER = 1  # row gutter in the node grid; columns are contiguous
+TILING_WIDTH = 96  # width >= this: SERVING left, node column right
+SERVING_TILED_FRAC = 56  # serving column width as % of the viewport width
+TILING_GUTTER = 1  # blank column between the tiled serving and node column
 NODE_CARD_MIN = 22  # a usable card (text) shows gpu/mem/cpu; below this -> table
 NODE_FULL_MIN = 26  # a tile at/above this keeps the meter/core/RoCE grammar
-NODE_FLOOR_MIN = 10  # a condensed table tile (used to pack many nodes)
+NODE_FLOOR_MAX = 20  # condensed table rows prefer this width (keeps gpu/mem/cpu)
 SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 
-# Bounded growth (bounded + breathe): a taller SERVING window is filled with a
-# real area chart, never a flat slab; the chart grows to at most
-# CHART_MAX_ROWS and the core grid never exceeds CORES_MAX_ROWS rows.
+# Bounded growth (bounded + breathe): the SERVING area chart fills the
+# leftover height up to the tier max and never thinner than its tier min; the
+# core grid never exceeds CORES_MAX_ROWS rows.
 CORES_MAX_ROWS = 2
-# Fixed area-chart rows per density (the SERVING window's tall focused chart).
-# The large area chart is dropped at compact and below; the inline gen
-# sparkline is the last chart visual left, per the density-refinement request.
-CHART_ROWS = {"roomy": 5, "dense": 4, "compact": 0, "rail": 0, "floor": 0}
+# Area-chart rows are fit-computed between these bounds; the gen area chart is
+# the last serving chart visual and survives compact. Rail/floor carry no area
+# chart (the inline gen sparkline is the last chart left there).
+CHART_MIN = {"roomy": 5, "dense": 4, "compact": 2, "rail": 0, "floor": 0}
+CHART_MAX = {"roomy": 16, "dense": 14, "compact": 6, "rail": 0, "floor": 0}
 
 # Interior rows per node tile (borders excluded). A full card keeps the
-# meter/core-grid/RoCE grammar; a text card drops the graphs and runs
-# gpu/mem/cpu only. The estimator mirrors the render width fold (floor-fit
-# duality lesson).
+# meter/core-grid/RoCE grammar; a compact meter card keeps the meters + core
+# grid but drops RoCE; a text card drops the graphs and runs gpu/mem/cpu only.
+# The estimator mirrors the render width fold (floor-fit duality lesson).
 NODE_ROWS_FULL = 8  # full card interior (gpu/meter+mem/meter+cpu+core+roce)
+NODE_ROWS_METER = 6  # compact card interior (headlines + meters + 1 core row)
 NODE_ROWS_TEXT = 3  # text card interior (gpu, mem, cpu; no meter/core/RoCE)
 
 # Natural interior rows per SERVING window by density (borders excluded).
@@ -255,6 +262,15 @@ def _bar_line(pct: float, width: int, color: str, pal: Palette) -> Text:
     )
 
 
+def _stretch(data: list[float], width: int) -> list[float]:
+    """Nearest-neighbour resample so a graph fills the full width even when
+    history has fewer points than the graph has columns."""
+    n = len(data)
+    if n <= 0 or n >= width:
+        return data
+    return [data[i * n // width] for i in range(width)]
+
+
 def _spark_line(data: list[float], color: str, width: int) -> Text:
     """Block sparkline (▁…█), single owning hue per series."""
     if not data or width <= 0:
@@ -278,12 +294,14 @@ def _cores_line(vals: list[float], pal: Palette, spaced: bool = True) -> Text:
 
 
 def _area_chart_lines(data: list[float], rows: int, width: int, pal: Palette) -> list[Text]:
-    """Multi-row block-glyph area chart coloured per column by height."""
+    """Multi-row block-glyph area chart coloured per column by height. The
+    history is resampled to the chart width so a short history still fills the
+    window (no blank columns)."""
     if not data or rows <= 0 or width <= 0:
         return [Text(" " * width) for _ in range(max(0, rows))]
     lo, hi = min(data), max(data)
     span = (hi - lo) or 1
-    norm = [(v - lo) / span for v in data[-width:]]
+    norm = [(v - lo) / span for v in _stretch(data, width)]
     blk = " ▁▂▃▄▅▆▇█"
     out: list[Text] = []
     for r in range(rows):
@@ -481,7 +499,7 @@ class ServingBox(Static):
         tier = "rail" if getattr(self.app, "rail", False) else _density(self)
         interior = self._interior_rows(pal, width, _density(self), tier)
         rows = list(interior)
-        chart_rows = CHART_ROWS.get(tier, 0)
+        chart_rows = getattr(self.app, "_chart_rows", 0)
         if chart_rows:
             rows.extend(_area_chart_lines(self._gen_data, chart_rows, max(1, width - 4), pal))
         kv = self._kv or {}
@@ -557,32 +575,30 @@ class ServingBox(Static):
         )
         kvp_tail = tail([(f"  {kv_pct:.0f}%", pal.accent)], tail_kvp)
 
-        def stretched(data: list[float]) -> list[float]:
-            """Nearest-neighbour resample so the graph fills the full width
-            even when history has fewer points than the graph has columns."""
-            n = len(data)
-            if n <= 0 or n >= graph_w:
-                return data
-            return [data[i * n // graph_w] for i in range(graph_w)]
-
         def graph_row(label: str, graph: Text, tail_segs: list[Text]) -> Text:
             return Text.assemble(
                 Text(label, style=pal.dim), graph, Text("  ", style=""), *tail_segs
             )
 
         r.append(
-            graph_row("gen    ", _spark_line(stretched(self._gen_data), pal.ok, graph_w), gen_tail)
-        )
-        r.append(Text("", style=""))
-        r.append(
             graph_row(
-                "prompt ", _spark_line(stretched(self._prompt_data), pal.blue, graph_w), prompt_tail
+                "gen    ", _spark_line(_stretch(self._gen_data, graph_w), pal.ok, graph_w), gen_tail
             )
         )
         r.append(Text("", style=""))
         r.append(
             graph_row(
-                "kv     ", _spark_line(stretched(self._kv_data), pal.accent, graph_w), kv_tail
+                "prompt ",
+                _spark_line(_stretch(self._prompt_data, graph_w), pal.blue, graph_w),
+                prompt_tail,
+            )
+        )
+        r.append(Text("", style=""))
+        r.append(
+            graph_row(
+                "kv     ",
+                _spark_line(_stretch(self._kv_data, graph_w), pal.accent, graph_w),
+                kv_tail,
             )
         )
         r.append(Text("", style=""))
@@ -767,11 +783,11 @@ def _short_label(label: str) -> str:
 
 class NodeBox(Static):
     """A per-node window: light border, caret title (host=cyan, worker=orange)
-    inset in the top rule, the configured host as the right meta tab,
-    configurable meters (gradient/spark/tick/line), a ramped core grid and the
-    RoCE row — when the tile is wide enough. A narrow card drops the graphs and
-    runs gpu/mem/cpu text only; the table mode collapses the node to a single
-    aligned row."""
+    inset in the top rule, the configured host as the right meta tab. The tile
+    grammar is width-driven: roomy/dense cards keep the configurable meters,
+    ramped core grid and RoCE row; the compact meter card keeps meters + core
+    grid but drops RoCE first; a narrow card runs gpu/mem/cpu text only; the
+    floor table mode collapses the node to a single aligned row."""
 
     def __init__(self, idx: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -809,8 +825,13 @@ class NodeBox(Static):
         if getattr(self.app, "node_mode", "") == "table":
             return self._table_row(s, pal, width)
         density = _density(self)
-        full = density in ("roomy", "dense") and width >= NODE_FULL_MIN
-        rows = self._interior_rows(s, pal, width, density, text=not full)
+        tier = "rail" if getattr(self.app, "rail", False) else density
+        if width >= NODE_FULL_MIN and tier in ("roomy", "dense"):
+            rows = self._interior_rows(s, pal, width, density, roce=True)
+        elif width >= NODE_FULL_MIN and tier == "compact":
+            rows = self._interior_rows(s, pal, width, density, roce=False)
+        else:
+            rows = self._text_rows(s, pal, width)
         role = "host" if not s.is_worker else "worker"
         role_style = pal.cyan if not s.is_worker else pal.warn
         caret_style = role_style if s.online else pal.warn
@@ -905,10 +926,8 @@ class NodeBox(Static):
         return rows
 
     def _interior_rows(
-        self, s: SparkUnitStats, pal: Palette, width: int, density: str, text: bool = False
+        self, s: SparkUnitStats, pal: Palette, width: int, density: str, roce: bool = True
     ) -> list[Text]:
-        if text:
-            return self._text_rows(s, pal, width)
         compact = density == "compact" or (width - 4) <= 18
         iw = max(1, width - 4)
         mw = min(20, max(4, iw - 6))
@@ -999,17 +1018,19 @@ class NodeBox(Static):
         else:
             rows.append(Text.assemble(Text(clabel, style=pal.dim), dash))
             rows.append(Text(""))
-        # RoCE: RX/TX + wire utilisation, always its own row (accent hue).
-        roce = Text.assemble(Text("roce ", style=pal.dim))
-        if s.online and (s.roce_rx_bps > 0 or s.roce_tx_bps > 0):
-            pct = _roce_util_pct(s)
-            roce.append(f"↓{_fmt_rate(s.roce_rx_bps)}", style=f"bold {pal.accent}")
-            roce.append(f" ↑{_fmt_rate(s.roce_tx_bps)}", style=f"bold {pal.accent}")
-            if s.roce_capacity_bps > 0:
-                roce.append(f" {pct:.0f}%", style=f"bold {pal.accent}")
-        else:
-            roce.append("—", style=pal.dim)
-        rows.append(roce)
+        # RoCE: RX/TX + wire utilisation, always its own row (accent hue) — but
+        # the compact meter card drops it first (the lowest-priority graph).
+        if roce:
+            roce_row = Text.assemble(Text("roce ", style=pal.dim))
+            if s.online and (s.roce_rx_bps > 0 or s.roce_tx_bps > 0):
+                pct = _roce_util_pct(s)
+                roce_row.append(f"↓{_fmt_rate(s.roce_rx_bps)}", style=f"bold {pal.accent}")
+                roce_row.append(f" ↑{_fmt_rate(s.roce_tx_bps)}", style=f"bold {pal.accent}")
+                if s.roce_capacity_bps > 0:
+                    roce_row.append(f" {pct:.0f}%", style=f"bold {pal.accent}")
+            else:
+                roce_row.append("—", style=pal.dim)
+            rows.append(roce_row)
         return rows
 
 
@@ -1038,37 +1059,54 @@ def _palette_for(app: "DGXTop") -> Palette:
 # ─── Fit-driven layout ───────────────────────────────────────────────
 
 
-def _serving_rows_for(width: int, tier: str) -> int:
-    """SERVING interior rows for (width, tier). The prioritized compact grammar
-    (gen/requests/ttft/kv% [+cache]) is used below SERVING_NARROW_WIDTH and at
-    the compact tier; the wide grammar (no window stat) elsewhere; rail drops
-    cache; floor is the base gen/req/ttft surface."""
+def _serving_base(tier: str, serv_width: int) -> int:
+    """SERVING interior rows without the area chart for (tier, serving width).
+    Rail/floor are the fixed base surfaces; the prioritized fused grammar is
+    used below SERVING_NARROW_WIDTH and always at compact (a height-driven
+    fold); the wide design grammar (no window stat) elsewhere."""
     if tier == "rail":
         return SERVING_ROWS_RAIL
     if tier == "floor":
         return SERVING_ROWS_FLOOR
-    base = NARROW_BASE if (width < SERVING_NARROW_WIDTH or tier == "compact") else WIDE_BASE
-    chart = CHART_ROWS.get(tier, 0)
-    return base + chart
+    if tier == "compact" or serv_width < SERVING_NARROW_WIDTH:
+        return NARROW_BASE
+    return WIDE_BASE
 
 
-def _node_tile_rows(tier: str, node_mode: str, tile_w: int) -> int:
-    """Rendered height of one node tile: a 1-row condensed-table row, a framed
-    full card (meters + core grid + RoCE) if the tile is wide enough and the
-    tier is roomy/dense, else a framed text card (gpu/mem/cpu only). The
+def _serving_chart(tier: str, room: int) -> int:
+    """Area-chart rows for a tier given ``room`` rows of leftover height
+    (bounded: never thinner than the tier min, never taller than the tier
+    max). Rail/floor carry none; the gen area chart is the last serving chart
+    visual and survives compact."""
+    if tier in ("rail", "floor"):
+        return 0
+    return min(CHART_MAX[tier], max(CHART_MIN[tier], room))
+
+
+def _node_tile_rows(tier: str, tile_w: int) -> int:
+    """Rendered height of one node tile (borders included): a 1-row condensed
+    table row at floor; a framed full card (meters + core grid + RoCE) when the
+    tile is wide enough and roomy/dense; a framed compact meter card (meters +
+    core grid, no RoCE); else a framed text card (gpu/mem/cpu only). The
     estimator passes the *widest* grid column (ceil of the column width) so the
-    full/text decision matches what NodeBox.render actually does."""
-    if node_mode == "table" or tier == "floor":
+    full/meter/text decision matches what NodeBox.render actually does."""
+    if tier == "floor":
         return 1
-    if tile_w >= NODE_FULL_MIN and tier in ("roomy", "dense"):
-        return NODE_ROWS_FULL + 2
+    if tile_w >= NODE_FULL_MIN:
+        if tier in ("roomy", "dense"):
+            return NODE_ROWS_FULL + 2
+        if tier == "compact":
+            return NODE_ROWS_METER + 2
     return NODE_ROWS_TEXT + 2
 
 
-def _floor_cols(grid_w: int, n: int) -> int:
-    """Columns for the floor tier, whose condensed 1-row table tiles pack
-    tightly."""
-    return min(n, max(1, grid_w // NODE_FLOOR_MIN))
+def _floor_cols(grid_w: int, n: int, row_budget: int) -> int:
+    """Columns for the floor tier. Condensed table rows are packed as wide as
+    the height budget allows (``row_budget`` node rows) and no wider than
+    NODE_FLOOR_MAX cells, so a row keeps its gpu/mem/cpu fields when the
+    column can carry them and the never-scroll floor holds."""
+    cols = max(-(-n // max(1, row_budget)), max(1, grid_w // NODE_FLOOR_MAX))
+    return min(n, cols)
 
 
 def _node_layout(grid_w: int, n: int) -> tuple[int, str]:
@@ -1083,24 +1121,88 @@ def _node_layout(grid_w: int, n: int) -> tuple[int, str]:
     return min(n, max(1, grid_w // NODE_CARD_MIN)), "card"
 
 
-def _layout_height(nodes: int, width: int, cols: int, tier: str, node_mode: str) -> int:
-    """Full viewport height (rows) a (cols, tier, node_mode) layout needs."""
-    chrome = WAYBAR_HEIGHT
-    serv_ir = _serving_rows_for(width, tier)
-    # Textual distributes the `width % cols` remainder to the trailing 1fr
-    # columns, so the widest column can be one cell wider than `width // cols`.
-    # Reserve the widest column's card grammar (full vs text) so the estimator
-    # never under-calls the render and clips the grid (never-clip invariant).
-    tile_w = -(-width // cols) if cols else width
-    tile = _node_tile_rows(tier, node_mode, tile_w)
-    grid_rows = -(-nodes // cols) if cols else nodes
-    gutter = 0 if tier == "floor" else GRID_GUTTER  # bare floor lines pack tight
-    grid_h = grid_rows * tile + max(0, grid_rows - 1) * gutter
+def _arrangement(width: int) -> bool:
+    """True for the wide tiled arrangement (SERVING beside a node column);
+    below TILING_WIDTH the SERVING hero stacks above the node grid."""
+    return width >= TILING_WIDTH
+
+
+def _serving_tiled_width(width: int) -> int:
+    """Serving column width in cells for the tiled arrangement (explicit, so
+    the estimator mirrors the resolved columns exactly — no ``fr`` rounding)."""
+    return max(1, width * SERVING_TILED_FRAC // 100)
+
+
+def _node_grid_columns(n: int, grid_w: int, tiled: bool) -> int:
+    """Grid columns for ``n`` nodes in a ``grid_w``-cell container (never the
+    floor, which packs via ``_floor_cols``). In the tiled arrangement a small
+    cluster (<= 4) stacks its cards in one column beside SERVING (the
+    reference tiling); otherwise the width rule applies."""
+    if tiled and n <= 4:
+        return 1
+    return _node_layout(grid_w, n)[0]
+
+
+def _grid_height(n: int, cols: int, tile: int, tier: str) -> int:
+    """Height of a node grid: ``tile`` rows per tile row, GRID_GUTTER blank
+    rows between tile rows (floor packs bare table lines flush)."""
+    rows = -(-n // cols)
+    gutter = 0 if tier == "floor" else GRID_GUTTER
+    return rows * tile + max(0, rows - 1) * gutter
+
+
+def _tier_fit(
+    n: int, width: int, avail: int, tier: str, tiled: bool
+) -> tuple[bool, int, int, int, int]:
+    """(fits, cols, node_h, serv_h, chart) for one tier in one arrangement.
+    Mirrors the CSS row grammar exactly (estimate/layout duality): the stacked
+    body is serv_h + GRID_GUTTER + node_h (no gutter at floor); the tiled body
+    is max(serv_h, node_h). Textual distributes the width%cols remainder to
+    the trailing 1fr columns, so the *widest* column is always reserved (ceil)
+    and the floor rows are bare (no +2 window frame)."""
+    if tiled:
+        sw = _serving_tiled_width(width)
+        nw = width - sw - TILING_GUTTER
+        if tier == "floor":
+            cols = _floor_cols(nw, n, avail - SERVING_ROWS_FLOOR)
+        else:
+            cols = _node_grid_columns(n, nw, tiled)
+        tile = _node_tile_rows(tier, -(-nw // cols))
+        node_h = _grid_height(n, cols, tile, tier)
+        base = _serving_base(tier, sw)
+        chart = _serving_chart(tier, avail - base - 2)
+        serv_h = base + chart + (2 if tier != "floor" else 0)
+        fits = node_h <= avail and serv_h <= avail
+        return fits, cols, node_h, serv_h, chart
     if tier == "floor":
-        body = serv_ir + grid_h
+        cols = _floor_cols(width, n, avail - SERVING_ROWS_FLOOR)
     else:
-        body = (serv_ir + 2) + GRID_GUTTER + grid_h
-    return chrome + body
+        cols = _node_grid_columns(n, width, tiled)
+    tile = _node_tile_rows(tier, -(-width // cols))
+    node_h = _grid_height(n, cols, tile, tier)
+    base = _serving_base(tier, width)
+    if tier == "floor":
+        serv_h = base  # bare floor lines, no window frame
+        fits = serv_h + node_h <= avail
+        return fits, cols, node_h, serv_h, 0
+    body = base + CHART_MIN[tier] + 2 + GRID_GUTTER + node_h
+    fits = body <= avail
+    chart = _serving_chart(tier, avail - (base + 2 + GRID_GUTTER + node_h)) if fits else 0
+    serv_h = base + chart + 2
+    return fits, cols, node_h, serv_h, chart
+
+
+_TIER_RANK = {name: i for i, name in enumerate(("roomy", "dense", "compact", "rail", "floor"))}
+
+
+def _tier_for(n: int, width: int, height: int, tiled: bool) -> str:
+    """Densest tier whose estimated body fits (loosest first) for one
+    arrangement; the floor is the unconditional fallback."""
+    avail = height - WAYBAR_HEIGHT
+    for tier in ("roomy", "dense", "compact", "rail"):
+        if _tier_fit(n, width, avail, tier, tiled)[0]:
+            return tier
+    return "floor"
 
 
 class DGXTop(App):
@@ -1124,11 +1226,12 @@ class DGXTop(App):
         layout: vertical;
         height: 1fr;
     }
-
-    /* SERVING hero full-width on top; the node grid below. The grid's column
-       count and tile mode are set per-resize in _apply_tier (columns-only
-       grid-size so any child count wraps; a fixed rows value would clamp and
-       orphan overflow children). */
+    /* SERVING hero full-width on top; the node grid below (the stacked
+       arrangement). At/above TILING_WIDTH the fit engine flips #body to
+       horizontal and sizes the two columns in cells (tiled arrangement).
+       The grid's column count and tile mode are set per-resize in _apply_tier
+       (columns-only grid-size so any child count wraps; a fixed rows value
+       would clamp and orphan overflow children). */
     #serving { height: auto; width: 1fr; }
     #node-col {
         layout: grid;
@@ -1137,13 +1240,13 @@ class DGXTop(App):
         grid-gutter: 1 0;   /* one blank row between tile rows; columns contiguous */
         margin: 1 0 0 0;     /* one blank row under SERVING (mirrored by the fit estimator) */
     }
+    /* The floor packs bare table lines flush (margin and gutter reset). */
     #body.floor #node-col { margin: 0; grid-gutter: 0; }
     #node-col > NodeBox { height: auto; margin: 0; }
 
     /* The waybar is the only chrome and stays visible in every tier (it is a
        sibling of #body, so a descendant selector could not reach it). */
     """
-
     BINDINGS = [
         Binding("plus", "poll_faster", "Faster"),
         Binding("minus", "poll_slower", "Slower"),
@@ -1170,11 +1273,13 @@ class DGXTop(App):
         self.density = ""
         self.cols = 0
         self.node_mode = ""
-        self.rail = False
-        self.floor = False
+        self.tiled = False
         self._serv_h = 0
         self._node_h = 0
+        self._chart_rows = 0
         self._pad = 0
+        self._sw = 0
+        self._nw = 0
 
     def get_driver_class(self):
         """Use resilient input unless Textual selected an explicit driver."""
@@ -1197,73 +1302,91 @@ class DGXTop(App):
     def on_resize(self, event) -> None:
         self._apply_tier(event.size.width, event.size.height)
 
-    def _pick_tier(self, n: int, width: int, height: int, cols: int, node_mode: str) -> str:
-        """Densest tier whose estimated height fits (loosest first)."""
-        for tier in ("roomy", "dense", "compact", "rail"):
-            if height >= _layout_height(n, width, cols, tier, node_mode):
-                return tier
-        # The floor packs condensed 1-row table tiles into more columns so
-        # every node fits with no scroll.
-        if height >= _layout_height(n, width, _floor_cols(width, n), "floor", "table"):
-            return "floor"
-        return "floor"
+    def _choose_layout(self, n: int, width: int, height: int) -> tuple[bool, str]:
+        """(tiled, tier) for a viewport. The tiled arrangement is used only
+        when it reaches a tier at least as loose as the stacked one: a narrow
+        right column must never densify the serving surface (the hero chart is
+        the priority). Ties prefer the tiled layout the request asks for."""
+        tiled = _arrangement(width)
+        tier_t = _tier_for(n, width, height, True)
+        tier_s = _tier_for(n, width, height, False)
+        if tiled and _TIER_RANK[tier_t] <= _TIER_RANK[tier_s]:
+            return True, tier_t
+        return False, tier_s
 
     def _apply_tier(self, width: int, height: int) -> None:
         n = len(self.settings.nodes)
-        cols, node_mode = _node_layout(width, n)
-        tier = self._pick_tier(n, width, height, cols, node_mode)
-        if tier == "floor":
-            cols = _floor_cols(width, n)
-            node_mode = "table"
+        avail = height - WAYBAR_HEIGHT
+        tiled, tier = self._choose_layout(n, width, height)
+        _fits, cols, node_h, serv_h, chart = _tier_fit(n, width, avail, tier, tiled)
+        node_mode = "table" if tier == "floor" else "card"
         rail = tier == "rail"
         floor = tier == "floor"
         density = "compact" if tier in ("compact", "rail", "floor") else tier
-        serv_h, node_h, pad = self._fill_heights(height, n, width, cols, tier, node_mode)
+        pad = self._body_pad(avail, tier, tiled, node_h, serv_h)
+        sw = _serving_tiled_width(width) if tiled else 0
+        nw = width - sw - TILING_GUTTER if tiled else 0
         if (
             density == self.density
             and cols == self.cols
             and node_mode == self.node_mode
+            and tiled == self.tiled
             and rail == self.rail
             and floor == self.floor
             and serv_h == self._serv_h
             and node_h == self._node_h
+            and chart == self._chart_rows
             and pad == self._pad
+            and sw == self._sw
+            and nw == self._nw
         ):
             return
         self.density = density
         self.cols = cols
         self.node_mode = node_mode
+        self.tiled = tiled
         self.rail = rail
         self.floor = floor
         self._serv_h = serv_h
         self._node_h = node_h
+        self._chart_rows = chart
         self._pad = pad
+        self._sw = sw
+        self._nw = nw
 
         for name in ("compact", "dense", "roomy"):
             self.screen.set_class(name == density, name)
         body = self.query_one("#body", Vertical)
+        body.set_class(tiled, "tiled")
         body.set_class(rail, "rail")
         body.set_class(floor, "floor")
+        body.styles.layout = "horizontal" if tiled else "vertical"
         node_col = self.query_one("#node-col", Vertical)
         node_col.styles.grid_size_columns = cols
         node_col.styles.grid_columns = " ".join(["1fr"] * cols)
-        self._apply_fill(serv_h, node_h, pad)
+        serving = self.query_one("#serving", ServingBox)
+        if tiled:
+            sw = _serving_tiled_width(width)
+            serving.styles.width = sw
+            node_col.styles.width = width - sw - TILING_GUTTER
+            node_col.styles.margin = (0, 0, 0, TILING_GUTTER)
+        else:
+            serving.styles.width = "1fr"
+            node_col.styles.width = "1fr"
+            node_col.styles.margin = (0, 0, 0, 0) if floor else (1, 0, 0, 0)
+        self._apply_fill(pad)
         self._update_ui()
 
-    def _fill_heights(
-        self, height: int, n: int, width: int, cols: int, tier: str, node_mode: str
-    ) -> tuple[int, int, int]:
-        """Centering pad only: every window auto-sizes to its content (no dead
-        space); leftover viewport height frames the dashboard (bounded +
-        breathe). Rail/floor are top-anchored (pad 0). Returns ``(0, 0, pad)``
-        — the first two are legacy slots."""
-        chrome = WAYBAR_HEIGHT
-        avail = height - chrome
-        body = _layout_height(n, width, cols, tier, node_mode) - chrome
-        pad = 0 if tier in ("rail", "floor") else max(0, (avail - body) // 2)
-        return 0, 0, pad
+    def _body_pad(self, avail: int, tier: str, tiled: bool, node_h: int, serv_h: int) -> int:
+        """Symmetric framing pad (bounded breathe). Rail/floor stay top-anchored
+        (pad 0). The tiled body band is max(serv_h, node_h); the stacked body
+        adds the grid gap."""
+        if tier in ("rail", "floor"):
+            return 0
+        body = max(serv_h, node_h) if tiled else serv_h + GRID_GUTTER + node_h
+        return max(0, (avail - body) // 2)
 
-    def _apply_fill(self, serv_h: int, node_h: int, pad: int) -> None:
+    def _apply_fill(self, pad: int) -> None:
         """Auto-size every window and centre the body with a top pad."""
         body = self.query_one("#body", Vertical)
         body.styles.margin = (pad, 0, 0, 0) if pad else 0
