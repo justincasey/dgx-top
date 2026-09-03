@@ -228,39 +228,49 @@ exact reference hues.
 
 No collected telemetry or endpoint response body is written to disk.
 
-## Layout and small terminals
+The dashboard is fluid in both axes. Two **arrangements** are chosen by width:
 
-The dashboard is fluid in both axes. A full-width **SERVING hero** sits on top
-and a **node grid** fills the rest; the grid's column count and per-tile mode are
-chosen so the cluster always fills the space with the most detail it can carry:
+- **At/above 96 columns** the SERVING card tiles as the left column (56% of the
+  width) and the **node cards sit beside it to the right** — a small cluster
+  stacks its cards in one column next to SERVING, a larger one wraps a narrow
+  card grid inside the right column.
+- **Below 96 columns** a full-width **SERVING hero** sits on top and the node
+  grid fills the rest.
+
+The node grid's column count and per-tile grammar are chosen so the cluster
+always keeps the most detail it can carry:
 
 | Composition | Layout |
 | --- | --- |
-| Wide + many nodes | SERVING hero on top, node **cards tile into rows**, each held at the card minimum — a 12-Spark cluster wraps into usable cards rather than a single cramped strip row |
-| Wide + few nodes | SERVING hero on top, all nodes as full **card** tiles in one row |
-| Narrow + many nodes | SERVING hero on top, node **cards tile into rows** below, each tile held at a minimum width so its metrics stay readable; when no usable card fits, every node collapses to a **condensed table row** |
+| Wide, few nodes | SERVING tiles left with a tall area chart; node cards stack right beside it, each a full card (meters, core grid, RoCE) |
+| Wide, many nodes | SERVING left with the chart; the right column wraps a **card grid** (each tile held at a usable width) |
+| Narrow, few nodes | SERVING hero on top, full **card** tiles in one row |
+| Narrow, many nodes | SERVING hero on top, node **cards tile into rows** below, each held at a minimum width; when no usable card fits, every node collapses to a **condensed table row** |
 
 Height picks how tight it gets. Every candidate tier — `roomy` → `dense` →
-`compact` → `rail` → `floor` — has an exact total height for the current width
-and node count (calibrated to the real rendered heights), and the densest tier
-that fits wins, so the dashboard degrades one step at a time and **never
-scrolls** (`overflow-y: hidden`); the floor tier packs every node into a compact
-condensed table row and fits down to an 8-row viewport:
+`compact` → `rail` → `floor` — has an exact total height for the current width,
+node count and arrangement (calibrated to the real rendered heights), and the
+densest tier that fits wins, so the dashboard degrades one step at a time and
+**never scrolls** (`overflow-y: hidden`); the floor tier packs every node into a
+compact condensed table row and fits down to an 8-row viewport. The tiled
+arrangement is used only when it reaches a tier at least as rich as the
+stacked one, so a narrow right column never densifies the serving surface:
 
 | Tier | Look |
 | --- | --- |
-| `roomy` | Full metric rows, gradient meters, two-row core grid, a five-row SERVING area chart |
-| `dense` | The same rows with a four-row chart |
-| `compact` | Node cards drop the meter/core-grid/RoCE graphs and run gpu/mem/cpu text; SERVING drops the area chart and favours gen (the last chart visual) + requests + ttft |
-| `rail` | SERVING chart gone (gen/req/ttft/kv% remain); node cards stay text; the waybar stays visible carrying gen/kv/online |
+| `roomy` | Full metric rows, gradient meters, two-row core grid, a SERVING area chart that **grows into the leftover height** (up to the tier max) |
+| `dense` | The same rows with a shorter upper chart bound |
+| `compact` | Node cards keep their **meters and core grid** (RoCE drops first) as long as the tile is wide enough; SERVING keeps a small area chart and favours gen (the last chart visual) + requests + ttft |
+| `rail` | SERVING chart gone (gen/req/ttft/kv% remain); node cards run gpu/mem/cpu text; the waybar stays visible carrying gen/kv/online |
 | `floor` | The never-scroll bottom: each node becomes one **condensed table row** (`● 3  87%  62%  61%`), SERVING to gen/req/ttft, no window frames |
 
 **Bounded fill, then breathe.** The fit selector guarantees the natural content
-fits; the SERVING window carries a real gradient area chart of the generation
-history, and leftover viewport rows frame the dashboard with calm, symmetric
-breathing room rather than stretching any panel into a slab. As the layout
+fits; the SERVING area chart is fit-computed (never thinner than its tier
+minimum, never taller than its tier maximum) so leftover viewport rows become
+graph, and only when a tier caps out does symmetric breathing room frame the
+dashboard rather than stretching any panel into a slab. As the layout
 densifies, lower-value data is dropped rather than crammed: node cards favour
-`gpu · mem · cpu` and shed the meters/core grid/RoCE for plain text; the
+`gpu · mem · cpu` and shed RoCE, then the meters/core grid, for plain text; the
 SERVING surface favours gen, the requests line (concurrency) and TTFT, dropping
 the window stat first and the large area chart before the gen sparkline. The
 base surface — node gpu/mem/cpu and serving gen/req/ttft (+ KV% through rail) —
