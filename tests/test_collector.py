@@ -274,6 +274,181 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.prompt_tokens_total, 0.0)
 
 
+class LabelConflationTests(unittest.TestCase):
+    """Sibling Prometheus series (``*_created``, ``*_by_reason``,
+    ``*_by_source``) and per-engine label sets must never bleed into the
+    parent counter — exact-name matching is the whole defence."""
+
+    def test_created_pseudo_counter_is_not_summed(self):
+        # *_created values are Unix epoch timestamps; summing one into the
+        # counter poisons the throughput delta with ~1/s wall-clock drift.
+        stats = collector._parse_vllm_metrics(
+            'vllm:generation_tokens_total{engine="0",model_name="a"} 264348.0\n'
+            'vllm:generation_tokens_created{engine="0",model_name="a"} 1788733924.32\n'
+        )
+        self.assertEqual(stats.generation_tokens_total, 264348.0)
+
+    def test_prompt_token_variant_series_are_excluded(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:prompt_tokens_total{model_name="a"} 3.6e+07\n'
+            'vllm:prompt_tokens_created{model_name="a"} 1.7887e+09\n'
+            'vllm:prompt_tokens_by_source_total{model_name="a",source="local_compute"} 2.5e+06\n'
+            'vllm:prompt_tokens_by_source_total{model_name="a",source="local_cache_hit"} 3.3e+07\n'
+            'vllm:prompt_tokens_cached_total{model_name="a"} 3.3e+07\n'
+        )
+        self.assertEqual(stats.prompt_tokens_total, 3.6e7)
+
+    def test_waiting_by_reason_does_not_override_the_gauge(self):
+        # The old prefix match let the last by_reason line overwrite the
+        # real waiting count.
+        stats = collector._parse_vllm_metrics(
+            'vllm:num_requests_waiting{model_name="a"} 5.0\n'
+            'vllm:num_requests_waiting_by_reason{model_name="a",reason="capacity"} 3.0\n'
+            'vllm:num_requests_waiting_by_reason{model_name="a",reason="deferred"} 0.0\n'
+        )
+        self.assertEqual(stats.requests_waiting, 5)
+
+    def test_multi_engine_label_sets_are_summed(self):
+        stats = collector._parse_vllm_metrics(
+            'vllm:num_requests_running{engine="0",model_name="a"} 2.0\n'
+            'vllm:num_requests_running{engine="1",model_name="a"} 3.0\n'
+            'vllm:generation_tokens_total{engine="0",model_name="a"} 100.0\n'
+            'vllm:generation_tokens_total{engine="1",model_name="a"} 50.0\n'
+        )
+        self.assertEqual(stats.requests_running, 5)
+        self.assertEqual(stats.generation_tokens_total, 150.0)
+
+    def test_multi_engine_histograms_accumulate(self):
+        # Engine 0 finishes ≤0.5s, engine 1 ≤1s: the merged p50 sits at the
+        # boundary (0.5s); last-engine-wins would report 1.0s.
+        stats = collector._parse_vllm_metrics(
+            'vllm:time_to_first_token_seconds_bucket{engine="0",le="0.5"} 5\n'
+            'vllm:time_to_first_token_seconds_bucket{engine="0",le="+Inf"} 5\n'
+            'vllm:time_to_first_token_seconds_count{engine="0"} 5\n'
+            'vllm:time_to_first_token_seconds_bucket{engine="1",le="0.5"} 0\n'
+            'vllm:time_to_first_token_seconds_bucket{engine="1",le="1"} 5\n'
+            'vllm:time_to_first_token_seconds_bucket{engine="1",le="+Inf"} 5\n'
+            'vllm:time_to_first_token_seconds_count{engine="1"} 5\n'
+        )
+        self.assertAlmostEqual(stats.ttft_p50_ms, 500.0)
+
+
+class ShortModelNameTests(unittest.TestCase):
+    def test_hf_cache_snapshot_path(self):
+        self.assertEqual(
+            collector._short_model_name(
+                "/root/.cache/huggingface/hub/models--nvidia--Nemotron-3.5/snapshots/cc84af2"
+            ),
+            "Nemotron-3.5",
+        )
+
+    def test_org_model_path_takes_the_name(self):
+        self.assertEqual(collector._short_model_name("Qwen/Qwen3.6-27B"), "Qwen3.6-27B")
+
+    def test_bare_name_is_unchanged(self):
+        self.assertEqual(collector._short_model_name("qwen3.8-flash-next"), "qwen3.8-flash-next")
+
+
+class SglangEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_load_fallback_marks_sglang_source(self):
+        units = {
+            9: {
+                "label": "spark-sg",
+                "ssh_target": "tester@spark.test",
+                "vllm_url": "http://spark.test:8888",
+                "worker": False,
+            }
+        }
+
+        async def metrics_404(url):
+            raise RuntimeError("404 Not Found for url 'http://spark.test:8888/metrics'")
+
+        collector._model_names.clear()
+        collector._model_names[9] = "Nemotron-3.5"
+        load = AsyncMock(return_value=(2, 1))
+        telemetry_mock = AsyncMock(return_value={})
+        with patch.object(collector, "SPARK_UNITS", units):
+            with patch.object(collector, "_fetch_vllm_metrics", metrics_404):
+                with patch.object(collector, "_fetch_telemetry", telemetry_mock):
+                    with patch.object(collector, "_fetch_sglang_load", load):
+                        stats = await collector.poll_unit(9)
+        load.assert_awaited_once_with("http://spark.test:8888")
+        self.assertTrue(stats.model_hosted)
+        self.assertEqual(stats.model_source, "sglang")
+        self.assertFalse(stats.model_metrics)
+        self.assertEqual((stats.requests_running, stats.requests_waiting), (2, 1))
+        self.assertEqual(stats.model_name, "Nemotron-3.5")
+        self.assertNotIn("vLLM", stats.error)
+
+    def test_sglang_metrics_namespace_is_parsed(self):
+        # SGLang with --enable-metrics mirrors the vLLM metric shape under
+        # the sglang: namespace — one parser must serve both.
+        stats = collector._parse_vllm_metrics(
+            'sglang:generation_tokens_total{model_name="a"} 900.0\n'
+            'sglang:prompt_tokens_total{model_name="a"} 400.0\n'
+            'sglang:num_requests_running{model_name="a"} 2.0\n'
+        )
+        self.assertTrue(stats.model_hosted)
+        self.assertEqual(stats.model_source, "sglang")
+        self.assertTrue(stats.model_metrics)
+        self.assertEqual(stats.generation_tokens_total, 900.0)
+        self.assertEqual(stats.prompt_tokens_total, 400.0)
+        self.assertEqual(stats.requests_running, 2)
+
+    async def test_get_load_sums_dp_ranks(self):
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return [
+                    {"num_reqs": 2, "num_waiting_reqs": 1},
+                    {"num_reqs": 1, "num_waiting_reqs": 0},
+                ]
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                return FakeResp()
+
+        with patch.object(collector.httpx, "AsyncClient", FakeClient):
+            got = await collector._fetch_sglang_load("http://x:1")
+        self.assertEqual(got, (3, 1))
+
+    async def test_get_load_none_for_foreign_endpoint(self):
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"detail": "Not Found"}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                return FakeResp()
+
+        with patch.object(collector.httpx, "AsyncClient", FakeClient):
+            got = await collector._fetch_sglang_load("http://x:1")
+        self.assertIsNone(got)
+
+
 class ClusterStatsKvAggregationTests(unittest.TestCase):
     """Tests for ClusterStats KV aggregation properties."""
 

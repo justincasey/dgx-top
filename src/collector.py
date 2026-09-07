@@ -23,6 +23,25 @@ from stats import (
 _model_names: dict[int, str] = {}
 
 
+def _short_model_name(raw: str) -> str:
+    """Human display name for a served-model id.
+
+    sglang serves the raw HF cache layout (``…/models--nvidia--NAME/snapshots/
+    <sha>``) as the model id; vLLM may serve ``org/model`` paths. Chart labels
+    must fit a legend column, so collapse to the bare model name.
+    """
+    if not raw:
+        return raw
+    s = raw.rstrip("/")
+    if "models--" in s:
+        segs = s.split("models--")[-1].replace("--", "/").split("/")
+        if "snapshots" in segs:
+            i = segs.index("snapshots")
+            return segs[i - 1] if i > 0 else segs[-1]
+        return segs[-1]
+    return s.split("/")[-1]
+
+
 async def _init_model_names() -> None:
     """Fetch model names from all Spark units once at startup."""
     if config.SIMULATION_NODES:
@@ -34,7 +53,9 @@ async def _init_model_names() -> None:
             resp.raise_for_status()
             models = resp.json().get("data", [])
             if models:
-                _model_names[uid] = models[0].get("id") or models[0].get("model", "")
+                _model_names[uid] = _short_model_name(
+                    models[0].get("id") or models[0].get("model", "")
+                )
         except Exception:
             pass  # model name is optional
 
@@ -47,7 +68,10 @@ async def _init_model_names() -> None:
 def _parse_prometheus_histogram(
     lines: List[str], metric_name: str
 ) -> Tuple[Dict[float, float], float]:
-    """Parse a Prometheus histogram and return (buckets, count)."""
+    """Parse a Prometheus histogram and return (buckets, count).
+
+    Buckets and counts accumulate across label sets so an endpoint exposing
+    several engines reports the summed histogram, never the last engine's."""
     buckets: Dict[float, float] = {}
     count = 0.0
     for line in lines:
@@ -61,11 +85,17 @@ def _parse_prometheus_histogram(
                     le = float("inf")
                 else:
                     le = float(le_str)
-                buckets[le] = cnt
+                if math.isfinite(cnt):
+                    buckets[le] = buckets.get(le, 0.0) + cnt
         elif line.startswith(f"{metric_name}_count"):
             parts = line.split()
             if len(parts) >= 2:
-                count = float(parts[-1])
+                try:
+                    c = float(parts[-1])
+                except ValueError:
+                    continue
+                if math.isfinite(c):
+                    count += c
     return buckets, count
 
 
@@ -88,8 +118,46 @@ def _estimate_quantile(buckets: Dict[float, float], count: float, q: float) -> f
     return prev_le
 
 
+def _metric_series(lines: List[str], *names: str) -> Tuple[List[float], bool]:
+    """Return (finite_values, saw_any_sample) for sample lines whose metric name
+    is exactly one of ``names`` (any label set).
+
+    Exact name matching is what keeps sibling series out of the sum. A loose
+    ``startswith("vllm:generation_tokens")`` also swallows
+    ``vllm:generation_tokens_created`` (a Unix-epoch pseudo-counter),
+    ``vllm:prompt_tokens_by_source_*`` and ``vllm:num_requests_waiting_by_reason``
+    — mixing an epoch timestamp into a token counter poisons the throughput
+    delta baseline with a ~1/s wall-clock drift and double-counts totals.
+    """
+    out: List[float] = []
+    saw = False
+    for line in lines:
+        for name in names:
+            if not line.startswith(name):
+                continue
+            rest = line[len(name) :]
+            if rest and rest[0] not in " {":
+                continue  # sibling series: *_created, *_by_reason, *_by_source…
+            saw = True
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    v = float(parts[-1])
+                except ValueError:
+                    break
+                if math.isfinite(v):
+                    out.append(v)
+            break
+    return out, saw
+
+
 def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     """Parse vLLM Prometheus metrics into SparkUnitStats.
+
+    Series are selected by exact metric name (see ``_metric_series``) and
+    summed across label sets, so an endpoint exposing several engines reports
+    one honest endpoint-level aggregate instead of whichever engine printed
+    last. Modern vLLM names (``*_total``) win over the legacy bare names.
 
     KV cache data available from /metrics:
       - vllm:kv_cache_usage_perc (Gauge): block-level allocation fraction (0-1).
@@ -116,10 +184,14 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     """
     s = SparkUnitStats()
     lines = text.strip().splitlines()
+    # SGLang mirrors the vLLM metric shape under the ``sglang:`` namespace
+    # when started with --enable-metrics; one parser, both namespaces.
+    ns = "sglang:" if any(line.startswith("sglang:") for line in lines) else "vllm:"
+    s.model_source = "sglang" if ns == "sglang:" else "vllm"
     # Cache config — block_size and total_blocks from cache_config_info at startup
     size_tokens = 0
     for line in lines:
-        if "vllm:cache_config_info{" in line:
+        if f"{ns}cache_config_info{{" in line:
             m = re.search(r'num_gpu_blocks="(\d+)"', line)
             if m:
                 s.kv_total_blocks = int(m.group(1))
@@ -133,128 +205,82 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
         s.kv_total_tokens = size_tokens
     elif s.kv_total_blocks > 0 and s.kv_block_size > 0:
         s.kv_total_tokens = s.kv_total_blocks * s.kv_block_size
-    # KV cache usage — block-level allocation fraction. This is from
-    # BlockPool.get_usage(): 1.0 - (free_blocks / (total_gpu_blocks - 1)).
-    # vLLM reserves 1 null block, which is already netted out by vLLM
-    # in the usage gauge. We do NOT subtract it again.
-    for line in lines:
-        if line.startswith("vllm:kv_cache_usage_perc"):
-            parts = line.split()
-            if len(parts) >= 2:
-                # Non-finite gauges (NaN/Inf, or values that overflow the
-                # ×100 scaling) would poison the Sparkline history and crash
-                # the app renderer — drop them.
-                pct = float(parts[-1]) * 100
-                if math.isfinite(pct):
-                    s.kv_cache_pct = pct
-                    # Derive block and token counts from the usage percentage.
-                    # usage_pct already accounts for the null block subtraction.
-                    if s.kv_total_tokens > 0:
-                        val = float(parts[-1])
-                        s.kv_cache_free_blocks = int(s.kv_total_blocks * (1 - val))
-                        s.kv_cache_used_tokens = int(s.kv_total_tokens * val)
-    for line in lines:
-        if line.startswith("vllm:prefix_cache_hits_total"):
-            parts = line.split()
-            if len(parts) >= 2:
-                v = float(parts[-1])
-                if math.isfinite(v):
-                    s.prefix_hits_total = v
-        elif line.startswith("vllm:prefix_cache_queries_total"):
-            parts = line.split()
-            if len(parts) >= 2:
-                v = float(parts[-1])
-                if math.isfinite(v):
-                    s.prefix_queries_total = v
 
-    # Requests running
-    for line in lines:
-        if line.startswith("vllm:num_requests_running"):
-            parts = line.split()
-            if len(parts) >= 2:
-                running = float(parts[-1])
-                # int(inf) raises OverflowError and would drop this node's
-                # whole vLLM parse — ignore non-finite counts.
-                if math.isfinite(running):
-                    s.requests_running = int(running)
-        elif line.startswith("vllm:num_requests_waiting"):
-            parts = line.split()
-            if len(parts) >= 2:
-                waiting = float(parts[-1])
-                if math.isfinite(waiting):
-                    s.requests_waiting = int(waiting)
+    # KV cache usage — block-level allocation fraction (null block already
+    # netted out by vLLM). Engines share the pool; the most-used engine is the
+    # honest endpoint number.
+    usage_vals, _ = _metric_series(lines, f"{ns}kv_cache_usage_perc")
+    if usage_vals:
+        val = max(usage_vals)
+        pct = val * 100
+        # A finite raw value can still overflow the ×100 scaling; a poisoned
+        # gauge would wreck the Sparkline history and the renderer.
+        if math.isfinite(pct):
+            s.kv_cache_pct = pct
+            if s.kv_total_tokens > 0:
+                s.kv_cache_free_blocks = int(s.kv_total_blocks * (1 - val))
+                s.kv_cache_used_tokens = int(s.kv_total_tokens * val)
+
+    hits, _ = _metric_series(lines, f"{ns}prefix_cache_hits_total")
+    s.prefix_hits_total = sum(hits)
+    queries, _ = _metric_series(lines, f"{ns}prefix_cache_queries_total")
+    s.prefix_queries_total = sum(queries)
+
+    # Concurrency — summed across engines; *_by_reason breakdowns excluded.
+    running, _ = _metric_series(lines, f"{ns}num_requests_running")
+    s.requests_running = int(sum(running))
+    waiting, _ = _metric_series(lines, f"{ns}num_requests_waiting")
+    s.requests_waiting = int(sum(waiting))
 
     # TTFT histogram
-    ttft_lines = [l for l in lines if "vllm:time_to_first_token" in l]
+    ttft_lines = [l for l in lines if l.startswith(f"{ns}time_to_first_token_seconds")]
     if ttft_lines:
-        buckets, count = _parse_prometheus_histogram(ttft_lines, "vllm:time_to_first_token_seconds")
+        buckets, count = _parse_prometheus_histogram(ttft_lines, f"{ns}time_to_first_token_seconds")
         s.ttft_p50_ms = _estimate_quantile(buckets, count, 0.50) * 1000
         s.ttft_p95_ms = _estimate_quantile(buckets, count, 0.95) * 1000
         s.ttft_p99_ms = _estimate_quantile(buckets, count, 0.99) * 1000
 
     # ITL histogram
-    itl_lines = [l for l in lines if "vllm:time_per_output_token" in l]
+    itl_lines = [l for l in lines if l.startswith(f"{ns}time_per_output_token_seconds")]
     if itl_lines:
         buckets, count = _parse_prometheus_histogram(
-            itl_lines, "vllm:time_per_output_token_seconds"
+            itl_lines, f"{ns}time_per_output_token_seconds"
         )
         s.itl_p50_ms = _estimate_quantile(buckets, count, 0.50) * 1000
         s.itl_p99_ms = _estimate_quantile(buckets, count, 0.99) * 1000
 
-    # Prefer the live generation token counter. The request histogram fallback only
-    # updates when requests finish, so it can lag and spike during long generations.
-    generation_tokens_total = 0.0
-    has_generation_tokens = False
-    # The live counter's metric being present at all (even with a bad value)
-    # is distinct from having parsed a finite value: a transient NaN poll must
-    # not silently fall back to the request-sum histogram (which lags the live
-    # counter and would rebase the throughput baseline onto a different source,
-    # painting a false spike on recovery).
-    saw_generation_tokens = False
-    request_generation_tokens_total = 0.0
-    has_request_generation_tokens = False
-    for line in lines:
-        if line.startswith("vllm:generation_tokens"):
-            parts = line.split()
-            if len(parts) >= 2:
-                saw_generation_tokens = True
-                value = float(parts[-1])
-                if math.isfinite(value):
-                    has_generation_tokens = True
-                    generation_tokens_total += value
-        elif line.startswith("vllm:request_generation_tokens_sum"):
-            parts = line.split()
-            if len(parts) >= 2:
-                value = float(parts[-1])
-                if math.isfinite(value):
-                    has_request_generation_tokens = True
-                    request_generation_tokens_total += value
-    if has_generation_tokens:
-        s.generation_tokens_total = generation_tokens_total
-    elif saw_generation_tokens:
+    # Prefer the live generation token counter. The request histogram fallback
+    # only updates when requests finish, so it can lag and spike during long
+    # generations. The counter being present at all (even non-finite) is
+    # distinct from having parsed a finite value: a transient NaN poll must
+    # not silently fall back to the request-sum histogram (which would rebase
+    # the throughput baseline onto a different source and paint a false spike
+    # on recovery).
+    has_gen_tokens = False
+    gen, saw_gen = _metric_series(lines, f"{ns}generation_tokens_total")
+    if not gen and not saw_gen:
+        # Older vLLM exposes the counter without the _total suffix.
+        gen, saw_gen = _metric_series(lines, f"{ns}generation_tokens")
+    if gen:
+        has_gen_tokens = True
+        s.generation_tokens_total = sum(gen)
+    elif saw_gen:
         # Live counter present but only non-finite: report 0 so the throughput
         # baseline is dropped and recovers cleanly instead of mixing sources.
         s.generation_tokens_total = 0.0
     else:
-        s.generation_tokens_total = request_generation_tokens_total
+        fallback, _ = _metric_series(lines, f"{ns}request_generation_tokens_sum")
+        if fallback:
+            has_gen_tokens = True
+            s.generation_tokens_total = sum(fallback)
 
-    if (
-        has_generation_tokens
-        or has_request_generation_tokens
-        or s.kv_total_blocks > 0
-        or s.requests_running > 0
-        or s.ttft_p50_ms > 0
-    ):
+    prompt, _ = _metric_series(lines, f"{ns}prompt_tokens_total")
+    if not prompt:
+        prompt, _ = _metric_series(lines, f"{ns}prompt_tokens")
+    s.prompt_tokens_total = sum(prompt)
+
+    if has_gen_tokens or s.kv_total_blocks > 0 or s.requests_running > 0 or s.ttft_p50_ms > 0:
         s.model_hosted = True
-
-    # Prompt tokens (split from generation — Spark Monitor insight)
-    for line in lines:
-        if line.startswith("vllm:prompt_tokens"):
-            parts = line.split()
-            if len(parts) >= 2:
-                prompt = float(parts[-1])
-                if math.isfinite(prompt):
-                    s.prompt_tokens_total += prompt
 
     s.online = True
     return s
@@ -434,6 +460,34 @@ async def _fetch_vllm_metrics(vllm_url: str) -> str:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.text
+
+
+async def _fetch_sglang_load(vllm_url: str) -> tuple[int, int] | None:
+    """Fetch request concurrency from an SGLang server.
+
+    SGLang without ``--enable-metrics`` does not serve ``/metrics`` (404) but
+    does expose ``/get_load``: a per-DP-rank list of
+    ``{"num_reqs", "num_waiting_reqs", "num_tokens", …}`` dicts. Returns the
+    summed ``(running, waiting)``, or None when the endpoint does not speak
+    SGLang's load protocol (dead port, non-SGLang server).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{vllm_url}/get_load")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return None
+    entries = data if isinstance(data, list) else [data]
+    running = 0
+    waiting = 0
+    seen = False
+    for entry in entries:
+        if isinstance(entry, dict) and "num_reqs" in entry:
+            seen = True
+            running += int(entry.get("num_reqs") or 0)
+            waiting += int(entry.get("num_waiting_reqs") or 0)
+    return (running, waiting) if seen else None
 
 
 def _parse_telemetry_output(stdout: str) -> dict:
@@ -789,15 +843,31 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
     metrics_task = asyncio.create_task(_fetch_vllm_metrics(vllm_url))
     telemetry_task = asyncio.create_task(_fetch_telemetry(ssh_target))
 
+    vllm_error: Exception | None = None
     try:
         metrics_text = await metrics_task
         parsed = _parse_vllm_metrics(metrics_text)
-        parsed.label = label
-        parsed.is_worker = is_worker
-        s = parsed
-        s.model_name = _model_names.get(unit_id, "")
+        if parsed.model_hosted or "vllm:" in metrics_text or "sglang:" in metrics_text:
+            parsed.label = label
+            parsed.is_worker = is_worker
+            s = parsed
+            s.model_name = _model_names.get(unit_id, "")
+        else:
+            vllm_error = RuntimeError("/metrics served no vllm:/sglang: series")
     except Exception as e:
-        errors.append(f"vLLM: {e}")
+        vllm_error = e
+    if vllm_error is not None:
+        # Not a vLLM metrics endpoint (or metrics are disabled on it): an
+        # SGLang server still reports its load over /get_load.
+        load = await _fetch_sglang_load(vllm_url)
+        if load is not None:
+            s.model_hosted = True
+            s.model_source = "sglang"
+            s.model_metrics = False  # /metrics 404: no token counters to rate
+            s.requests_running, s.requests_waiting = load
+            s.model_name = _model_names.get(unit_id, "")
+        else:
+            errors.append(f"vLLM: {vllm_error}")
 
     # Hardware telemetry started alongside the vLLM request above.
     telemetry = await telemetry_task

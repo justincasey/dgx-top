@@ -320,6 +320,78 @@ def _area_chart_lines(data: list[float], rows: int, width: int, pal: Palette) ->
     return out
 
 
+# Braille dot bitmaps by (column, row) inside a 2×4 cell (⣿ = all bits).
+_BRAILLE_BITS = {
+    (0, 0): 0x01,
+    (0, 1): 0x02,
+    (0, 2): 0x04,
+    (0, 3): 0x40,
+    (1, 0): 0x08,
+    (1, 1): 0x10,
+    (1, 2): 0x20,
+    (1, 3): 0x80,
+}
+
+
+def _lines_chart_lines(
+    series: list[tuple[str, str, list[float]]], rows: int, width: int, pal: Palette
+) -> list[Text]:
+    """Multi-series braille line chart on one shared time axis.
+
+    Each cell carries a 2×4 dot matrix (Unicode braille), so every served
+    model's throughput line overlays the same pane without fighting over
+    whole columns; a cell's hue belongs to the first series that plotted
+    into it, so overlapping cells stay deterministic. The scale is
+    0…max(all series) — shared, never per-series — so the lines stay
+    comparable, and short histories resample to fill the width.
+    """
+    if rows <= 0:
+        return []
+    if width <= 0:
+        return [Text("") for _ in range(rows)]
+    plotted = [(label, color, list(hist)) for label, color, hist in series if hist]
+    hi = max((max(d) for _, _, d in plotted), default=0.0)
+    span = hi if hi > 0 else 1.0
+    cells = [[0] * width for _ in range(rows)]
+    owner: list[list[str | None]] = [[None] * width for _ in range(rows)]
+    for _label, color, hist in plotted:
+        vals = _stretch(hist, width * 2)
+        for x, v in enumerate(vals):
+            dot_y = (rows * 4 - 1) - int(min(max(v, 0.0), hi) / span * (rows * 4 - 1))
+            cy, dy = divmod(dot_y, 4)
+            cx = x // 2
+            if 0 <= cy < rows and 0 <= cx < width:
+                cells[cy][cx] |= _BRAILLE_BITS[(x % 2, dy)]
+                if owner[cy][cx] is None:
+                    owner[cy][cx] = color
+    out: list[Text] = []
+    for r in range(rows):
+        parts: list[Text] = []
+        run: list[str] = []
+        run_style: str | None = None
+        for c in range(width):
+            style = owner[r][c]
+            ch = chr(0x2800 + cells[r][c]) if cells[r][c] else " "
+            if style != run_style:
+                if run:
+                    parts.append(
+                        Text("".join(run))
+                        if run_style is None
+                        else Text("".join(run), style=f"bold {run_style}")
+                    )
+                    run = []
+                run_style = style
+            run.append(ch)
+        if run:
+            parts.append(
+                Text("".join(run))
+                if run_style is None
+                else Text("".join(run), style=f"bold {run_style}")
+            )
+        out.append(_fit(Text.assemble(*parts), width))
+    return out
+
+
 # ─── Chrome: waybar (the only chrome; footer removed) ────────────────
 
 
@@ -441,8 +513,13 @@ def _ttft_tail(seconds: float, pal: Palette) -> tuple[str, str]:
 
 class ServingBox(Static):
     """The SERVING window: heavy focused border, caret tab inset in the top
-    rule, a right meta tab, the design's metric rows, and a gradient area
-    chart that fills the window's grown height."""
+    rule, a right meta tab, the design's metric rows, and the time-series
+    line chart that fills the window's grown height.
+
+    Every served model contributes one series (per-endpoint throughput
+    history) to the same chart pane; with more than one model the wide
+    grammar gains a gen/requests/ttft row per extra model (mirrored by the
+    fit estimator's ``models`` parameter)."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -450,6 +527,7 @@ class ServingBox(Static):
         self._prompt_data: list[float] = []
         self._kv_data: list[float] = []
         self._kv: dict | None = None
+        self._models: list[dict] = []
 
     def update_throughput(
         self,
@@ -458,6 +536,12 @@ class ServingBox(Static):
     ):
         self._gen_data = list(gen_vals)
         self._prompt_data = list(prompt_vals)
+        self.refresh()
+
+    def update_models(self, models: list[dict]):
+        """One dict per served model: name, color, gen (history), req, wait,
+        ttft_p50_ms, ttft_p95_ms, source."""
+        self._models = [dict(m) for m in models]
         self.refresh()
 
     def update_kv(
@@ -501,7 +585,17 @@ class ServingBox(Static):
         rows = list(interior)
         chart_rows = getattr(self.app, "_chart_rows", 0)
         if chart_rows:
-            rows.extend(_area_chart_lines(self._gen_data, chart_rows, max(1, width - 4), pal))
+            if self._models:
+                rows.extend(
+                    _lines_chart_lines(
+                        [(m["name"], m["color"], m["gen"]) for m in self._models],
+                        chart_rows,
+                        max(1, width - 4),
+                        pal,
+                    )
+                )
+            else:
+                rows.extend(_area_chart_lines(self._gen_data, chart_rows, max(1, width - 4), pal))
         kv = self._kv or {}
         rtab = [(f"{_fmt_tokens(kv.get('total_tok', 0))} tok", pal.dim)]
         title = [
@@ -521,7 +615,10 @@ class ServingBox(Static):
 
     def _wide_rows(self, pal: Palette, width: int) -> list[Text]:
         """The design's serving rows (4 aligned metric rows with graph
-        spacers, then requests/cache/ttft/window)."""
+        spacers, then requests/cache/ttft/window). With several served
+        models the gen/requests/ttft rows go per-model instead."""
+        if len(self._models) > 1:
+            return self._multi_rows(pal, width)
         gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
         prompt_avg = sum(self._prompt_data) / len(self._prompt_data) if self._prompt_data else 0.0
         lo = min(self._gen_data) if self._gen_data else 0.0
@@ -624,6 +721,157 @@ class ServingBox(Static):
         r.append(self._cache_row(pal, s, width))
         r.append(self._ttft_row(pal, s, width))
         return r
+
+    def _multi_rows(self, pal: Palette, width: int) -> list[Text]:
+        """Multi-model serving pane: one aligned gen row per served model
+        (its hue is its identity in the shared braille chart below), the
+        aggregate prompt/kv rows, then per-model requests and ttft rows.
+        Row count is ``WIDE_BASE + 4*(models-1)`` — mirrored by the fit
+        estimator so nothing ever clips."""
+        models = self._models
+        name_w = min(20, max(len(m["name"]) for m in models))
+        s = self._kv or {}
+        used = s.get("used_tok", 0)
+        total = s.get("total_tok", 0)
+        kv_pct = s.get("pct", 0.0)
+        prompt_avg = sum(self._prompt_data) / len(self._prompt_data) if self._prompt_data else 0.0
+
+        gen_tails: list[str] = []
+        for m in models:
+            gen = m["gen"]
+            gen_tails.append(
+                f"{sum(gen) / len(gen):.0f} · {max(gen):.0f} tok/s"
+                if gen
+                else f"no tok/s · {m['source']}"
+            )
+        tail_prompt = f"{prompt_avg:.0f} tok/s"
+        tail_kv = f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok" if total else "—"
+        tail_kvp = f"  {kv_pct:.0f}%"
+        tail_w = max(
+            [len(t) for t in gen_tails] + [len(tail_prompt), len(tail_kv), len(tail_kvp), 5]
+        )
+        graph_w = max(3, width - 4 - 7 - name_w - 2 - 2 - tail_w)
+
+        def tail(text: str, segs: list[tuple[str, str]]) -> list[Text]:
+            out = [Text(t, style=st) for t, st in segs]
+            pad = tail_w - len(text)
+            if pad > 0:
+                out.append(Text(" " * pad, style=""))
+            return out
+
+        r: list[Text] = []
+        for m, gen_tail in zip(models, gen_tails):
+            name = (m["name"][: name_w - 1] + "…") if len(m["name"]) > name_w else m["name"]
+            name = name.ljust(name_w)
+            gen = m["gen"]
+            if gen:
+                avg = sum(gen) / len(gen)
+                hi = max(gen)
+                graph = _spark_line(_stretch(gen, graph_w), m["color"], graph_w)
+                segs = [
+                    (f"{avg:.0f}", f"bold {m['color']}"),
+                    (" · ", pal.dim),
+                    (f"{hi:.0f}", m["color"]),
+                    (" tok/s", pal.dim),
+                ]
+            else:
+                graph = Text(" " * graph_w)
+                segs = [(gen_tail, pal.dim)]
+            r.append(
+                Text.assemble(
+                    Text("gen    ", style=pal.dim),
+                    Text(name, style=m["color"]),
+                    Text("  ", style=""),
+                    graph,
+                    Text("  ", style=""),
+                    *tail(gen_tail, segs),
+                )
+            )
+            r.append(Text("", style=""))
+        r.append(
+            Text.assemble(
+                Text("prompt ", style=pal.dim),
+                _spark_line(_stretch(self._prompt_data, graph_w), pal.blue, graph_w)
+                if self._prompt_data
+                else Text(" " * graph_w),
+                Text("  ", style=""),
+                *tail(
+                    tail_prompt,
+                    [
+                        (f"{prompt_avg:.0f}", f"bold {pal.fg}" if self._prompt_data else pal.dim),
+                        (" tok/s", pal.dim),
+                    ],
+                ),
+            )
+        )
+        r.append(Text("", style=""))
+        r.append(
+            Text.assemble(
+                Text("kv     ", style=pal.dim),
+                _spark_line(_stretch(self._kv_data, graph_w), pal.accent, graph_w),
+                Text("  ", style=""),
+                *tail(
+                    tail_kv,
+                    [
+                        (_fmt_tokens(used), f"bold {pal.accent}" if total else pal.dim),
+                        (f"/{_fmt_tokens(total)} tok" if total else "", pal.dim),
+                    ],
+                ),
+            )
+        )
+        r.append(Text("", style=""))
+        r.append(
+            Text.assemble(
+                Text("kv%    ", style=pal.dim),
+                _bar_line(kv_pct, graph_w, pal.accent, pal)
+                if _treatment(self) == "gradient"
+                else _meter_line(
+                    _treatment(self), kv_pct, graph_w, pal, pal.accent, list(self._kv_data)
+                ),
+                *tail(tail_kvp, [(f"  {kv_pct:.0f}%", pal.accent)]),
+            )
+        )
+        r.append(Text("", style=""))
+        for m in models:
+            r.append(self._model_requests_row(pal, m, name_w))
+        r.append(self._cache_row(pal, s, width))
+        for m in models:
+            r.append(self._model_ttft_row(pal, m, name_w))
+        return r
+
+    def _model_requests_row(self, pal: Palette, m: dict, name_w: int) -> Text:
+        name = (m["name"][: name_w - 1] + "…") if len(m["name"]) > name_w else m["name"]
+        wait = m.get("wait", 0)
+        return Text.assemble(
+            Text("requests  ", style=pal.dim),
+            Text(name.ljust(name_w), style=m["color"]),
+            Text("  ", style=""),
+            Text(f"{m.get('req', 0)}r", style=f"bold {pal.fg}"),
+            Text(" · ", style=pal.dim),
+            Text(f"{wait}w waiting", style=pal.dim if wait == 0 else f"bold {pal.warn}"),
+        )
+
+    def _model_ttft_row(self, pal: Palette, m: dict, name_w: int) -> Text:
+        name = (m["name"][: name_w - 1] + "…") if len(m["name"]) > name_w else m["name"]
+        row = Text.assemble(
+            Text("ttft      ", style=pal.dim),
+            Text(name.ljust(name_w), style=m["color"]),
+            Text("  ", style=""),
+            Text("p50 ", style=pal.dim),
+        )
+        p50 = m.get("ttft_p50_ms", 0.0)
+        p95 = m.get("ttft_p95_ms", 0.0)
+        if p95 <= 0:
+            row.append("—", style=pal.dim)
+            return row
+        marker, tail_style = _ttft_tail(p95 / 1000.0, pal)
+        row.append(f"{p50 / 1000:.1f}s", style=f"bold {pal.fg}")
+        row.append(" · ", style=pal.dim)
+        row.append("p95 ", style=pal.dim)
+        row.append(f"{p95 / 1000:.1f}s", style=tail_style)
+        if marker:
+            row.append(f" {marker}", style=tail_style)
+        return row
 
     def _requests_row(self, pal, s, width) -> Text:
         req = s.get("req", 0)
@@ -1059,18 +1307,20 @@ def _palette_for(app: "DGXTop") -> Palette:
 # ─── Fit-driven layout ───────────────────────────────────────────────
 
 
-def _serving_base(tier: str, serv_width: int) -> int:
-    """SERVING interior rows without the area chart for (tier, serving width).
-    Rail/floor are the fixed base surfaces; the prioritized fused grammar is
-    used below SERVING_NARROW_WIDTH and always at compact (a height-driven
-    fold); the wide design grammar (no window stat) elsewhere."""
+def _serving_base(tier: str, serv_width: int, models: int = 1) -> int:
+    """SERVING interior rows without the area chart for (tier, serving width,
+    model count). Rail/floor are the fixed base surfaces; the prioritized
+    fused grammar is used below SERVING_NARROW_WIDTH and always at compact (a
+    height-driven fold); the wide design grammar (no window stat) elsewhere.
+    Each model beyond the first gains an extra gen row + spacer, its own
+    requests row and its own ttft row (4 rows) in the wide grammar only."""
     if tier == "rail":
         return SERVING_ROWS_RAIL
     if tier == "floor":
         return SERVING_ROWS_FLOOR
     if tier == "compact" or serv_width < SERVING_NARROW_WIDTH:
         return NARROW_BASE
-    return WIDE_BASE
+    return WIDE_BASE + 4 * max(0, models - 1)
 
 
 def _serving_chart(tier: str, room: int) -> int:
@@ -1152,7 +1402,7 @@ def _grid_height(n: int, cols: int, tile: int, tier: str) -> int:
 
 
 def _tier_fit(
-    n: int, width: int, avail: int, tier: str, tiled: bool
+    n: int, width: int, avail: int, tier: str, tiled: bool, models: int = 1
 ) -> tuple[bool, int, int, int, int]:
     """(fits, cols, node_h, serv_h, chart) for one tier in one arrangement.
     Mirrors the CSS row grammar exactly (estimate/layout duality): the stacked
@@ -1169,7 +1419,7 @@ def _tier_fit(
             cols = _node_grid_columns(n, nw, tiled)
         tile = _node_tile_rows(tier, -(-nw // cols))
         node_h = _grid_height(n, cols, tile, tier)
-        base = _serving_base(tier, sw)
+        base = _serving_base(tier, sw, models)
         chart = _serving_chart(tier, avail - base - 2)
         serv_h = base + chart + (2 if tier != "floor" else 0)
         fits = node_h <= avail and serv_h <= avail
@@ -1180,7 +1430,7 @@ def _tier_fit(
         cols = _node_grid_columns(n, width, tiled)
     tile = _node_tile_rows(tier, -(-width // cols))
     node_h = _grid_height(n, cols, tile, tier)
-    base = _serving_base(tier, width)
+    base = _serving_base(tier, width, models)
     if tier == "floor":
         serv_h = base  # bare floor lines, no window frame
         fits = serv_h + node_h <= avail
@@ -1195,12 +1445,12 @@ def _tier_fit(
 _TIER_RANK = {name: i for i, name in enumerate(("roomy", "dense", "compact", "rail", "floor"))}
 
 
-def _tier_for(n: int, width: int, height: int, tiled: bool) -> str:
+def _tier_for(n: int, width: int, height: int, tiled: bool, models: int = 1) -> str:
     """Densest tier whose estimated body fits (loosest first) for one
     arrangement; the floor is the unconditional fallback."""
     avail = height - WAYBAR_HEIGHT
     for tier in ("roomy", "dense", "compact", "rail"):
-        if _tier_fit(n, width, avail, tier, tiled)[0]:
+        if _tier_fit(n, width, avail, tier, tiled, models)[0]:
             return tier
     return "floor"
 
@@ -1270,6 +1520,8 @@ class DGXTop(App):
         self.history: dict[str, collections.deque] = {}
         self._current_topology: str = ""
         self._host_model: str = ""
+        self._models_n = 1
+        self._last_size = (80, 24)
         self.density = ""
         self.cols = 0
         self.node_mode = ""
@@ -1300,6 +1552,7 @@ class DGXTop(App):
         self.run_worker(_init_model_names())
 
     def on_resize(self, event) -> None:
+        self._last_size = (event.size.width, event.size.height)
         self._apply_tier(event.size.width, event.size.height)
 
     def _choose_layout(self, n: int, width: int, height: int) -> tuple[bool, str]:
@@ -1308,8 +1561,8 @@ class DGXTop(App):
         right column must never densify the serving surface (the hero chart is
         the priority). Ties prefer the tiled layout the request asks for."""
         tiled = _arrangement(width)
-        tier_t = _tier_for(n, width, height, True)
-        tier_s = _tier_for(n, width, height, False)
+        tier_t = _tier_for(n, width, height, True, self._models_n)
+        tier_s = _tier_for(n, width, height, False, self._models_n)
         if tiled and _TIER_RANK[tier_t] <= _TIER_RANK[tier_s]:
             return True, tier_t
         return False, tier_s
@@ -1318,7 +1571,7 @@ class DGXTop(App):
         n = len(self.settings.nodes)
         avail = height - WAYBAR_HEIGHT
         tiled, tier = self._choose_layout(n, width, height)
-        _fits, cols, node_h, serv_h, chart = _tier_fit(n, width, avail, tier, tiled)
+        _fits, cols, node_h, serv_h, chart = _tier_fit(n, width, avail, tier, tiled, self._models_n)
         node_mode = "table" if tier == "floor" else "card"
         rail = tier == "rail"
         floor = tier == "floor"
@@ -1482,9 +1735,52 @@ class DGXTop(App):
                 "dropped %d non-finite sample(s): %s", len(skipped), ", ".join(sorted(set(skipped)))
             )
 
-        self._host_model = (
-            hosted_units[0].model_name if hosted_units and hosted_units[0].model_name else ""
-        )
+        # One time-series series per served model: an endpoint re-reporting
+        # the same engine (a TP worker sharing the pool, say) must never
+        # split or double a model's line, so within each model name the unit
+        # carrying the largest cumulative counter is the authoritative
+        # reporter.
+        reps: dict[str, SparkUnitStats] = {}
+        for u in hosted_units:
+            name = u.model_name or u.label
+            cur = reps.get(name)
+            if cur is None or u.generation_tokens_total > cur.generation_tokens_total:
+                reps[name] = u
+        gen_keys = {f"gen-{name}" for name in reps}
+        for key in [k for k in list(self.history) if k.startswith("gen-") and k not in gen_keys]:
+            self.history.pop(key)
+        for name, u in reps.items():
+            key = f"gen-{name}"
+            self.history.setdefault(key, collections.deque(maxlen=self.settings.history_length))
+            # An endpoint without a token counter (SGLang without
+            # --enable-metrics) has NO throughput series — recording its
+            # constant 0 would draw a flat line that reads as "idle", not
+            # "unknown". The gen row and chart leave it blank instead.
+            if u.model_metrics:
+                _record(key, u.throughput_tok_s)
+        pal = _palette_for(self)
+        hues = ("ok", "blue", "warn", "accent", "cyan", "fg")
+        models_payload = [
+            dict(
+                name=name,
+                color=getattr(pal, hues[i % len(hues)]),
+                gen=list(self.history.get(f"gen-{name}", [])),
+                req=u.requests_running,
+                wait=u.requests_waiting,
+                ttft_p50_ms=u.ttft_p50_ms,
+                ttft_p95_ms=u.ttft_p95_ms,
+                source=u.model_source,
+            )
+            for i, (name, u) in enumerate(reps.items())
+        ]
+        n_models = max(1, len(models_payload))
+        if n_models != self._models_n:
+            self._models_n = n_models
+            # Each extra model claims 4 serving rows; re-check the tier fit
+            # at the current viewport so the grammar never clips.
+            self._apply_tier(*self._last_size)
+
+        self._host_model = " · ".join(m["name"] for m in models_payload)
 
         serving = self.query_one("#serving", ServingBox)
         serving.update_throughput(
@@ -1504,6 +1800,7 @@ class DGXTop(App):
             ttft_p95_ms=hosted_units[0].ttft_p95_ms if hosted_units else 0.0,
             ttft_p99_ms=hosted_units[0].ttft_p99_ms if hosted_units else 0.0,
         )
+        serving.update_models(models_payload)
 
         interval = self._current_interval()
         self.query_one("#waybar", Waybar).update_cluster(stats, interval)

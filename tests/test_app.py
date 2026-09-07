@@ -91,7 +91,7 @@ async def _resize(pilot, width, height):
 
 
 def _seed_history(app):
-    """Give the charts real history so sparklines/area chart populate."""
+    """Give the charts real history so sparklines/line chart populate."""
     import collections
 
     app.history["throughput"] = collections.deque([40 + (i * 7) % 60 for i in range(24)], maxlen=25)
@@ -100,6 +100,11 @@ def _seed_history(app):
     )
     app.history["kv-usage-head"] = collections.deque(
         [18 + (i * 3) % 15 for i in range(24)], maxlen=25
+    )
+    # the shared model's own time-series (both fixture units host it; the
+    # head unit is its authoritative reporter)
+    app.history["gen-Qwen3.6-27B-Instruct"] = collections.deque(
+        [40 + (i * 7) % 60 for i in range(24)], maxlen=25
     )
     app._update_ui()
 
@@ -422,9 +427,10 @@ async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
         _seed_history(app)
         lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
         assert not any("last 24 samples" in ln for ln in lines)  # chart label removed
-        chart_rows = [ln for ln in lines if any(c in ln for c in "▁▂▃▄▅▆▇█")]
-        # gen/prompt/kv sparklines + a multi-row area chart
-        assert len(chart_rows) >= 3
+        # gen/prompt/kv sparklines (blocks) + the multi-series braille chart
+        assert any(c in ln for ln in lines for c in "▁▂▃▄▅▆▇█")
+        chart_rows = [ln for ln in lines if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
+        assert len(chart_rows) >= 2
 
 
 # ─── AC7: waybar ─────────────────────────────────────────────────────
@@ -1052,7 +1058,7 @@ async def test_serving_never_mentions_window(tmp_path: Path, monkeypatch):
 async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
     """AC2: the graphs survive an extra tier. At compact the node cards still
     carry the meters + core grid (RoCE is the first graph to go) and the
-    serving keeps a multi-row gen area chart."""
+    serving keeps a multi-row gen line chart (braille dots)."""
     from app import DGXTop, NodeBox, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -1064,10 +1070,17 @@ async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
         _seed_history(app)
         await _resize(pilot, 132, 20)
         assert app.density == "compact" and not app.rail and not app.floor
-        assert app._chart_rows >= 2, app._chart_rows  # area chart survives compact
+        assert app._chart_rows >= 2, app._chart_rows  # line chart survives compact
         serv_lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
-        chart_glyphs = set("▁▂▃▄▅▆▇█")
-        assert sum(1 for ln in serv_lines if any(c in chart_glyphs for c in ln)) >= 3
+        # sparkline blocks ∪ braille line-chart dots (U+2800–U+28FF)
+        assert (
+            sum(
+                1
+                for ln in serv_lines
+                if any(c in "▁▂▃▄▅▆▇█" or 0x2800 <= ord(c) < 0x2900 for c in ln)
+            )
+            >= 3
+        )
         node = app.query_one("#node-0", NodeBox).render().plain
         assert "73%" in node and "52%" in node and "50%" in node
         assert any(c in node for c in "█▓━╾┈"), "meter glyphs survive compact"
@@ -1116,3 +1129,50 @@ async def test_serving_wins_gen_reqs_ttft(tmp_path: Path, monkeypatch):
             assert "gen" in blob, (w, h, blob)
             assert "req" in blob or "requests" in blob, (w, h, blob)
             assert "ttft" in blob, (w, h, blob)
+
+
+async def test_two_models_share_one_serving_pane(tmp_path: Path, monkeypatch):
+    """Two endpoints, one pane: a gen row per model (an SGLang endpoint with
+    no Prometheus counter says so honestly instead of plotting a fake zero
+    line), one shared braille time-series chart, per-model requests/ttft
+    rows — and the extra model rows never clip at any tier."""
+    import collections
+
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    head.model_name = "qwen3.8-flash-next"
+    head.generation_tokens_total = 264348.0
+    worker = _unit("worker", worker=True)
+    worker.model_name = "NVIDIA-Nemotron-3.5-Lightning"
+    worker.model_source = "sglang"
+    worker.generation_tokens_total = 0.0
+    worker.throughput_tok_s = 0.0
+    worker.model_metrics = False
+    worker.requests_running = 0
+    worker.requests_waiting = 0
+    worker.ttft_p50_ms = 0.0
+    worker.ttft_p95_ms = 0.0
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert app._models_n == 2
+        app.history["gen-qwen3.8-flash-next"] = collections.deque(
+            [40 + (i * 7) % 60 for i in range(24)], maxlen=25
+        )
+        app._update_ui()
+        blob = app.query_one("#serving", ServingBox).render().plain
+        # both models appear in the pane, each with its own row set
+        assert "qwen3.8-flash-next" in blob
+        assert "NVIDIA-Nemotron" in blob
+        assert "no tok/s · sglang" in blob
+        braille = [ln for ln in blob.split("\n") if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
+        assert len(braille) >= 2, braille  # the shared time-series chart
+        assert blob.count("requests") == 2, blob  # one concurrency row per model
+        for w, h in [(100, 40), (95, 24), (60, 18), (40, 8)]:
+            await _resize(pilot, w, h)
+            assert app.screen.max_scroll_y == 0, (w, h)
