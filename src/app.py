@@ -18,7 +18,7 @@ from collector import _init_model_names, poll_cluster
 from config import default_config_path, get_settings
 from input_driver import ResilientLinuxDriver
 from stats import ClusterStats, SparkUnitStats
-from themes import CUSTOM_THEMES, Palette, build_palette
+from themes import CUSTOM_THEMES, SERIES_HUES, Palette, blend_toward, build_palette, series_hue
 
 log = logging.getLogger("dgx-top")
 
@@ -283,6 +283,47 @@ def _spark_line(data: list[float], color: str, width: int) -> Text:
     return Text(seg, style=f"bold {color}")
 
 
+def _spark_duo_lines(data: list[float], color: str, width: int, pal: Palette) -> list[Text]:
+    """Two-row sparkline in the serving chart's grammar: a connected braille
+    dot line at the full series hue over a fill row in the chart's translucent
+    fill shade — the hue blended 75% toward the background (25% strength, the
+    same ``ALPHA`` treatment ``_lines_chart_lines`` applies). With several
+    models the light fills sit adjacent without the solid-hue clash the old
+    single-row block spark produced, so multi-model sparks read as blended.
+
+    Always exactly 2 rows × ``width`` — the fill row exists under the hero
+    variant too, so the serving row budget never depends on data presence.
+    Scaled 0…max like the chart (sparks plot throughput; never negative).
+    """
+    if width <= 0:
+        return [Text(""), Text("")]
+    # Non-finite samples would poison the scale (max → NaN) and the dot
+    # grid — drop them at the door (same policy as _lines_chart_lines).
+    data = [v for v in data if math.isfinite(v)]
+    if not data:
+        return [Text(" " * width), Text(" " * width)]
+    hi = max(data)
+    span = hi if hi > 0 else 1.0
+    ys = _interp_dot_rows(data, width * 2, 4, hi, span)
+    cells = [0] * width
+    for j, y in enumerate(ys):
+        top = y if not j else min(ys[j - 1], y)
+        bot = y if not j else max(ys[j - 1], y)
+        for dr in range(top, bot + 1):
+            cells[j // 2] |= _BRAILLE_BITS[(j % 2, dr)]
+    fill = blend_toward(color, pal.bg, 0.75)
+    return [
+        _fit(
+            Text(
+                "".join(" " if not c else chr(0x2800 + c) for c in cells),
+                style=f"bold {color}",
+            ),
+            width,
+        ),
+        _fit(Text("█" * width, style=f"bold {fill}"), width),
+    ]
+
+
 def _cores_line(vals: list[float], pal: Palette, spaced: bool = True) -> Text:
     """Per-core ■ squares, each cell ramped by its own load."""
     parts: list[Text] = []
@@ -320,6 +361,51 @@ def _area_chart_lines(data: list[float], rows: int, width: int, pal: Palette) ->
     return out
 
 
+def _catmull(p0: float, p1: float, p2: float, p3: float, t: float) -> float:
+    """Standard Catmull-Rom: interpolated value at ``t`` in p1→p2."""
+    t2 = t * t
+    t3 = t2 * t
+    return 0.5 * (
+        2 * p1
+        + (p2 - p0) * t
+        + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+        + (p3 - p0 + 3 * (p1 - p2)) * t3
+    )
+
+
+def _interp_dot_rows(
+    hist: list[float], subw: int, dotrows: int, hi: float, span: float
+) -> list[int]:
+    """Resample ``hist`` onto ``subw`` sub-columns with Catmull-Rom smoothing
+    and return each sub-column's dot row (0 = top) in a ``dotrows`` grid.
+
+    Values are clamped to ``[0, hi]`` before mapping — the spline may
+    overshoot sharp peaks, and an unclamped overshoot would walk the line
+    outside the chart. ``span`` is the caller's shared scale denominator
+    (never 0)."""
+    n = len(hist)
+    if n == 0 or subw <= 0 or dotrows <= 0:
+        return []
+    out: list[int] = []
+    last = dotrows - 1
+    for j in range(subw):
+        t = j * (n - 1) / (subw - 1) if subw > 1 else 0.0
+        i = min(int(t), n - 1)
+        if i >= n - 1:
+            v = hist[-1]
+        else:
+            v = _catmull(
+                hist[i - 1] if i > 0 else hist[0],
+                hist[i],
+                hist[i + 1],
+                hist[min(i + 2, n - 1)],
+                t - i,
+            )
+        v = min(max(v, 0.0), hi)
+        out.append(min(max(round(last * (1.0 - v / span)), 0), last))
+    return out
+
+
 # Braille dot bitmaps by (column, row) inside a 2×4 cell (⣿ = all bits).
 _BRAILLE_BITS = {
     (0, 0): 0x01,
@@ -336,42 +422,85 @@ _BRAILLE_BITS = {
 def _lines_chart_lines(
     series: list[tuple[str, str, list[float]]], rows: int, width: int, pal: Palette
 ) -> list[Text]:
-    """Multi-series braille line chart on one shared time axis.
+    """Multi-series line chart on one shared time axis, in the smooth-line +
+    translucent-fill grammar the design system's reference chart uses.
 
-    Each cell carries a 2×4 dot matrix (Unicode braille), so every served
-    model's throughput line overlays the same pane without fighting over
-    whole columns; a cell's hue belongs to the first series that plotted
-    into it, so overlapping cells stay deterministic. The scale is
+    Each series is Catmull-Rom resampled onto the 2-dot-wide braille
+    sub-column grid and painted as a CONNECTED staircase: a sub-column
+    carries every dot row between its sample and the previous one, so
+    slopes read as a line instead of a scatter of single dots. Under each
+    line every cell strictly below it is filled with a uniform ``█`` at
+    ~25% of the series hue over the background — the terminal stand-in for
+    a translucent area fill. Where two series' fills overlap the shades
+    COMPOSITE (each layering 25% over the cell's current colour), so
+    overlapping regions blend instead of the later series punching out the
+    earlier one — several lines can share the same space. The scale is
     0…max(all series) — shared, never per-series — so the lines stay
-    comparable, and short histories resample to fill the width.
+    comparable, and a line pixel always wins over a fill pixel.
     """
     if rows <= 0:
         return []
     if width <= 0:
         return [Text("") for _ in range(rows)]
-    plotted = [(label, color, list(hist)) for label, color, hist in series if hist]
+    # Non-finite samples would poison the shared scale (max → NaN) and the
+    # dot grid (divmod on NaN) — drop them at the door so the renderer is
+    # total over its input, not just over what _record happens to pass.
+    plotted = [
+        (label, color, [v for v in hist if math.isfinite(v)])
+        for label, color, hist in series
+        if hist
+    ]
+    plotted = [(label, color, d) for label, color, d in plotted if d]
     hi = max((max(d) for _, _, d in plotted), default=0.0)
     span = hi if hi > 0 else 1.0
-    cells = [[0] * width for _ in range(rows)]
-    owner: list[list[str | None]] = [[None] * width for _ in range(rows)]
+    subw = width * 2
+    dotrows = rows * 4
+    line = [[0] * width for _ in range(rows)]
+    line_style: list[list[str | None]] = [[None] * width for _ in range(rows)]
+    fill: list[list[list[str]]] = [[[] for _ in range(width)] for _ in range(rows)]
     for _label, color, hist in plotted:
-        vals = _stretch(hist, width * 2)
-        for x, v in enumerate(vals):
-            dot_y = (rows * 4 - 1) - int(min(max(v, 0.0), hi) / span * (rows * 4 - 1))
-            cy, dy = divmod(dot_y, 4)
-            cx = x // 2
-            if 0 <= cy < rows and 0 <= cx < width:
-                cells[cy][cx] |= _BRAILLE_BITS[(x % 2, dy)]
-                if owner[cy][cx] is None:
-                    owner[cy][cx] = color
+        ys = _interp_dot_rows(hist, subw, dotrows, hi, span)
+        for j, y in enumerate(ys):
+            cx, dx = divmod(j, 2)
+            top = y if not j else min(ys[j - 1], y)
+            bot = y if not j else max(ys[j - 1], y)
+            for dr in range(top, bot + 1):
+                cy, dy = divmod(dr, 4)
+                line[cy][cx] |= _BRAILLE_BITS[(dx, dy)]
+                if line_style[cy][cx] is None:
+                    line_style[cy][cx] = color
+        # Flat fill: the cell holding the line is the line's own; every
+        # cell strictly below it takes the hue. No partial blocks, no
+        # depth gradient — overlaps composite at render time.
+        for cx in range(width):
+            tl = ys[2 * cx]
+            tr = ys[2 * cx + 1] if 2 * cx + 1 < len(ys) else tl
+            top_cell = min(tl, tr) >> 2
+            if top_cell >= rows - 1:
+                continue
+            for cy in range(top_cell + 1, rows):
+                fill[cy][cx].append(color)
+    ALPHA = 0.25
+    shades: dict[tuple[str, ...], str] = {}
     out: list[Text] = []
     for r in range(rows):
         parts: list[Text] = []
         run: list[str] = []
         run_style: str | None = None
         for c in range(width):
-            style = owner[r][c]
-            ch = chr(0x2800 + cells[r][c]) if cells[r][c] else " "
+            if line[r][c]:
+                ch, style = chr(0x2800 + line[r][c]), line_style[r][c]
+            elif fill[r][c]:
+                hues = tuple(fill[r][c])
+                shade = shades.get(hues)
+                if shade is None:
+                    shade = pal.bg
+                    for hue in hues:
+                        shade = blend_toward(hue, shade, 1.0 - ALPHA)
+                    shades[hues] = shade
+                ch, style = "█", shade
+            else:
+                ch, style = " ", None
             if style != run_style:
                 if run:
                     parts.append(
@@ -463,6 +592,30 @@ def _fmt_tokens(n: int) -> str:
     if n < 1_000_000:
         return f"{n / 1000:.0f}K"
     return f"{n / 1_000_000:.1f}M"
+
+
+def _fmt_axis(v: float) -> str:
+    """Compact chart-axis tick (``0``, ``650``, ``5K``, ``1.3K``, ``2.5M``).
+
+    Deliberately not ``_fmt_tokens``: an axis needs the decimal that the
+    integer-quantized token format drops (1349 → ``1.3K``, not ``1K``)."""
+    r = round(v)
+    if r >= 1_000_000:
+        return f"{r / 1_000_000:.1f}M"
+    if r >= 1000:
+        k = f"{r / 1000:.1f}K".replace(".0K", "K")
+        return "1M" if k == "1000K" else k  # 999_999 must not read 1000K
+    return f"{r:.0f}"
+
+
+def _axis_labels(hi: float, rows: int, gutter: int, pal: Palette) -> list[Text]:
+    """Right-aligned y ticks for the chart pane: the shared max on the top
+    row, ``0`` on the baseline, and half-max mid-pane when the chart is at
+    least four rows. Each label occupies ``gutter`` columns + one space."""
+    ticks = {rows - 1: "0", 0: _fmt_axis(hi)}
+    if rows >= 4:
+        ticks[rows // 2] = _fmt_axis(hi / 2)
+    return [Text(f"{ticks.get(r, ''):>{gutter}} ", style=pal.dim) for r in range(rows)]
 
 
 def _fmt_freq(mhz: float) -> str:
@@ -586,14 +739,26 @@ class ServingBox(Static):
         chart_rows = getattr(self.app, "_chart_rows", 0)
         if chart_rows:
             if self._models:
-                rows.extend(
-                    _lines_chart_lines(
-                        [(m["name"], m["color"], m["gen"]) for m in self._models],
-                        chart_rows,
-                        max(1, width - 4),
-                        pal,
-                    )
+                series = [(m["name"], m["color"], m["gen"]) for m in self._models]
+                # Y ticks need the shared scale; with nothing plotted there
+                # is no range to label, and a narrow pane cannot spare the
+                # gutter — either way the chart renders unlabeled.
+                hi = max((max(d) for _, _, d in series if d), default=0.0)
+                # the mid tick (hi/2) can be WIDER than the top tick in the
+                # ~1000-1049 band ('524' vs '1K') — size the gutter for both
+                gutter = len(_fmt_axis(hi)) if hi > 0 else 0
+                if hi > 0 and chart_rows >= 4:
+                    gutter = max(gutter, len(_fmt_axis(hi / 2)))
+                body = max(1, width - 4 - gutter - 1)
+                if gutter and body < 12:
+                    gutter = 0
+                chart = _lines_chart_lines(
+                    series, chart_rows, body if gutter else max(1, width - 4), pal
                 )
+                if gutter:
+                    labels = _axis_labels(hi, chart_rows, gutter, pal)
+                    chart = [Text.assemble(lab, row) for lab, row in zip(labels, chart)]
+                rows.extend(chart)
             else:
                 rows.extend(_area_chart_lines(self._gen_data, chart_rows, max(1, width - 4), pal))
         kv = self._kv or {}
@@ -603,8 +768,16 @@ class ServingBox(Static):
             (" ", ""),
             ("serving", f"bold {pal.fg}"),
             (" ", ""),
-            (self._model(), pal.accent),
         ]
+        if self._models:
+            # The chart legend: each model's name in its own series hue —
+            # the same hue its chart line, gen row, and sparkline carry.
+            for i, m in enumerate(self._models):
+                if i:
+                    title.append((" · ", pal.dim))
+                title.append((m["name"], f"bold {m['color']}"))
+        else:
+            title.append((self._model(), pal.accent))
         return Text("\n").join(_box_lines(width, title, rtab, rows, False, pal))
 
     def _interior_rows(self, pal: Palette, width: int, density: str, tier: str) -> list[Text]:
@@ -619,18 +792,23 @@ class ServingBox(Static):
         models the gen/requests/ttft rows go per-model instead."""
         if len(self._models) > 1:
             return self._multi_rows(pal, width)
-        gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
+        # One model name on N endpoints: the cluster aggregate reads N× the
+        # pane's own chart — the gen row's value AND its lo/avg/hi tail all
+        # come from the authoritative rep's series.
+        rep_gen = (
+            self._models[0]["gen"] if self._models and self._models[0]["gen"] else self._gen_data
+        )
+        gen_avg = sum(rep_gen) / len(rep_gen) if rep_gen else 0.0
         prompt_avg = sum(self._prompt_data) / len(self._prompt_data) if self._prompt_data else 0.0
-        lo = min(self._gen_data) if self._gen_data else 0.0
-        hi = max(self._gen_data) if self._gen_data else 0.0
+        lo = min(rep_gen) if rep_gen else 0.0
+        hi = max(rep_gen) if rep_gen else 0.0
         s = self._kv or {}
         kv_pct = s.get("pct", 0.0)
         used = s.get("used_tok", 0)
         total = s.get("total_tok", 0)
         r = []
-        has = self._gen_data
         # Top rows share one graph width and a padded tail so the graphs and
-        # their trailing stats align across gen/prompt/kv/kv%.
+        has = bool(rep_gen)
         tail_gen = f"{lo:.0f} · {gen_avg:.0f} · {hi:.0f} tok/s"
         tail_prompt = f"{prompt_avg:.0f} tok/s"
         tail_kv = f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok" if total else "—"
@@ -677,27 +855,37 @@ class ServingBox(Static):
                 Text(label, style=pal.dim), graph, Text("  ", style=""), *tail_segs
             )
 
+        # Gen row: the model's current output leads (the authoritative rep's
+        # own series — with one model name served by N endpoints the cluster
+        # aggregate reads N× what the chart plots), then the duo spark: dots
+        # at the full hue over a fill row 75% toward the background — the
+        # chart's dot + translucent-fill grammar at sparkline size.
+        if self._models and self._models[0]["gen"]:
+            hero = f"{self._models[0]['gen'][-1]:.0f}"
+        elif self._gen_data:
+            hero = f"{self._gen_data[-1]:.0f}"
+        else:
+            hero = "—"
+        hue = self._models[0]["color"] if len(self._models) == 1 else pal.ok
+        hero_style = f"bold {hue}" if hero != "—" else pal.dim
+        spark_w = max(3, graph_w - len(hero) - 1)
+        duo = _spark_duo_lines(_stretch(rep_gen, spark_w), hue, spark_w, pal)
         r.append(
             graph_row(
-                "gen    ", _spark_line(_stretch(self._gen_data, graph_w), pal.ok, graph_w), gen_tail
+                "gen    ",
+                Text.assemble(Text(hero, style=hero_style), Text(" ", style=""), duo[0]),
+                gen_tail,
             )
         )
+        r.append(Text.assemble(Text(" " * (7 + len(hero) + 1), style=""), duo[1]))
         r.append(Text("", style=""))
-        r.append(
-            graph_row(
-                "prompt ",
-                _spark_line(_stretch(self._prompt_data, graph_w), pal.blue, graph_w),
-                prompt_tail,
-            )
-        )
+        prompt_duo = _spark_duo_lines(_stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal)
+        r.append(graph_row("prompt ", prompt_duo[0], prompt_tail))
+        r.append(Text.assemble(Text(" " * 7, style=""), prompt_duo[1]))
         r.append(Text("", style=""))
-        r.append(
-            graph_row(
-                "kv     ",
-                _spark_line(_stretch(self._kv_data, graph_w), pal.accent, graph_w),
-                kv_tail,
-            )
-        )
+        kv_duo = _spark_duo_lines(_stretch(self._kv_data, graph_w), pal.accent, graph_w, pal)
+        r.append(graph_row("kv     ", kv_duo[0], kv_tail))
+        r.append(Text.assemble(Text(" " * 7, style=""), kv_duo[1]))
         r.append(Text("", style=""))
         if self._kv is None:
             r.append(Text.assemble(Text("kv%    ", style=pal.dim), Text("—", style=pal.dim)))
@@ -726,8 +914,9 @@ class ServingBox(Static):
         """Multi-model serving pane: one aligned gen row per served model
         (its hue is its identity in the shared braille chart below), the
         aggregate prompt/kv rows, then per-model requests and ttft rows.
-        Row count is ``WIDE_BASE + 4*(models-1)`` — mirrored by the fit
-        estimator so nothing ever clips."""
+        Row count is ``WIDE_BASE + models + 2 + 4*(models-1)`` — mirrored by
+        the fit estimator so nothing ever clips (each gen row is 2 rows: dot
+        line + fill; prompt/kv are duo too)."""
         models = self._models
         name_w = min(20, max(len(m["name"]) for m in models))
         s = self._kv or {}
@@ -767,7 +956,19 @@ class ServingBox(Static):
             if gen:
                 avg = sum(gen) / len(gen)
                 hi = max(gen)
-                graph = _spark_line(_stretch(gen, graph_w), m["color"], graph_w)
+                # The row leads with the model's current output, then the
+                # duo spark: dots at the full hue over a fill row 75% toward
+                # the background — the chart's grammar at sparkline size, in
+                # the hue that owns this model everywhere else.
+                hero = f"{gen[-1]:.0f}"
+                spark_w = max(3, graph_w - len(hero) - 1)
+                duo = _spark_duo_lines(_stretch(gen, spark_w), m["color"], spark_w, pal)
+                graph = Text.assemble(
+                    Text(hero, style=f"bold {m['color']}"),
+                    Text(" ", style=""),
+                    duo[0],
+                )
+                fill_prefix = 7 + name_w + 2 + len(hero) + 1
                 segs = [
                     (f"{avg:.0f}", f"bold {m['color']}"),
                     (" · ", pal.dim),
@@ -776,6 +977,7 @@ class ServingBox(Static):
                 ]
             else:
                 graph = Text(" " * graph_w)
+                fill_prefix = 0
                 segs = [(gen_tail, pal.dim)]
             r.append(
                 Text.assemble(
@@ -787,13 +989,21 @@ class ServingBox(Static):
                     *tail(gen_tail, segs),
                 )
             )
+            if gen:
+                # Second row of the duo budget: the model's fill shade,
+                # aligned under its dots.
+                r.append(
+                    Text.assemble(
+                        Text(" " * fill_prefix, style=""),
+                        duo[1],
+                    )
+                )
             r.append(Text("", style=""))
+        prompt_duo = _spark_duo_lines(_stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal)
         r.append(
             Text.assemble(
                 Text("prompt ", style=pal.dim),
-                _spark_line(_stretch(self._prompt_data, graph_w), pal.blue, graph_w)
-                if self._prompt_data
-                else Text(" " * graph_w),
+                prompt_duo[0],
                 Text("  ", style=""),
                 *tail(
                     tail_prompt,
@@ -804,11 +1014,13 @@ class ServingBox(Static):
                 ),
             )
         )
+        r.append(Text.assemble(Text(" " * 7, style=""), prompt_duo[1]))
         r.append(Text("", style=""))
+        kv_duo = _spark_duo_lines(_stretch(self._kv_data, graph_w), pal.accent, graph_w, pal)
         r.append(
             Text.assemble(
                 Text("kv     ", style=pal.dim),
-                _spark_line(_stretch(self._kv_data, graph_w), pal.accent, graph_w),
+                kv_duo[0],
                 Text("  ", style=""),
                 *tail(
                     tail_kv,
@@ -819,6 +1031,7 @@ class ServingBox(Static):
                 ),
             )
         )
+        r.append(Text.assemble(Text(" " * 7, style=""), kv_duo[1]))
         r.append(Text("", style=""))
         r.append(
             Text.assemble(
@@ -1313,14 +1526,16 @@ def _serving_base(tier: str, serv_width: int, models: int = 1) -> int:
     fused grammar is used below SERVING_NARROW_WIDTH and always at compact (a
     height-driven fold); the wide design grammar (no window stat) elsewhere.
     Each model beyond the first gains an extra gen row + spacer, its own
-    requests row and its own ttft row (4 rows) in the wide grammar only."""
+    requests row and its own ttft row (4 rows) in the wide grammar only. In
+    the wide grammar every gen row is 2 rows (dot line + fill) and the
+    prompt/kv sparks are duo as well — the ``+ models + 2`` term."""
     if tier == "rail":
         return SERVING_ROWS_RAIL
     if tier == "floor":
         return SERVING_ROWS_FLOOR
     if tier == "compact" or serv_width < SERVING_NARROW_WIDTH:
         return NARROW_BASE
-    return WIDE_BASE + 4 * max(0, models - 1)
+    return WIDE_BASE + max(1, models) + 2 + 4 * max(0, models - 1)
 
 
 def _serving_chart(tier: str, room: int) -> int:
@@ -1521,6 +1736,8 @@ class DGXTop(App):
         self._current_topology: str = ""
         self._host_model: str = ""
         self._models_n = 1
+        self._model_hue: dict[str, int] = {}
+        self._model_hue_miss: dict[str, int] = {}
         self._last_size = (80, 24)
         self.density = ""
         self.cols = 0
@@ -1749,6 +1966,17 @@ class DGXTop(App):
         gen_keys = {f"gen-{name}" for name in reps}
         for key in [k for k in list(self.history) if k.startswith("gen-") and k not in gen_keys]:
             self.history.pop(key)
+        # A gone model's hue slot must not linger (a later new model takes
+        # the freed slot), but ONE flaky poll that omits a live model must
+        # not repaint it either — a model keeps its slot through a 3-poll
+        # grace window before its mapping is released.
+        for name in [k for k in list(self._model_hue) if k not in gen_keys]:
+            self._model_hue_miss[name] = self._model_hue_miss.get(name, 0) + 1
+            if self._model_hue_miss[name] >= 3:
+                del self._model_hue[name]
+                del self._model_hue_miss[name]
+        for name in gen_keys:
+            self._model_hue_miss.pop(name.removeprefix("gen-"), None)
         for name, u in reps.items():
             key = f"gen-{name}"
             self.history.setdefault(key, collections.deque(maxlen=self.settings.history_length))
@@ -1759,11 +1987,33 @@ class DGXTop(App):
             if u.model_metrics:
                 _record(key, u.throughput_tok_s)
         pal = _palette_for(self)
-        hues = ("ok", "blue", "warn", "accent", "cyan", "fg")
+        # One distinct identity hue per served model (themes.SERIES_HUES
+        # cycle) — the chart line, title legend, per-model rows and inline
+        # spark all read m["color"], so this one site coordinates them. A
+        # model holds its slot for the app's lifetime (a topology change
+        # never repaints an existing line); a first-seen model takes the
+        # lowest slot free among the live models, and past eight concurrent
+        # models the hue cycle repeats.
+        live_used: set[int] = set()
+        slots: dict[str, int] = {}
+        for name in sorted(reps):
+            held = self._model_hue.get(name)
+            if held is not None and held not in live_used:
+                slots[name] = held
+                live_used.add(held)
+        for name in sorted(reps):
+            if name in slots:
+                continue
+            slot = next((i for i in range(len(SERIES_HUES)) if i not in live_used), None)
+            if slot is None:  # more live models than hues: sharing unavoidable
+                slot = len(slots) - len(SERIES_HUES)
+            slots[name] = slot
+            self._model_hue[name] = slot
+            live_used.add(slot)
         models_payload = [
             dict(
                 name=name,
-                color=getattr(pal, hues[i % len(hues)]),
+                color=series_hue(slots[name], pal),
                 gen=list(self.history.get(f"gen-{name}", [])),
                 req=u.requests_running,
                 wait=u.requests_waiting,
@@ -1771,7 +2021,7 @@ class DGXTop(App):
                 ttft_p95_ms=u.ttft_p95_ms,
                 source=u.model_source,
             )
-            for i, (name, u) in enumerate(reps.items())
+            for name, u in sorted(reps.items())
         ]
         n_models = max(1, len(models_payload))
         if n_models != self._models_n:

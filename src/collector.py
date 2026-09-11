@@ -4,7 +4,7 @@ import asyncio
 import math
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
@@ -80,11 +80,14 @@ def _parse_prometheus_histogram(
             if m:
                 le_str = m.group(1)
                 parts = line.split()
-                cnt = float(parts[-1]) if len(parts) >= 2 else 0.0
-                if le_str == "+Inf":
-                    le = float("inf")
-                else:
-                    le = float(le_str)
+                try:
+                    cnt = float(parts[-1]) if len(parts) >= 2 else 0.0
+                    le = float("inf") if le_str == "+Inf" else float(le_str)
+                except ValueError:
+                    # Truncated/garbage bucket line: skip it, keep the rest
+                    # of the payload — one bad sample must not discard a
+                    # healthy node's whole parse for the poll.
+                    continue
                 if math.isfinite(cnt):
                     buckets[le] = buckets.get(le, 0.0) + cnt
         elif line.startswith(f"{metric_name}_count"):
@@ -151,6 +154,48 @@ def _metric_series(lines: List[str], *names: str) -> Tuple[List[float], bool]:
     return out, saw
 
 
+def _engine_label(line: str, key: str = "engine") -> Optional[str]:
+    """The ``key="…"`` label of an exposition sample line, if it carries one."""
+    m = re.search(rf'\b{key}="([^"]*)"', line)
+    return m.group(1) if m else None
+
+
+def _labeled_series(lines: List[str], name: str) -> List[Tuple[Optional[str], float]]:
+    """``_metric_series`` with each sample's engine label attached — for
+    aggregations that must pair samples across metric families BY ENGINE,
+    not by line order (two families' label orderings are not guaranteed to
+    correspond)."""
+    out: List[Tuple[Optional[str], float]] = []
+    for line in lines:
+        if not line.startswith(name):
+            continue
+        rest = line[len(name) :]
+        if rest and rest[0] not in " {":
+            continue  # sibling series: *_created, *_by_reason, *_by_source…
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                v = float(parts[-1])
+            except ValueError:
+                continue
+            if math.isfinite(v):
+                out.append((_engine_label(line), v))
+    return out
+
+
+def _ns_sample_count(lines: List[str], ns: str) -> int:
+    """Count sample lines under namespace prefix ``ns`` that carry a value.
+
+    Sample-evidence counting, not substring matching: ``# HELP vllm:...`` /
+    ``# TYPE ...`` comment lines start with ``#`` and never count, arbitrary
+    body text mentioning the namespace mid-line never counts, and a
+    bare/truncated name line with no value token never counts. (Unlike
+    ``_metric_series`` there is no sibling exclusion here — at namespace
+    granularity every ``ns:*`` sample line IS evidence.)
+    """
+    return sum(1 for line in lines if line.startswith(ns) and len(line.split()) >= 2)
+
+
 def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     """Parse vLLM Prometheus metrics into SparkUnitStats.
 
@@ -185,33 +230,61 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     s = SparkUnitStats()
     lines = text.strip().splitlines()
     # SGLang mirrors the vLLM metric shape under the ``sglang:`` namespace
-    # when started with --enable-metrics; one parser, both namespaces.
-    ns = "sglang:" if any(line.startswith("sglang:") for line in lines) else "vllm:"
+    # when started with --enable-metrics; one parser, both namespaces. The
+    # namespace is chosen by sample evidence — majority of actual sample
+    # lines, tie → vllm — so one stray sample from the other family can
+    # never flip the parse and zero out every real series.
+    vllm_n = _ns_sample_count(lines, "vllm:")
+    sglang_n = _ns_sample_count(lines, "sglang:")
+    ns = "sglang:" if sglang_n > vllm_n else "vllm:"
     s.model_source = "sglang" if ns == "sglang:" else "vllm"
-    # Cache config — block_size and total_blocks from cache_config_info at startup
+    # Cache config — block_size and total_blocks from cache_config_info at
+    # startup. Pool capacity ACCUMULATES across engines (an endpoint exposing
+    # several engines owns the summed pool, consistent with the summation
+    # policy used for every other metric here).
     size_tokens = 0
+    engine_caps: List[float] = []
+    caps_by_engine: Dict[str, float] = {}
     for line in lines:
         if f"{ns}cache_config_info{{" in line:
             m = re.search(r'num_gpu_blocks="(\d+)"', line)
             if m:
-                s.kv_total_blocks = int(m.group(1))
+                blocks = int(m.group(1))
+                s.kv_total_blocks += blocks
+                engine_caps.append(float(blocks))
+                lbl = _engine_label(line)
+                if lbl is not None:
+                    caps_by_engine[lbl] = float(blocks)
             m = re.search(r'block_size="(\d+)"', line)
             if m:
-                s.kv_block_size = int(m.group(1))
+                s.kv_block_size = max(s.kv_block_size, int(m.group(1)))
             m = re.search(r'kv_cache_size_tokens="(\d+)"', line)
             if m:
-                size_tokens = int(m.group(1))
+                size_tokens += int(m.group(1))
     if size_tokens > 0:
         s.kv_total_tokens = size_tokens
     elif s.kv_total_blocks > 0 and s.kv_block_size > 0:
         s.kv_total_tokens = s.kv_total_blocks * s.kv_block_size
 
     # KV cache usage — block-level allocation fraction (null block already
-    # netted out by vLLM). Engines share the pool; the most-used engine is the
-    # honest endpoint number.
-    usage_vals, _ = _metric_series(lines, f"{ns}kv_cache_usage_perc")
-    if usage_vals:
-        val = max(usage_vals)
+    # netted out by vLLM). The honest endpoint number pairs each engine's
+    # gauge with ITS OWN capacity: by engine label when both families carry
+    # one (line order across two metric families is not guaranteed to
+    # correspond), else by line order when the counts pair, else a plain
+    # mean — never one engine's usage over another engine's capacity.
+    usage = _labeled_series(lines, f"{ns}kv_cache_usage_perc")
+    if usage:
+        if all(lbl is not None and lbl in caps_by_engine for lbl, _v in usage):
+            pairs = [(v, caps_by_engine[lbl]) for lbl, v in usage]
+        elif len(usage) == len(engine_caps) and sum(engine_caps) > 0:
+            pairs = [(v, c) for (_l, v), c in zip(usage, engine_caps)]
+        else:
+            pairs = [(v, 1.0) for _l, v in usage]
+        cap_sum = sum(c for _v, c in pairs)
+        if cap_sum > 0:
+            val = sum(v * c for v, c in pairs) / cap_sum
+        else:
+            val = sum(v for v, _c in pairs) / len(pairs)
         pct = val * 100
         # A finite raw value can still overflow the ×100 scaling; a poisoned
         # gauge would wreck the Sparkline history and the renderer.
@@ -274,10 +347,15 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
             has_gen_tokens = True
             s.generation_tokens_total = sum(fallback)
 
-    prompt, _ = _metric_series(lines, f"{ns}prompt_tokens_total")
-    if not prompt:
-        prompt, _ = _metric_series(lines, f"{ns}prompt_tokens")
-    s.prompt_tokens_total = sum(prompt)
+    # Same baseline-source stability rule as generation_tokens: the legacy
+    # bare name is tried only when the modern counter is entirely absent —
+    # a transient NaN on the modern counter must not silently switch the
+    # prompt-throughput baseline onto a different source (false spike on
+    # recovery).
+    ptot, saw_ptot = _metric_series(lines, f"{ns}prompt_tokens_total")
+    if not ptot and not saw_ptot:
+        ptot, _ = _metric_series(lines, f"{ns}prompt_tokens")
+    s.prompt_tokens_total = sum(ptot)
 
     if has_gen_tokens or s.kv_total_blocks > 0 or s.requests_running > 0 or s.ttft_p50_ms > 0:
         s.model_hosted = True
@@ -462,6 +540,18 @@ async def _fetch_vllm_metrics(vllm_url: str) -> str:
         return resp.text
 
 
+def _coerce_count(v: object) -> int:
+    """Best-effort int for a /get_load field. A malformed value (dict, list,
+    garbage string) degrades to 0 for that field — it must never raise out
+    of the parse, or one bad payload kills the whole cluster poll tick
+    (``poll_cluster``'s gather has no ``return_exceptions``). JSON ``1e999``
+    parses to float inf, so OverflowError is part of the contract too."""
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 async def _fetch_sglang_load(vllm_url: str) -> tuple[int, int] | None:
     """Fetch request concurrency from an SGLang server.
 
@@ -485,8 +575,8 @@ async def _fetch_sglang_load(vllm_url: str) -> tuple[int, int] | None:
     for entry in entries:
         if isinstance(entry, dict) and "num_reqs" in entry:
             seen = True
-            running += int(entry.get("num_reqs") or 0)
-            waiting += int(entry.get("num_waiting_reqs") or 0)
+            running += _coerce_count(entry.get("num_reqs"))
+            waiting += _coerce_count(entry.get("num_waiting_reqs"))
     return (running, waiting) if seen else None
 
 
@@ -847,7 +937,11 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
     try:
         metrics_text = await metrics_task
         parsed = _parse_vllm_metrics(metrics_text)
-        if parsed.model_hosted or "vllm:" in metrics_text or "sglang:" in metrics_text:
+        if (
+            parsed.model_hosted
+            or _ns_sample_count(metrics_text.splitlines(), "vllm:") > 0
+            or _ns_sample_count(metrics_text.splitlines(), "sglang:") > 0
+        ):
             parsed.label = label
             parsed.is_worker = is_worker
             s = parsed

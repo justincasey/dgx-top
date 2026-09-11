@@ -1189,3 +1189,136 @@ class InitModelNamesTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewHardeningTests(unittest.TestCase):
+    """Robustness contract: a malformed remote payload degrades one field or
+    one node — it never raises past the parser or kills the cluster tick."""
+
+    def test_coerce_count_degrades_malformed_values(self):
+        self.assertEqual(collector._coerce_count({"a": 1}), 0)
+        self.assertEqual(collector._coerce_count([2]), 0)
+        self.assertEqual(collector._coerce_count("garbage"), 0)
+        self.assertEqual(collector._coerce_count(None), 0)
+        self.assertEqual(collector._coerce_count("3"), 3)
+        self.assertEqual(collector._coerce_count(2.7), 2)
+
+    def test_get_load_malformed_entries_degrade_not_raise(self):
+        # A non-numeric num_reqs must never raise out of the parse:
+        # poll_cluster's gather has no return_exceptions, so one bad payload
+        # would kill the whole cluster poll tick.
+        from unittest.mock import patch
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return [
+                    {"num_reqs": {"a": 1}, "num_waiting_reqs": [2]},
+                    {"num_reqs": "3", "num_waiting_reqs": None},
+                    {"num_reqs": 4, "num_waiting_reqs": 1},
+                    # JSON 1e999 parses to float inf — int(inf) raises
+                    # OverflowError, which must degrade to 0, not escape
+                    {"num_reqs": 1e999, "num_waiting_reqs": 0},
+                ]
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                return FakeResp()
+
+        with patch.object(collector.httpx, "AsyncClient", FakeClient):
+            got = asyncio.run(collector._fetch_sglang_load("http://x:1"))
+        self.assertEqual(got, (7, 1))
+
+    def test_histogram_skips_garbage_bucket_lines(self):
+        lines = [
+            'vllm:ttft_bucket{le="0.1"} 10',
+            'vllm:ttft_bucket{le="0.5"} abc',  # garbage count
+            'vllm:ttft_bucket{le="x"} 20',  # garbage bound
+            'vllm:ttft_bucket{le="+Inf"} 40',
+            "vllm:ttft_count 40",
+        ]
+        buckets, count = collector._parse_prometheus_histogram(lines, "vllm:ttft")
+        self.assertEqual(count, 40.0)
+        # the garbage line is skipped whole — its bound goes with it
+        self.assertEqual(buckets, {0.1: 10.0, float("inf"): 40.0})
+        # quantiles still computable from the surviving buckets
+        q = collector._estimate_quantile(buckets, count, 0.2)
+        self.assertGreater(q, 0.0)
+        self.assertLessEqual(q, 0.1)
+
+    def test_multi_engine_kv_capacity_weighted(self):
+        text = (
+            'vllm:cache_config_info{engine="0",num_gpu_blocks="100",'
+            'block_size="16",kv_cache_size_tokens="1600"} 0\n'
+            'vllm:cache_config_info{engine="1",num_gpu_blocks="300",'
+            'block_size="16",kv_cache_size_tokens="4800"} 0\n'
+            'vllm:kv_cache_usage_perc{engine="0"} 0.2\n'
+            'vllm:kv_cache_usage_perc{engine="1"} 0.6\n'
+        )
+        s = collector._parse_vllm_metrics(text)
+        self.assertEqual(s.kv_total_blocks, 400)  # summed, not last-engine
+        self.assertEqual(s.kv_total_tokens, 6400)
+        self.assertAlmostEqual(s.kv_cache_pct, 50.0)  # (0.2*100 + 0.6*300)/400
+        self.assertEqual(s.kv_cache_used_tokens, int(6400 * 0.5))
+        self.assertEqual(s.kv_cache_free_blocks, int(400 * 0.5))
+
+    def test_multi_engine_kv_unpaired_counts_use_plain_mean(self):
+        text = (
+            'vllm:cache_config_info{engine="0",num_gpu_blocks="100",'
+            'block_size="16",kv_cache_size_tokens="1600"} 0\n'
+            'vllm:kv_cache_usage_perc{engine="0"} 0.2\n'
+            'vllm:kv_cache_usage_perc{engine="1"} 0.6\n'
+        )
+        s = collector._parse_vllm_metrics(text)
+        self.assertAlmostEqual(s.kv_cache_pct, 40.0)
+        self.assertEqual(s.kv_total_tokens, 1600)
+
+    def test_namespace_picked_by_sample_evidence(self):
+        vllm_majority = (
+            "vllm:generation_tokens_total 5.0\n"
+            "vllm:num_requests_running 1.0\n"
+            "vllm:prompt_tokens_total 2.0\n"
+            "sglang:generation_tokens_total 9.0\n"
+        )
+        s = collector._parse_vllm_metrics(vllm_majority)
+        self.assertEqual(s.model_source, "vllm")
+        self.assertEqual(s.generation_tokens_total, 5.0)
+        sglang_majority = (
+            "vllm:generation_tokens_total 5.0\n"
+            "sglang:generation_tokens_total 9.0\n"
+            "sglang:num_requests_running 2.0\n"
+            "sglang:prompt_tokens_total 3.0\n"
+        )
+        s2 = collector._parse_vllm_metrics(sglang_majority)
+        self.assertEqual(s2.model_source, "sglang")
+        self.assertEqual(s2.generation_tokens_total, 9.0)
+
+    def test_help_only_namespace_mention_is_not_sample_evidence(self):
+        text = (
+            "# HELP vllm:generation_tokens_total some help text\n"
+            "# TYPE vllm:generation_tokens_total counter\n"
+        )
+        self.assertEqual(collector._ns_sample_count(text.splitlines(), "vllm:"), 0)
+        s = collector._parse_vllm_metrics(text)
+        self.assertFalse(s.model_hosted)
+
+    def test_prompt_nan_only_keeps_baseline_source(self):
+        # A transient NaN on the modern counter must NOT switch the prompt
+        # baseline onto the legacy name (the generation_tokens rule).
+        text = "vllm:prompt_tokens_total  NaN\nvllm:prompt_tokens  77.0\n"
+        s = collector._parse_vllm_metrics(text)
+        self.assertEqual(s.prompt_tokens_total, 0.0)
+        # legacy-only payloads still read the legacy name
+        s2 = collector._parse_vllm_metrics("vllm:prompt_tokens  77.0\n")
+        self.assertEqual(s2.prompt_tokens_total, 77.0)
