@@ -242,7 +242,7 @@ always keeps the most detail it can carry:
 
 | Composition | Layout |
 | --- | --- |
-| Wide, few nodes | SERVING tiles left with a tall area chart; node cards stack right beside it, each a full card (meters, core grid, RoCE) |
+| Wide, few nodes | SERVING tiles left with a tall time-series line chart; node cards stack right beside it, each a full card (meters, core grid, RoCE) |
 | Wide, many nodes | SERVING left with the chart; the right column wraps a **card grid** (each tile held at a usable width) |
 | Narrow, few nodes | SERVING hero on top, full **card** tiles in one row |
 | Narrow, many nodes | SERVING hero on top, node **cards tile into rows** below, each held at a minimum width; when no usable card fits, every node collapses to a **condensed table row** |
@@ -258,23 +258,25 @@ stacked one, so a narrow right column never densifies the serving surface:
 
 | Tier | Look |
 | --- | --- |
-| `roomy` | Full metric rows, gradient meters, two-row core grid, a SERVING area chart that **grows into the leftover height** (up to the tier max) |
+| `roomy` | Full metric rows, gradient meters, two-row core grid, a SERVING multi-series line chart that **grows into the leftover height** (up to the tier max) |
 | `dense` | The same rows with a shorter upper chart bound |
-| `compact` | Node cards keep their **meters and core grid** (RoCE drops first) as long as the tile is wide enough; SERVING keeps a small area chart and favours gen (the last chart visual) + requests + ttft |
+| `compact` | Node cards keep their **meters and core grid** (RoCE drops first) as long as the tile is wide enough; SERVING keeps a small line chart and favours gen (the last chart visual) + requests + ttft |
 | `rail` | SERVING chart gone (gen/req/ttft/kv% remain); node cards run gpu/mem/cpu text; the waybar stays visible carrying gen/kv/online |
 | `floor` | The never-scroll bottom: each node becomes one **condensed table row** (`● 3  87%  62%  61%`), SERVING to gen/req/ttft, no window frames |
 
 **Bounded fill, then breathe.** The fit selector guarantees the natural content
-fits; the SERVING area chart is fit-computed (never thinner than its tier
+fits; the SERVING line chart is fit-computed (never thinner than its tier
 minimum, never taller than its tier maximum) so leftover viewport rows become
 graph, and only when a tier caps out does symmetric breathing room frame the
 dashboard rather than stretching any panel into a slab. As the layout
 densifies, lower-value data is dropped rather than crammed: node cards favour
 `gpu · mem · cpu` and shed RoCE, then the meters/core grid, for plain text; the
 SERVING surface favours gen, the requests line (concurrency) and TTFT, dropping
-the window stat first and the large area chart before the gen sparkline. The
+the window stat first and the large line chart before the gen sparkline. The
 base surface — node gpu/mem/cpu and serving gen/req/ttft (+ KV% through rail) —
-never disappears at any size.
+never disappears at any size. With several models served at once, the wide
+SERVING pane becomes a single multi-model view: a gen/requests/ttft row per
+model and one shared time axis in the line chart, one hue per model.
 
 ## Synthetic data
 

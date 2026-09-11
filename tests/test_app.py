@@ -91,7 +91,7 @@ async def _resize(pilot, width, height):
 
 
 def _seed_history(app):
-    """Give the charts real history so sparklines/area chart populate."""
+    """Give the charts real history so sparklines/line chart populate."""
     import collections
 
     app.history["throughput"] = collections.deque([40 + (i * 7) % 60 for i in range(24)], maxlen=25)
@@ -100,6 +100,11 @@ def _seed_history(app):
     )
     app.history["kv-usage-head"] = collections.deque(
         [18 + (i * 3) % 15 for i in range(24)], maxlen=25
+    )
+    # the shared model's own time-series (both fixture units host it; the
+    # head unit is its authoritative reporter)
+    app.history["gen-Qwen3.6-27B-Instruct"] = collections.deque(
+        [40 + (i * 7) % 60 for i in range(24)], maxlen=25
     )
     app._update_ui()
 
@@ -370,7 +375,7 @@ async def test_density_ladder_steps_down(tmp_path: Path, monkeypatch):
     async with app.run_test(size=(90, 44)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (44, 29, 20, 17, 8):
+        for h in (44, 32, 30, 17, 8):
             await _resize(pilot, 90, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
@@ -422,9 +427,10 @@ async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
         _seed_history(app)
         lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
         assert not any("last 24 samples" in ln for ln in lines)  # chart label removed
-        chart_rows = [ln for ln in lines if any(c in ln for c in "▁▂▃▄▅▆▇█")]
-        # gen/prompt/kv sparklines + a multi-row area chart
-        assert len(chart_rows) >= 3
+        # gen/prompt/kv sparklines (blocks) + the multi-series braille chart
+        assert any(c in ln for ln in lines for c in "▁▂▃▄▅▆▇█")
+        chart_rows = [ln for ln in lines if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
+        assert len(chart_rows) >= 2
 
 
 # ─── AC7: waybar ─────────────────────────────────────────────────────
@@ -807,8 +813,9 @@ async def test_meter_escalates_to_crit(tmp_path: Path, monkeypatch):
 
 
 async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
-    """AC: gen/prompt/kv/kv% graphs share one width and tails align; blank
-    spacer rows separate the graph rows; nothing overflows the box."""
+    """AC: gen/prompt/kv duo rows share one graph lane (value + dots on the
+    line row, the fill row aligned under the dots), tails align, blank
+    spacer rows separate the graph blocks; nothing overflows the box."""
     from app import DGXTop, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -843,32 +850,46 @@ async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
             if m:
                 by_label.setdefault(m.group(1), []).append((i, ln))
         assert set(by_label) == {"gen    ", "prompt ", "kv     ", "kv%    "}
-        graph_glyphs = set("\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588\u2593\u2591")
+        braille = {chr(c) for c in range(0x2801, 0x2900)}
         starts, lens = set(), set()
         for label, entries in by_label.items():
+            if label == "kv%    ":
+                continue  # meter row, not a duo spark
             i, ln = entries[0]
-            cols = [j for j, ch in enumerate(ln) if ch in graph_glyphs]
-            assert cols, f"no graph glyphs on {label!r}"
-            starts.add(min(cols))
-            lens.add(max(cols) - min(cols) + 1)
-            assert cols == list(range(min(cols), max(cols) + 1)), f"ragged graph {label!r}"
+            # line row: the gen row leads with the value at the lane start,
+            # then contiguous braille dots; prompt/kv are pure dot rows
+            cols = [j for j, ch in enumerate(ln) if ch in braille]
+            assert cols, f"no dot glyphs on {label!r}"
+            assert cols == list(range(min(cols), max(cols) + 1)), f"ragged dots {label!r}"
+            # fill row beneath: a contiguous █ run aligned with the dots
+            fcols = [j for j, ch in enumerate(interior[i + 1]) if ch == "\u2588"]
+            assert fcols, f"no fill row under {label!r}"
+            assert fcols == list(range(min(fcols), max(fcols) + 1)), f"ragged fill {label!r}"
+            assert (min(fcols), len(fcols)) == (min(cols), len(cols)), (
+                f"fill misaligned under {label!r}"
+            )
+            if label != "gen    ":
+                starts.add(min(cols))
+                lens.add(len(cols))
         assert len(lens) == 1, f"graph lengths differ: {lens}"
         assert len(starts) == 1, f"graph starts differ: {starts}"
-        # blank spacer row between the gen/prompt/kv graph rows
+        # the gen value sits exactly at the shared graph lane's start
+        assert by_label["gen    "][0][1][min(starts)].isdigit(), by_label["gen    "][0][1]
+        # each duo block is line row + fill row; blank spacers between blocks
         gen_i = by_label["gen    "][0][0]
         prompt_i = by_label["prompt "][0][0]
         kv_i = by_label["kv     "][0][0]
-        assert prompt_i - gen_i == 2 and kv_i - prompt_i == 2
+        assert prompt_i - gen_i == 3 and kv_i - prompt_i == 3
 
         def blank(ln: str) -> bool:
             return ln[1:-1].strip() == ""
 
         kvp_i = by_label["kv%    "][0][0]
-        assert kv_i - prompt_i == 2 and kvp_i - kv_i == 2
+        assert kv_i - prompt_i == 3 and kvp_i - kv_i == 3
         assert (
-            blank(interior[gen_i + 1])
-            and blank(interior[prompt_i + 1])
-            and blank(interior[kv_i + 1])
+            blank(interior[gen_i + 2])
+            and blank(interior[prompt_i + 2])
+            and blank(interior[kv_i + 2])
         )
         # the widest tail (gen) reaches the interior's right edge
         assert len(by_label["gen    "][0][1][1:-1].rstrip()) == width - 3
@@ -978,8 +999,8 @@ async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatc
 
 async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
     """A 12-node cluster steps through the whole ladder as height shrinks
-    (at width 180 the wide tiled roomy and the denser stacked tiers both
-    appear)."""
+    (at width 180 the wide tiled roomy tier and the denser tiers both
+    appear; the duo spark rows cost height, so dense now needs ≥33 rows)."""
     from app import DGXTop
 
     _config_cluster(tmp_path / "config.toml", 12)
@@ -989,7 +1010,7 @@ async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
     async with app.run_test(size=(180, 60)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (60, 30, 24, 20, 8):
+        for h in (60, 33, 24, 20, 8):
             await _resize(pilot, 180, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
@@ -1052,7 +1073,7 @@ async def test_serving_never_mentions_window(tmp_path: Path, monkeypatch):
 async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
     """AC2: the graphs survive an extra tier. At compact the node cards still
     carry the meters + core grid (RoCE is the first graph to go) and the
-    serving keeps a multi-row gen area chart."""
+    serving keeps a multi-row gen line chart (braille dots)."""
     from app import DGXTop, NodeBox, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -1064,10 +1085,17 @@ async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
         _seed_history(app)
         await _resize(pilot, 132, 20)
         assert app.density == "compact" and not app.rail and not app.floor
-        assert app._chart_rows >= 2, app._chart_rows  # area chart survives compact
+        assert app._chart_rows >= 2, app._chart_rows  # line chart survives compact
         serv_lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
-        chart_glyphs = set("▁▂▃▄▅▆▇█")
-        assert sum(1 for ln in serv_lines if any(c in chart_glyphs for c in ln)) >= 3
+        # sparkline blocks ∪ braille line-chart dots (U+2800–U+28FF)
+        assert (
+            sum(
+                1
+                for ln in serv_lines
+                if any(c in "▁▂▃▄▅▆▇█" or 0x2800 <= ord(c) < 0x2900 for c in ln)
+            )
+            >= 3
+        )
         node = app.query_one("#node-0", NodeBox).render().plain
         assert "73%" in node and "52%" in node and "50%" in node
         assert any(c in node for c in "█▓━╾┈"), "meter glyphs survive compact"
@@ -1116,3 +1144,601 @@ async def test_serving_wins_gen_reqs_ttft(tmp_path: Path, monkeypatch):
             assert "gen" in blob, (w, h, blob)
             assert "req" in blob or "requests" in blob, (w, h, blob)
             assert "ttft" in blob, (w, h, blob)
+
+
+async def test_two_models_share_one_serving_pane(tmp_path: Path, monkeypatch):
+    """Two endpoints, one pane: a gen row per model (an SGLang endpoint with
+    no Prometheus counter says so honestly instead of plotting a fake zero
+    line), one shared braille time-series chart, per-model requests/ttft
+    rows — and the extra model rows never clip at any tier."""
+    import collections
+
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    head.model_name = "qwen3.8-flash-next"
+    head.generation_tokens_total = 264348.0
+    worker = _unit("worker", worker=True)
+    worker.model_name = "NVIDIA-Nemotron-3.5-Lightning"
+    worker.model_source = "sglang"
+    worker.generation_tokens_total = 0.0
+    worker.throughput_tok_s = 0.0
+    worker.model_metrics = False
+    worker.requests_running = 0
+    worker.requests_waiting = 0
+    worker.ttft_p50_ms = 0.0
+    worker.ttft_p95_ms = 0.0
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert app._models_n == 2
+        app.history["gen-qwen3.8-flash-next"] = collections.deque(
+            [40 + (i * 7) % 60 for i in range(24)], maxlen=25
+        )
+        app._update_ui()
+        blob = app.query_one("#serving", ServingBox).render().plain
+        # both models appear in the pane, each with its own row set
+        assert "qwen3.8-flash-next" in blob
+        assert "NVIDIA-Nemotron" in blob
+        assert "no tok/s · sglang" in blob
+        braille = [ln for ln in blob.split("\n") if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
+        assert len(braille) >= 2, braille  # the shared time-series chart
+        assert blob.count("requests") == 2, blob  # one concurrency row per model
+        for w, h in [(100, 40), (95, 24), (60, 18), (40, 8)]:
+            await _resize(pilot, w, h)
+            assert app.screen.max_scroll_y == 0, (w, h)
+
+
+# ─── line-chart-hires: connected smooth chart + stable per-model hues ──
+
+
+def _cells(t):
+    """(char, style-string) per column of a rendered Text (single row)."""
+    from rich.console import Console
+
+    cells = []
+    for seg in Console(force_terminal=True, width=4096).render(t):
+        cells.extend((ch, str(seg.style) if seg.style else "") for ch in seg.text)
+    return cells
+
+
+def _line_dots(out):
+    """Absolute dot rows per braille sub-column: {(cell, side): set(rows)}."""
+    from app import _BRAILLE_BITS
+
+    dots = {}
+    for r, t in enumerate(out):
+        for c, (ch, _st) in enumerate(_cells(t)):
+            code = ord(ch)
+            if 0x2800 < code < 0x2900:
+                bits = code - 0x2800
+                for (cc, rr), b in _BRAILLE_BITS.items():
+                    if bits & b:
+                        dots.setdefault((c, cc), set()).add(r * 4 + rr)
+    return dots
+
+
+def _aeon_palettes():
+    from themes import build_palette, get_theme
+
+    return build_palette(get_theme("dgx-aeon")), build_palette(get_theme("dgx-aeon"), quiet=True)
+
+
+def test_lines_chart_draws_connected_lines_not_dots():
+    """AC1: on a steep multi-slope series every sub-column carries dots and
+    adjacent sub-columns never jump more than one dot row — the line is
+    connected, not the old single-dot-per-sample scatter."""
+    from app import _lines_chart_lines
+
+    pal, _ = _aeon_palettes()
+    out = _lines_chart_lines([("m", "#8A7CFF", [5, 30, 12, 44, 8, 27])], 6, 40, pal)
+    dots = _line_dots(out)
+    assert len(dots) == 80, len(dots)  # every sub-column plotted
+    seq = sorted(dots)
+    for k1, k2 in zip(seq, seq[1:]):
+        gap = min(abs(a - b) for a in dots[k1] for b in dots[k2])
+        assert gap <= 1, (k1, k2, dots[k1], dots[k2])
+
+
+def test_lines_chart_step_transition_is_smooth():
+    """AC2: a step between two sample levels renders a curved ramp of
+    intermediate dot rows, not a nearest-neighbour plateau + jump."""
+    from app import _lines_chart_lines
+
+    pal, _ = _aeon_palettes()
+    out = _lines_chart_lines([("m", "#8A7CFF", [0, 0, 60, 60])], 8, 40, pal)
+    dots = _line_dots(out)
+    levels = {row for rows in dots.values() for row in rows}
+    assert len(levels) >= 4, len(levels)
+    # The step must SPREAD across sub-columns (each column's lowest line dot
+    # advances at most a few rows). Nearest-neighbour resampling concentrates
+    # the whole 0→max step in one column (a 31-row spike) — the exact
+    # staircase the old renderer drew.
+    reps = [max(rows) for _k, rows in sorted(dots.items())]
+    jumps = [abs(b - a) for a, b in zip(reps, reps[1:])]
+    assert max(jumps) <= 8, max(jumps)
+
+
+def test_lines_chart_flat_composite_fill():
+    """AC Y6 (supersedes the old gradient contract): fill is a UNIFORM █
+    at 25% of the hue over the background — no partial blocks, no depth
+    gradient — and starts directly under the line's cell."""
+    from textual.color import Color
+
+    from app import _lines_chart_lines
+
+    pal, _ = _aeon_palettes()
+    out = _lines_chart_lines([("m", "#8A7CFF", [8, 34, 44, 12, 5])], 6, 30, pal)
+    expect = Color.parse(pal.bg).blend(Color.parse("#8A7CFF"), 0.25)
+    seen = 0
+    top_fill: dict[int, int] = {}
+    for r, t in enumerate(out):
+        for c, (ch, st) in enumerate(_cells(t)):
+            if "\u2581" <= ch <= "\u2588":
+                assert ch == "\u2588", (r, c, ch)  # flat: never a partial block
+                rgb = Color.parse(st.split()[-1]).rgb[:3]
+                assert all(abs(x - y) <= 1 for x, y in zip(rgb, expect.rgb[:3])), (r, c, st)
+                top_fill[c] = min(top_fill.get(c, 99), r)
+                seen += 1
+    assert seen > 20, seen
+    dots = _line_dots(out)
+    per_col: dict[int, set[int]] = {}
+    for (c, _side), ds in dots.items():
+        per_col.setdefault(c, set()).update(ds)
+    for c, fr in top_fill.items():
+        d = per_col.get(c, set())
+        assert d, c
+        assert 4 * fr + 3 > min(d), (c, fr, sorted(d))  # never above the line
+        assert fr <= (max(d) >> 2) + 1, (c, fr, sorted(d))  # no gap under it
+
+
+def test_lines_chart_overlapping_fills_composite():
+    """AC Y7: where two series' fills share a cell the shade is the
+    two-layer 25% composite — visibly its own tone, not the later series
+    punching out the earlier one."""
+    from textual.color import Color
+
+    from app import _lines_chart_lines
+
+    pal, _ = _aeon_palettes()
+    c1, c2 = "#8A7CFF", "#F06AC0"
+    out = _lines_chart_lines([("a", c1, [40, 40, 40, 40]), ("b", c2, [20, 20, 20, 20])], 6, 30, pal)
+    bg = Color.parse(pal.bg)
+    one = bg.blend(Color.parse(c1), 0.25)
+    two = one.blend(Color.parse(c2), 0.25)
+    tones: dict[tuple, int] = {}
+    for t in out:
+        for ch, st in _cells(t):
+            if ch == "\u2588":
+                rgb = Color.parse(st.split()[-1]).rgb[:3]
+                which = (
+                    "two"
+                    if all(abs(x - y) <= 1 for x, y in zip(rgb, two.rgb[:3]))
+                    else (
+                        "one" if all(abs(x - y) <= 1 for x, y in zip(rgb, one.rgb[:3])) else "other"
+                    )
+                )
+                assert which != "other", st
+                tones[which] = tones.get(which, 0) + 1
+    assert tones.get("one", 0) > 0 and tones.get("two", 0) > 0, tones
+
+
+def test_axis_format_and_ticks():
+    """AC Y1/Y4: compact tick format and the shared-scale tick rows
+    (max on top, 0 on the baseline, half-max only when ≥ 4 rows)."""
+    from app import _axis_labels, _fmt_axis
+
+    assert _fmt_axis(999_999) == "1M"  # .1f rounding must not read "1000K"
+
+    assert (_fmt_axis(0), _fmt_axis(650)) == ("0", "650")
+    assert (_fmt_axis(5000), _fmt_axis(1349), _fmt_axis(2_500_000)) == ("5K", "1.3K", "2.5M")
+    pal, _ = _aeon_palettes()
+    pl = [t.plain for t in _axis_labels(1349.0, 6, 4, pal)]
+    assert pl[0].strip() == "1.3K" and pl[-1].strip() == "0" and pl[3].strip() == "674"
+    assert pl[1].strip() == "" and pl[2].strip() == ""
+    assert all(len(p) == 5 for p in pl)  # gutter + trailing space, every row
+    short = [t.plain.strip() for t in _axis_labels(900.0, 3, 3, pal)]
+    assert short == ["900", "", "0"]  # no mid tick below 4 rows
+
+
+def test_lines_chart_geometry_boundaries():
+    """AC6: rows/width always exact — incl. rows=1 (single-row gradient
+    divide) and width=1 — for empty, single-sample, all-zero and spiky
+    histories."""
+    from app import _lines_chart_lines
+
+    pal, _ = _aeon_palettes()
+    for hist in ([7.0], [0.0, 0.0, 0.0], [0.0, 100.0, 0.0, 100.0], [1.0, 2.0]):
+        for rows, width in ((1, 1), (1, 20), (6, 1), (2, 17)):
+            out = _lines_chart_lines([("a", "#8A7CFF", hist)], rows, width, pal)
+            assert len(out) == rows
+            assert all(t.cell_len == width for t in out)
+    assert _lines_chart_lines([("a", "#8A7CFF", [1, 2])], 0, 5, pal) == []
+
+
+def test_series_hues_distinct_quiet_and_light():
+    """AC4a: identity cycle is pairwise-distinct then deterministic-cycles;
+    quiet collapses to fg; a light background gets a contrast blend."""
+    from themes import SERIES_HUES, build_palette, get_theme, series_hue
+
+    pal, quiet = _aeon_palettes()
+    hues = [series_hue(i, pal) for i in range(len(SERIES_HUES) + 1)]
+    assert len(set(hues[: len(SERIES_HUES)])) == len(SERIES_HUES)
+    assert hues[len(SERIES_HUES)] == hues[0]
+    assert series_hue(3, quiet) == quiet.fg
+    light = build_palette(get_theme("tokyo-night-light"))
+    assert series_hue(0, light) != SERIES_HUES[0]
+
+
+def test_quiet_chart_is_monochrome():
+    """AC5: quiet identity collapse happens at series_hue — the ONE hue
+    assignment site (chart, legend, rows, sparks all read its output) — so
+    a quiet palette yields fg for every slot and the chart renders
+    monochrome."""
+    from app import _lines_chart_lines
+    from themes import SERIES_HUES, series_hue
+
+    _, pq = _aeon_palettes()
+    assert all(series_hue(i, pq) == pq.fg for i in range(len(SERIES_HUES)))
+    # the renderer honors the (already collapsed) hue it is given
+    out = _lines_chart_lines([("a", pq.fg, [3, 9, 4])], 5, 20, pq)
+    line_sty = {
+        st for t in out for _c, (ch, st) in enumerate(_cells(t)) if 0x2800 < ord(ch) < 0x2900
+    }
+    expected = {f"bold {pq.fg}".lower()}  # rich lowercases hex in styles
+    assert {s.lower() for s in line_sty} == expected, line_sty
+
+
+async def test_model_hues_stable_across_topology_changes(tmp_path: Path, monkeypatch):
+    """AC4b: a model's hue is stable for the app's lifetime — a model
+    appearing, dropping and re-appearing (even at the front of the unit
+    order) never repaints the other models' lines."""
+    from app import DGXTop, ServingBox
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[app]\npoll_interval = 5\nhistory_length = 25\n"
+        '[[nodes]]\nlabel = "head"\nssh_target = "head"\n'
+        'vllm_url = "http://192.0.2.10:8000"\n'
+        '[[nodes]]\nlabel = "worker"\nssh_target = "worker"\n'
+        'vllm_url = "http://192.0.2.11:8000"\nworker = true\n'
+        '[[nodes]]\nlabel = "third"\nssh_target = "third"\n'
+        'vllm_url = "http://192.0.2.12:8000"\nworker = true\n'
+    )
+    configure(cfg)
+
+    def mk(label, name, worker=False, tok=100.0):
+        u = _unit(label, worker=worker)
+        u.model_name = name
+        u.generation_tokens_total = tok
+        return u
+
+    a = mk("head", "model-a", tok=300.0)
+    b = mk("worker", "model-b", worker=True, tok=200.0)
+    c = mk("third", "model-c", worker=True, tok=100.0)
+    units = [a, b]
+    _stub(monkeypatch, units)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        serving = app.query_one("#serving", ServingBox)
+        base = {m["name"]: m["color"] for m in serving._models}
+        assert base["model-a"] != base["model-b"]
+
+        units.append(c)
+        app._update_ui()
+        got = {m["name"]: m["color"] for m in serving._models}
+        assert (got["model-a"], got["model-b"]) == (base["model-a"], base["model-b"]), got
+        assert len({got[n] for n in got}) == 3, got
+
+        units.remove(b)
+        app._update_ui()
+        units.insert(0, mk("worker", "model-b", worker=True, tok=400.0))
+        app._update_ui()
+        got = {m["name"]: m["color"] for m in serving._models}
+        assert got["model-a"] == base["model-a"], got
+        assert got["model-b"] == base["model-b"], got
+
+        units.reverse()
+        app._update_ui()
+        got = {m["name"]: m["color"] for m in serving._models}
+        assert (got["model-a"], got["model-b"]) == (base["model-a"], base["model-b"]), got
+
+
+async def test_serving_title_row_legends_model_hues(tmp_path: Path, monkeypatch):
+    """AC4c: the SERVING title row is the chart legend — each model name is
+    styled in the exact hue its chart line and gen row carry."""
+    import collections
+
+    from app import DGXTop, ServingBox
+
+    cfg = tmp_path / "config.toml"
+    _config(cfg)
+    configure(cfg)
+    head = _unit("head")
+    head.model_name = "model-a"
+    head.generation_tokens_total = 300.0
+    worker = _unit("worker", worker=True)
+    worker.model_name = "model-b"
+    worker.generation_tokens_total = 100.0
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        serving = app.query_one("#serving", ServingBox)
+        app.history["gen-model-a"] = collections.deque([40 + (i * 7) % 60 for i in range(24)])
+        app.history["gen-model-b"] = collections.deque([20 + (i * 5) % 40 for i in range(24)])
+        app._update_ui()
+        colors = {m["name"]: m["color"] for m in serving._models}
+        title = serving.render().split("\n")[0]
+        spans = {(title.plain[s.start : s.end], s.style) for s in title._spans}
+        for name, hue in colors.items():
+            assert (name, f"bold {hue}") in spans, (name, hue, spans)
+
+
+@contextlib.asynccontextmanager
+async def _two_model_app(tmp_path, monkeypatch, hist_a, hist_b):
+    """Shared fixture: two served models with seeded gen histories."""
+    import collections
+
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    head.model_name = "model-a"
+    head.generation_tokens_total = 300.0
+    worker = _unit("worker", worker=True)
+    worker.model_name = "model-b"
+    worker.generation_tokens_total = 100.0
+    worker.throughput_tok_s = hist_b[-1] if hist_b else 0.0
+    head.throughput_tok_s = hist_a[-1] if hist_a else 0.0
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        if hist_a:
+            app.history["gen-model-a"] = collections.deque(hist_a, maxlen=25)
+        if hist_b:
+            app.history["gen-model-b"] = collections.deque(hist_b, maxlen=25)
+        app._update_ui()
+        yield app
+
+
+async def test_chart_y_axis_gutter_and_suppression(tmp_path: Path, monkeypatch):
+    """AC Y1/Y2/Y3: the chart pane gains a right-aligned tick gutter
+    (max / half / 0) without changing its total width, and the gutter is
+    suppressed when nothing is plotted."""
+    from app import ServingBox
+
+    async with _two_model_app(tmp_path, monkeypatch, [100.0] * 24, [10.0] * 24) as app:
+        serving = app.query_one("#serving", ServingBox)
+        w = serving.content_size.width
+        rows = serving.render().split("\n")
+        assert all(t.cell_len == w for t in rows)
+        content = rows[1:-1]  # strip box top/bottom borders
+        chart = [t.plain[2:] for t in content[-app._chart_rows :]]  # strip "│ "
+        assert len(chart) == app._chart_rows, (len(chart), app._chart_rows)
+        assert chart[0].startswith("100 "), chart[0]
+        assert chart[app._chart_rows // 2].startswith(" 50 "), chart[app._chart_rows // 2]
+        assert chart[-1].startswith("  0 "), chart[-1]
+    # all-zero throughput: no range to label — the pane renders unlabeled
+    # (the fixture pins stub throughput to the seed tail, so an empty seed
+    # really does leave only 0s in the history)
+    async with _two_model_app(tmp_path, monkeypatch, [], []) as app:
+        serving = app.query_one("#serving", ServingBox)
+        blob = serving.render().plain
+        assert not any(ln[2:].startswith(("0 ", " 0 ")) for ln in blob.split("\n")[1:-1]), blob
+
+
+async def test_gen_rows_lead_with_hue_values_and_duo_fill(tmp_path: Path, monkeypatch):
+    """AC Y8 (duo grammar): each gen row leads with that model's CURRENT
+    total output in its own hue, then its duo spark — braille dots at the
+    full hue — with a fill row beneath in the chart's translucent shade
+    (hue blended 75% toward the background)."""
+    from app import ServingBox, _palette_for
+    from themes import blend_toward
+
+    hist = [20 + (i * 7) % 50 for i in range(24)]  # last=31, avg=44, hi=69
+    async with _two_model_app(tmp_path, monkeypatch, hist, hist) as app:
+        serving = app.query_one("#serving", ServingBox)
+        hue = {m["name"]: m["color"] for m in serving._models}["model-a"]
+        pal = _palette_for(app)
+        rows = serving.render().split("\n")
+        gi = next(i for i, t in enumerate(rows) if "gen" in t.plain and "model-a" in t.plain)
+        gen = rows[gi]
+        assert "31" in gen.plain and "44" in gen.plain and "69" in gen.plain, gen.plain
+        assert f"bold {hue}" in {s.style for s in gen._spans}, gen.plain
+        # dots at the full hue share the row with the leading value
+        assert any("\u2800" <= c <= "\u28ff" for c in gen.plain), gen.plain
+        # the row beneath is the fill: solid blocks in the 75%-lighter shade
+        fill = rows[gi + 1]
+        assert "\u2588" in fill.plain, fill.plain
+        expected = f"bold {blend_toward(hue, pal.bg, 0.75)}"
+        assert expected in {s.style for s in fill._spans}, (
+            expected,
+            [s.style for s in fill._spans],
+        )
+        # model-b's fill carries ITS hue — the two light fills are distinct
+        hue_b = {m["name"]: m["color"] for m in serving._models}["model-b"]
+        assert blend_toward(hue_b, pal.bg, 0.75) != blend_toward(hue, pal.bg, 0.75)
+
+
+# ─── review-hardening: hero honesty, order, hue hygiene, duo sparks ──
+
+
+@contextlib.asynccontextmanager
+async def _served_models_app(tmp_path, monkeypatch, specs, hists, size=(132, 44)):
+    """Fixture: N served models with arbitrary gen histories.
+
+    ``specs``: list of (model_name, generation_tokens_total, throughput).
+    ``hists``: per-model history (or None to skip seeding), same length.
+    """
+    import collections
+
+    from app import DGXTop
+
+    _config_cluster(tmp_path / "config.toml", max(2, len(specs)))
+    configure(tmp_path / "config.toml")
+
+    units = []
+    for i, (name, gen_total, tput) in enumerate(specs):
+        u = _unit(f"n{i}", worker=bool(i))
+        u.model_name = name
+        u.generation_tokens_total = gen_total
+        u.throughput_tok_s = tput
+        units.append(u)
+    _stub(monkeypatch, units)
+    app = DGXTop()
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        for (name, _g, _t), h in zip(specs, hists):
+            if h:
+                app.history[f"gen-{name}"] = collections.deque(h, maxlen=25)
+        app._update_ui()
+        yield app
+
+
+async def test_gen_hero_shows_rep_value_not_cluster_aggregate(tmp_path, monkeypatch):
+    """AC6: one model name served by 2 endpoints — the hero reads the
+    authoritative rep's own series, not the N× cluster aggregate."""
+    from app import ServingBox
+
+    hist = [20 + (i * 7) % 50 for i in range(24)]  # rep tail = 31
+    specs = [("model-a", 300.0, 31.0), ("model-a", 100.0, 1000.0)]
+    async with _served_models_app(tmp_path, monkeypatch, specs, [hist, hist]) as app:
+        serving = app.query_one("#serving", ServingBox)
+        assert len(serving._models) == 1  # one pane, not two
+        gen_row = next(t for t in serving.render().split("\n") if t.plain.startswith("│ gen"))
+        # pin the parsed hero TOKEN (leading value at the graph lane), not a
+        # substring that larger numbers could contain
+        m = re.search(r"gen\s+(\d+)", gen_row.plain)
+        assert m and m.group(1) == "31", gen_row.plain
+        # the aggregate (31 + 1000) must not leak into the hero or the tail
+        assert "1031" not in gen_row.plain, gen_row.plain
+        # the spark scales to the REP's series (peak 69 reaches the top dot
+        # row); the N× aggregate scale would flatten it onto the baseline
+        from app import _BRAILLE_BITS
+
+        dot_rows = [
+            row
+            for ch in gen_row.plain
+            if 0x2800 < ord(ch) <= 0x28FF
+            for (_col, row), bit in _BRAILLE_BITS.items()
+            if (ord(ch) - 0x2800) & bit
+        ]
+        # spread too: the rep series (20..69) spans dot rows; a single
+        # self-scaled aggregate sample would be one flat row
+        assert dot_rows and min(dot_rows) == 0 and max(dot_rows) >= 1, gen_row.plain
+
+
+async def test_model_series_sorted_by_name(tmp_path, monkeypatch):
+    """AC7: legend and series order is sorted by model name regardless of
+    the unit encounter order."""
+    from app import ServingBox
+
+    hist = [10.0 + i for i in range(10)]
+    specs = [("model-b", 300.0, 10.0), ("model-a", 200.0, 20.0)]
+    async with _served_models_app(tmp_path, monkeypatch, specs, [hist, hist]) as app:
+        serving = app.query_one("#serving", ServingBox)
+        assert [m["name"] for m in serving._models] == ["model-a", "model-b"]
+        title = serving.render().split("\n")[0].plain
+        assert title.index("model-a") < title.index("model-b"), title
+
+
+async def test_model_hue_slots_pruned_on_exit(tmp_path, monkeypatch):
+    """AC8: a model that disappears releases its hue slot (and its gen
+    history, mirroring the existing history pruning)."""
+    hist = [10.0 + i for i in range(10)]
+    specs = [("model-a", 300.0, 10.0), ("model-b", 200.0, 20.0)]
+    async with _served_models_app(tmp_path, monkeypatch, specs, [hist, hist]) as app:
+        assert len(app._model_hue) == 2
+        # the live fleet stops hosting models: ONE flaky poll must NOT
+        # repaint a live model — the slot survives a 3-poll grace window
+        app.cluster = _cluster([_unit("head", hosted=False)])
+        app._update_ui()
+        assert len(app._model_hue) == 2, app._model_hue
+        app._update_ui()
+        app._update_ui()
+        assert app._model_hue == {}, app._model_hue
+        assert not [k for k in app.history if k.startswith("gen-")]
+
+
+def test_fmt_axis_boundary_band():
+    """AC9: the 999.5-999.99 band rounds into the K scale, like 1024."""
+    from app import _fmt_axis
+
+    assert _fmt_axis(0) == "0"
+    assert _fmt_axis(650) == "650"
+    assert _fmt_axis(999) == "999"
+    assert _fmt_axis(999.5) == "1K"
+    assert _fmt_axis(1024) == "1K"
+    assert _fmt_axis(1349) == "1.3K"
+    assert _fmt_axis(999_999) == "1M"
+    assert _fmt_axis(1_500_000) == "1.5M"
+
+
+async def test_nine_models_exhaust_hue_cycle_without_crash(tmp_path, monkeypatch):
+    """AC13: more live models than hues — the cycle repeats
+    deterministically (slot = len(slots) - len(SERIES_HUES) for the 9th) and
+    the pane renders."""
+    from app import ServingBox
+    from themes import series_hue
+
+    specs = [(f"model-{i}", 100.0 * (9 - i), 10.0 + i) for i in range(9)]
+    hists = [[10.0 + i] * 6 for i in range(9)]
+    async with _served_models_app(tmp_path, monkeypatch, specs, hists) as app:
+        serving = app.query_one("#serving", ServingBox)
+        assert len(serving._models) == 9
+        pal = serving.render()  # must not raise
+        assert pal is not None
+        slot_hues = [series_hue(i, _palette_of(app)) for i in range(9)]
+        colors = [m["color"] for m in serving._models]
+        assert colors[:8] == slot_hues[:8]
+        assert colors[8] == slot_hues[0]  # 9th reuses slot 0 (len(slots)-8)
+        assert colors[8] == colors[0]
+
+
+def _palette_of(app):
+    from app import _palette_for
+
+    return _palette_for(app)
+
+
+def test_chart_and_spark_helpers_tolerate_non_finite_samples():
+    """AC14: NaN/Inf samples are dropped at the door — the helpers are
+    total over their input (no NaN scale, no divmod-on-NaN crash)."""
+    from app import _lines_chart_lines, _spark_duo_lines
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    series = [("m", "#8A7CFF", [float("nan"), 5.0, float("inf"), 0.0])]
+    rows = _lines_chart_lines(series, 4, 20, pal)
+    assert len(rows) == 4 and all(t.cell_len == 20 for t in rows)
+    assert all("nan" not in t.style for t in rows), [t.style for t in rows]
+    duo = _spark_duo_lines([float("nan"), 5.0, float("inf")], "#8A7CFF", 12, pal)
+    assert len(duo) == 2 and all(t.cell_len == 12 for t in duo)
+    all_nan = _spark_duo_lines([float("nan")], "#8A7CFF", 8, pal)
+    assert len(all_nan) == 2 and all(t.cell_len == 8 for t in all_nan)
+    assert all(not c for t in all_nan for c in t.plain if c == "█")
+
+
+def test_spark_duo_boundary_inputs():
+    """AC11: empty / single-sample / all-equal / all-zero / width-1 inputs
+    all render exactly 2 rows x width without crashing."""
+    from app import _spark_duo_lines
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    for data, w in (([], 10), ([5.0], 10), ([5.0, 5.0, 5.0], 10), ([1.0], 1), ([0.0, 0.0], 12)):
+        rows = _spark_duo_lines(list(data), "#8A7CFF", w, pal)
+        assert len(rows) == 2, (data, w)
+        assert all(t.cell_len == w for t in rows), (data, w)

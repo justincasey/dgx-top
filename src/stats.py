@@ -40,6 +40,8 @@ class SparkUnitStats:
     is_worker: bool = False
     model_hosted: bool = False
     model_name: str = ""
+    model_source: str = "vllm"  # "vllm" or "sglang" (engine family)
+    model_metrics: bool = True  # False = load-only endpoint (no token counters)
     kv_cache_pct: float = 0.0  # 0-100, from vllm:kv_cache_usage_perc × 100
     kv_total_blocks: int = 0  # from cache_config_info num_gpu_blocks (minus null block)
     kv_block_size: int = 0  # tokens per block

@@ -266,3 +266,47 @@ def build_palette(theme: Theme, quiet: bool = False) -> Palette:
         .hex,
         quiet=quiet,
     )
+
+
+SERIES_HUES: tuple[str, ...] = (
+    "#8A7CFF",  # violet (the reference chart's primary)
+    "#F06AC0",  # magenta-pink
+    "#4FD0E8",  # cyan
+    "#3FD07F",  # green
+    "#E8A83B",  # amber
+    "#4AA3FF",  # blue
+    "#F0709A",  # rose
+    "#2BB5A8",  # teal
+)
+"""Truecolor identity ramp for served-model series (chart lines, gen/req/ttft
+rows, inline sparks, title legend). Deliberately NOT the semantic palette
+roles: ok/warn stay reserved for state escalation, and the 6-role rotation
+could not give 7+ models distinct hues. Eight maximally-distinct
+mid-luminance hexes, cycled by series index."""
+
+_LIGHT_ANCHOR = "#14161F"
+"""Dark anchor the series hues darken toward on light-background palettes."""
+
+
+def series_hue(index: int, pal: Palette) -> str:
+    """Identity hue of the ``index``-th served-model series.
+
+    ``quiet`` collapses identity to the foreground exactly like the other
+    identity roles (colour-as-identity is opt-out app-wide); light
+    backgrounds get a contrast darkening so a mid-luminance hue never
+    dissolves into the canvas."""
+    hue = SERIES_HUES[index % len(SERIES_HUES)]
+    if pal.quiet:
+        return pal.fg
+    red, green, blue = Color.parse(pal.bg).rgb[:3]
+    if 0.2126 * red + 0.7152 * green + 0.0722 * blue > 127.5:
+        return Color.parse(hue).blend(Color.parse(_LIGHT_ANCHOR), 0.32).hex
+    return hue
+
+
+def blend_toward(color: str, target: str, t: float) -> str:
+    """Hex of ``color`` moved ``t`` of the way to ``target``.
+
+    The truecolor stand-in for alpha compositing: a translucent fill drawn
+    over ``target`` reads as ``blend_toward(hue, target, 1 - alpha)``."""
+    return Color.parse(color).blend(Color.parse(target), t).hex
