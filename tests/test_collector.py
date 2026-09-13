@@ -4,17 +4,17 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import collector
-from stats import SparkUnitStats
+from stats import ClusterStats, SparkUnitStats
 
 
 class VllmMetricsTests(unittest.TestCase):
     def test_generation_tokens_counter_is_parsed(self):
-        stats = collector._parse_vllm_metrics('vllm:generation_tokens{model_name="a"} 123.0\n')
+        stats = collector._parse_engine_metrics('vllm:generation_tokens{model_name="a"} 123.0\n')
 
         self.assertEqual(stats.generation_tokens_total, 123.0)
 
     def test_generation_tokens_counter_sums_multiple_series(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:generation_tokens{model_name="a"} 100.0\n'
             'vllm:generation_tokens{model_name="b"} 23.0\n'
         )
@@ -22,7 +22,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.generation_tokens_total, 123.0)
 
     def test_request_generation_tokens_sum_is_fallback(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:request_generation_tokens_sum{model_name="a"} 456.0\n'
         )
 
@@ -30,7 +30,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertTrue(stats.model_hosted)
 
     def test_zero_request_generation_tokens_fallback_marks_model_hosted(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:request_generation_tokens_sum{model_name="a"} 0.0\n'
         )
 
@@ -38,7 +38,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertTrue(stats.model_hosted)
 
     def test_generation_tokens_counter_is_preferred_over_fallback(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:generation_tokens{model_name="a"} 123.0\n'
             'vllm:request_generation_tokens_sum{model_name="a"} 456.0\n'
         )
@@ -46,7 +46,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.generation_tokens_total, 123.0)
 
     def test_zero_generation_tokens_counter_is_preferred_over_fallback(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:generation_tokens{model_name="a"} 0.0\n'
             'vllm:request_generation_tokens_sum{model_name="a"} 456.0\n'
         )
@@ -54,22 +54,22 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.generation_tokens_total, 0.0)
 
     def test_model_hosted_set_by_vllm_metrics_parser(self):
-        stats = collector._parse_vllm_metrics('vllm:generation_tokens{model_name="a"} 123.0\n')
+        stats = collector._parse_engine_metrics('vllm:generation_tokens{model_name="a"} 123.0\n')
 
         self.assertTrue(stats.model_hosted)
 
     def test_model_hosted_false_when_metrics_empty(self):
-        stats = collector._parse_vllm_metrics("")
+        stats = collector._parse_engine_metrics("")
 
         self.assertFalse(stats.model_hosted)
 
     def test_kv_cache_usage_perc_is_parsed(self):
-        stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} 0.45\n')
+        stats = collector._parse_engine_metrics('vllm:kv_cache_usage_perc{model_name="a"} 0.45\n')
 
         self.assertAlmostEqual(stats.kv_cache_pct, 45.0)
 
     def test_kv_cache_config_parses_blocks_and_block_size(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:cache_config_info{block_size="16",num_gpu_blocks="1234"} 1.0\n'
         )
 
@@ -78,7 +78,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.kv_total_tokens, 1234 * 16)
 
     def test_kv_cache_derives_block_and_token_counts_from_usage(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:cache_config_info{block_size="16",num_gpu_blocks="10000"} 1.0\n'
             'vllm:kv_cache_usage_perc{model_name="a"} 0.32\n'
         )
@@ -91,7 +91,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.kv_cache_used_tokens, int(10000 * 16 * 0.32))
 
     def test_kv_cache_no_token_derivation_without_block_size(self):
-        stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} 0.5\n')
+        stats = collector._parse_engine_metrics('vllm:kv_cache_usage_perc{model_name="a"} 0.5\n')
 
         self.assertAlmostEqual(stats.kv_cache_pct, 50.0)
         self.assertEqual(stats.kv_total_tokens, 0)
@@ -100,7 +100,7 @@ class VllmMetricsTests(unittest.TestCase):
     def test_kv_cache_size_tokens_is_authoritative(self):
         # MLA packs several tokens per block: prefer kv_cache_size_tokens over
         # num_gpu_blocks * block_size.
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:cache_config_info{block_size="4",num_gpu_blocks="16677",'
             'kv_cache_size_tokens="1489151"} 1.0\n'
             'vllm:kv_cache_usage_perc{model_name="a"} 0.5\n'
@@ -110,7 +110,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.kv_cache_used_tokens, int(1489151 * 0.5))
 
     def test_prefix_cache_counters_are_parsed(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:prefix_cache_hits_total{model_name="a"} 700.0\n'
             'vllm:prefix_cache_queries_total{model_name="a"} 1000.0\n'
         )
@@ -119,7 +119,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.prefix_queries_total, 1000.0)
 
     def test_prefix_created_series_do_not_pollute_counters(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:prefix_cache_hits_created{model_name="a"} 1.7e9\n'
             'vllm:external_prefix_cache_hits_total{model_name="a"} 5.0\n'
         )
@@ -173,7 +173,7 @@ class VllmMetricsTests(unittest.TestCase):
             'vllm:time_to_first_token_seconds_count{model_name="a"} 100\n'
         )
 
-        stats = collector._parse_vllm_metrics(text)
+        stats = collector._parse_engine_metrics(text)
 
         # p50 lands in the fast population (~1s); p95 tracks the slow tail.
         self.assertAlmostEqual(stats.ttft_p50_ms, 1000.0, delta=100.0)
@@ -181,7 +181,7 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertGreater(stats.ttft_p95_ms, stats.ttft_p50_ms)
 
     def test_model_hosted_true_when_kv_blocks_exist(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:cache_config_info{block_size="16",num_gpu_blocks="5000"} 1.0\n'
         )
 
@@ -197,35 +197,51 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
     """
 
     def test_nan_kv_usage_perc_is_ignored(self):
-        stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} NaN\n')
+        stats = collector._parse_engine_metrics('vllm:kv_cache_usage_perc{model_name="a"} NaN\n')
 
-        self.assertEqual(stats.kv_cache_pct, 0.0)
+        # Dropped, and left as the no-reading sentinel: an unusable sample is
+        # not the same reading as an empty pool.
+        self.assertEqual(stats.kv_cache_pct, -1.0)
 
     def test_overflowing_kv_usage_is_ignored(self):
         # 1e308 * 100 overflows to inf even though the raw value is finite.
-        stats = collector._parse_vllm_metrics('vllm:kv_cache_usage_perc{model_name="a"} 1e308\n')
+        stats = collector._parse_engine_metrics('vllm:kv_cache_usage_perc{model_name="a"} 1e308\n')
 
-        self.assertEqual(stats.kv_cache_pct, 0.0)
+        self.assertEqual(stats.kv_cache_pct, -1.0)
 
     def test_nan_kv_usage_does_not_derive_block_counts(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:cache_config_info{block_size="16",num_gpu_blocks="10000"} 1.0\n'
             'vllm:kv_cache_usage_perc{model_name="a"} NaN\n'
         )
 
-        self.assertEqual(stats.kv_cache_pct, 0.0)
+        self.assertEqual(stats.kv_cache_pct, -1.0)
         self.assertEqual(stats.kv_cache_free_blocks, 0)
         self.assertEqual(stats.kv_cache_used_tokens, 0)
         self.assertEqual(stats.kv_total_tokens, 10000 * 16)
 
+    def test_out_of_band_kv_usage_does_not_derive_block_counts(self):
+        # A finite but out-of-contract sample must not leave the derived
+        # figures claiming a known pool: free = total × (1 - usage) would read
+        # as "every block free" — a confident empty pool — if the rejected
+        # value leaked past the band.
+        stats = collector._parse_engine_metrics(
+            'vllm:cache_config_info{block_size="16",num_gpu_blocks="10000"} 1.0\n'
+            'vllm:kv_cache_usage_perc{model_name="a"} 42\n'
+        )
+
+        self.assertEqual(stats.kv_cache_pct, -1.0)
+        self.assertEqual(stats.kv_cache_free_blocks, 0)
+        self.assertEqual(stats.kv_cache_used_tokens, 0)
+
     def test_inf_generation_tokens_are_ignored(self):
-        stats = collector._parse_vllm_metrics('vllm:generation_tokens{model_name="a"} +Inf\n')
+        stats = collector._parse_engine_metrics('vllm:generation_tokens{model_name="a"} +Inf\n')
 
         self.assertEqual(stats.generation_tokens_total, 0.0)
         self.assertFalse(stats.model_hosted)
 
     def test_finite_generation_tokens_survive_a_bad_series(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:generation_tokens{model_name="a"} NaN\n'
             'vllm:generation_tokens{model_name="b"} 100.0\n'
         )
@@ -234,7 +250,7 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertTrue(stats.model_hosted)
 
     def test_inf_requests_running_does_not_break_parse(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:num_requests_running{model_name="a"} +Inf\n'
             'vllm:generation_tokens{model_name="b"} 5.0\n'
         )
@@ -243,7 +259,7 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertTrue(stats.model_hosted)
 
     def test_inf_requests_waiting_does_not_break_parse(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:num_requests_waiting{model_name="a"} +Inf\n'
             'vllm:generation_tokens{model_name="b"} 5.0\n'
         )
@@ -252,7 +268,7 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertTrue(stats.model_hosted)
 
     def test_inf_request_generation_tokens_sum_is_ignored(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:request_generation_tokens_sum{model_name="a"} +Inf\n'
         )
 
@@ -260,7 +276,7 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertFalse(stats.model_hosted)
 
     def test_nan_prefix_counters_are_ignored(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:prefix_cache_hits_total{model_name="a"} NaN\n'
             'vllm:prefix_cache_queries_total{model_name="a"} NaN\n'
         )
@@ -269,7 +285,7 @@ class NonFiniteVllmMetricsTests(unittest.TestCase):
         self.assertEqual(stats.prefix_queries_total, 0.0)
 
     def test_nan_prompt_tokens_are_ignored(self):
-        stats = collector._parse_vllm_metrics('vllm:prompt_tokens{model_name="a"} NaN\n')
+        stats = collector._parse_engine_metrics('vllm:prompt_tokens{model_name="a"} NaN\n')
 
         self.assertEqual(stats.prompt_tokens_total, 0.0)
 
@@ -282,14 +298,14 @@ class LabelConflationTests(unittest.TestCase):
     def test_created_pseudo_counter_is_not_summed(self):
         # *_created values are Unix epoch timestamps; summing one into the
         # counter poisons the throughput delta with ~1/s wall-clock drift.
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:generation_tokens_total{engine="0",model_name="a"} 264348.0\n'
             'vllm:generation_tokens_created{engine="0",model_name="a"} 1788733924.32\n'
         )
         self.assertEqual(stats.generation_tokens_total, 264348.0)
 
     def test_prompt_token_variant_series_are_excluded(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:prompt_tokens_total{model_name="a"} 3.6e+07\n'
             'vllm:prompt_tokens_created{model_name="a"} 1.7887e+09\n'
             'vllm:prompt_tokens_by_source_total{model_name="a",source="local_compute"} 2.5e+06\n'
@@ -301,7 +317,7 @@ class LabelConflationTests(unittest.TestCase):
     def test_waiting_by_reason_does_not_override_the_gauge(self):
         # The old prefix match let the last by_reason line overwrite the
         # real waiting count.
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:num_requests_waiting{model_name="a"} 5.0\n'
             'vllm:num_requests_waiting_by_reason{model_name="a",reason="capacity"} 3.0\n'
             'vllm:num_requests_waiting_by_reason{model_name="a",reason="deferred"} 0.0\n'
@@ -309,7 +325,7 @@ class LabelConflationTests(unittest.TestCase):
         self.assertEqual(stats.requests_waiting, 5)
 
     def test_multi_engine_label_sets_are_summed(self):
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:num_requests_running{engine="0",model_name="a"} 2.0\n'
             'vllm:num_requests_running{engine="1",model_name="a"} 3.0\n'
             'vllm:generation_tokens_total{engine="0",model_name="a"} 100.0\n'
@@ -321,7 +337,7 @@ class LabelConflationTests(unittest.TestCase):
     def test_multi_engine_histograms_accumulate(self):
         # Engine 0 finishes ≤0.5s, engine 1 ≤1s: the merged p50 sits at the
         # boundary (0.5s); last-engine-wins would report 1.0s.
-        stats = collector._parse_vllm_metrics(
+        stats = collector._parse_engine_metrics(
             'vllm:time_to_first_token_seconds_bucket{engine="0",le="0.5"} 5\n'
             'vllm:time_to_first_token_seconds_bucket{engine="0",le="+Inf"} 5\n'
             'vllm:time_to_first_token_seconds_count{engine="0"} 5\n'
@@ -349,104 +365,712 @@ class ShortModelNameTests(unittest.TestCase):
         self.assertEqual(collector._short_model_name("qwen3.8-flash-next"), "qwen3.8-flash-next")
 
 
-class SglangEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_get_load_fallback_marks_sglang_source(self):
-        units = {
-            9: {
-                "label": "spark-sg",
-                "ssh_target": "tester@spark.test",
-                "vllm_url": "http://spark.test:8888",
-                "worker": False,
-            }
+def _patch_http(routes: dict[str, object]):
+    """Patch ``collector.httpx.AsyncClient`` with a client that serves canned
+    JSON keyed by request path; a path not in ``routes`` raises, as a real
+    404 does. Returns (patcher, requested_urls)."""
+    requested: list[str] = []
+
+    class FakeResp:
+        def __init__(self, payload: object):
+            self._payload = payload
+
+        def raise_for_status(self):
+            if isinstance(self._payload, Exception):
+                raise self._payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url: str):
+            requested.append(url)
+            for path, payload in routes.items():
+                if url.endswith(path):
+                    return FakeResp(payload)
+            return FakeResp(RuntimeError(f"404 Not Found for url '{url}'"))
+
+    return patch.object(collector.httpx, "AsyncClient", FakeClient), requested
+
+
+class SglangMetricsTests(unittest.TestCase):
+    """SGLang's ``--enable-metrics`` exposition is NOT the vLLM shape under a
+    different namespace: only the token counters and the TTFT histogram
+    match. Every semantic is read through the engine's own profile."""
+
+    LABELS = (
+        '{model_name="qwen3.6-27b",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"}'
+    )
+
+    def _payload(self) -> str:
+        lbl = self.LABELS
+        return (
+            "# HELP sglang:num_running_reqs The number of running requests.\n"
+            "# TYPE sglang:num_running_reqs gauge\n"
+            f"sglang:num_running_reqs{lbl} 2.0\n"
+            f"sglang:num_queue_reqs{lbl} 1.0\n"
+            f"sglang:token_usage{lbl} 0.45\n"
+            f"sglang:num_used_tokens{lbl} 450000\n"
+            f"sglang:max_total_num_tokens{lbl} 1000000\n"
+            f"sglang:cache_hit_rate{lbl} 0.62\n"
+            f"sglang:prompt_tokens_total{lbl} 4000\n"
+            f"sglang:generation_tokens_total{lbl} 9000\n"
+            f'sglang:time_to_first_token_seconds_bucket{lbl[:-1]},le="1.0"}} 10\n'
+            f'sglang:time_to_first_token_seconds_bucket{lbl[:-1]},le="+Inf"}} 10\n'
+            f"sglang:time_to_first_token_seconds_count{lbl} 10\n"
+            f'sglang:inter_token_latency_seconds_bucket{lbl[:-1]},le="0.5"}} 10\n'
+            f'sglang:inter_token_latency_seconds_bucket{lbl[:-1]},le="+Inf"}} 10\n'
+            f"sglang:inter_token_latency_seconds_count{lbl} 10\n"
+        )
+
+    def test_sglang_payload_populates_every_semantic(self):
+        s = collector._parse_engine_metrics(self._payload())
+
+        self.assertEqual(s.model_source, "sglang")
+        self.assertTrue(s.model_hosted)
+        self.assertEqual((s.requests_running, s.requests_waiting), (2, 1))
+        self.assertAlmostEqual(s.kv_cache_pct, 45.0)
+        self.assertEqual(s.kv_total_tokens, 1_000_000)
+        self.assertEqual(s.kv_cache_used_tokens, 450_000)
+        self.assertAlmostEqual(s.kv_prefix_hit_rate, 62.0)
+        self.assertAlmostEqual(s.itl_p50_ms, 250.0)
+        self.assertAlmostEqual(s.ttft_p50_ms, 500.0)
+        self.assertEqual(s.generation_tokens_total, 9000.0)
+        self.assertEqual(s.prompt_tokens_total, 4000.0)
+        # SGLang exposes no block concept at all.
+        self.assertEqual(s.kv_total_blocks, 0)
+        # A metrics-enabled SGLang poll has token counters to rate: this flag
+        # is what tells its row apart from a load-only node's, and nothing
+        # else pins it.
+        self.assertTrue(s.model_metrics)
+
+    def test_sglang_out_of_range_usage_gauge_is_rejected_not_scaled(self):
+        # token_usage is a 0-1 fraction and the ×100 happens in the collector,
+        # so a hostile or mis-scaled sample must leave the no-reading sentinel
+        # rather than paint a 4200% (or -50%) KV meter and seed the Sparkline
+        # history with it.
+        payload = self._payload()
+        line = f"sglang:token_usage{self.LABELS} 0.45\n"
+        for value in ("42", "-0.5", "1.0000001", "NaN", "+Inf", "garbage"):
+            s = collector._parse_engine_metrics(
+                payload.replace(line, f"sglang:token_usage{self.LABELS} {value}\n")
+            )
+            self.assertEqual(s.kv_cache_pct, -1.0, value)
+            # The used count comes from its own gauge, never from the fraction.
+            self.assertEqual(s.kv_cache_used_tokens, 450_000, value)
+        for value, expected in (("0.0", 0.0), ("1.0", 100.0)):
+            s = collector._parse_engine_metrics(
+                payload.replace(line, f"sglang:token_usage{self.LABELS} {value}\n")
+            )
+            self.assertAlmostEqual(s.kv_cache_pct, expected, msg=value)
+
+    def test_sglang_prefix_rate_is_a_gauge_not_a_counter_pair(self):
+        s = collector._parse_engine_metrics(self._payload())
+
+        self.assertEqual(s.prefix_hits_total, 0.0)
+        self.assertEqual(s.prefix_queries_total, 0.0)
+        # The counter-only delta machinery must leave the gauge value alone.
+        collector._prev_prefix.pop(77, None)
+        collector._update_prefix_hit_rate(77, s)
+        self.assertAlmostEqual(s.kv_prefix_hit_rate, 62.0)
+
+    def test_sglang_out_of_range_prefix_gauge_leaves_the_sentinel(self):
+        # cache_hit_rate is a 0-1 fraction. A hostile/never-valid sample must
+        # not become "-200%" in the UI.
+        for value in ("-2.0", "3.5", "NaN", "+Inf", "garbage"):
+            s = collector._parse_engine_metrics(
+                f'sglang:cache_hit_rate{{model_name="m"}} {value}\n'
+            )
+            self.assertEqual(s.kv_prefix_hit_rate, -1.0, value)
+        s = collector._parse_engine_metrics('sglang:cache_hit_rate{model_name="m"} 1.0\n')
+        self.assertEqual(s.kv_prefix_hit_rate, 100.0)
+
+    def test_sglang_poisoned_gauge_sums_do_not_raise(self):
+        # Two 1e308 gauges sum to inf, and int(inf) raises — which would
+        # discard the node's whole metrics parse. Overflow degrades to 0.
+        s = collector._parse_engine_metrics(
+            'sglang:token_usage{a="1"} 0.5\n'
+            'sglang:max_total_num_tokens{a="1"} 1e308\n'
+            'sglang:max_total_num_tokens{a="2"} 1e308\n'
+        )
+        self.assertEqual(s.kv_total_tokens, 0)
+        self.assertAlmostEqual(s.kv_cache_pct, 50.0)
+
+        s = collector._parse_engine_metrics(
+            'sglang:token_usage{a="1"} 0.5\n'
+            'sglang:max_total_num_tokens{a="1"} 1000\n'
+            'sglang:num_used_tokens{a="1"} 1e308\n'
+            'sglang:num_used_tokens{a="2"} 1e308\n'
+        )
+        self.assertEqual(s.kv_cache_used_tokens, 0)
+        self.assertEqual(s.kv_total_tokens, 1000)
+
+    def test_sglang_token_usage_pairs_by_label_not_line_order(self):
+        # The two families are listed in opposite rank order: pairing by line
+        # order would weight each usage by the other rank's capacity.
+        s = collector._parse_engine_metrics(
+            'sglang:max_total_num_tokens{model_name="m",tp_rank="0",dp_rank="1"} 3000\n'
+            'sglang:max_total_num_tokens{model_name="m",tp_rank="0",dp_rank="0"} 1000\n'
+            'sglang:token_usage{model_name="m",tp_rank="0",dp_rank="0"} 0.2\n'
+            'sglang:token_usage{model_name="m",tp_rank="0",dp_rank="1"} 0.6\n'
+        )
+
+        self.assertEqual(s.kv_total_tokens, 4000)
+        self.assertAlmostEqual(s.kv_cache_pct, 50.0)  # (0.2·1000 + 0.6·3000)/4000
+
+    def test_sglang_inter_token_latency_accepts_both_generations_of_name(self):
+        modern = collector._parse_engine_metrics(
+            'sglang:inter_token_latency_seconds_bucket{le="0.5"} 10\n'
+            'sglang:inter_token_latency_seconds_bucket{le="+Inf"} 10\n'
+            "sglang:inter_token_latency_seconds_count 10\n"
+        )
+        legacy = collector._parse_engine_metrics(
+            'sglang:time_per_output_token_seconds_bucket{le="0.5"} 10\n'
+            'sglang:time_per_output_token_seconds_bucket{le="+Inf"} 10\n'
+            "sglang:time_per_output_token_seconds_count 10\n"
+        )
+
+        self.assertAlmostEqual(modern.itl_p50_ms, 250.0)
+        self.assertAlmostEqual(legacy.itl_p50_ms, 250.0)
+
+        # A transitional SGLang may expose BOTH names. The modern one leads
+        # the ladder, so it must win: taking the last match or reversing the
+        # order would report the legacy value here (250 vs 750 ms).
+        both = collector._parse_engine_metrics(
+            'sglang:inter_token_latency_seconds_bucket{le="0.5"} 10\n'
+            'sglang:inter_token_latency_seconds_bucket{le="+Inf"} 10\n'
+            "sglang:inter_token_latency_seconds_count 10\n"
+            'sglang:time_per_output_token_seconds_bucket{le="1.5"} 10\n'
+            'sglang:time_per_output_token_seconds_bucket{le="+Inf"} 10\n'
+            "sglang:time_per_output_token_seconds_count 10\n"
+        )
+        self.assertAlmostEqual(both.itl_p50_ms, 250.0)
+
+    def test_sglang_dead_metric_names_are_not_read_by_the_vllm_profile(self):
+        # The false premise was "one parser, both namespaces". These are
+        # SGLang's names; a vLLM payload must never be read through them, and
+        # vice versa (their series would be silently dead, not shared).
+        s = collector._parse_engine_metrics(
+            "vllm:num_running_reqs 5\n"
+            "vllm:num_queue_reqs 3\n"
+            "vllm:token_usage 0.5\n"
+            "vllm:max_total_num_tokens 100\n"
+            "vllm:cache_hit_rate 0.9\n"
+            # Positive control: the parse DID read this payload — otherwise
+            # the sentinel/zero assertions below would also pass on an empty
+            # stats object and would pin nothing.
+            "vllm:generation_tokens_total 9000\n"
+        )
+        self.assertEqual(s.generation_tokens_total, 9000.0)
+        self.assertEqual(s.requests_running, 0)
+        self.assertEqual(s.requests_waiting, 0)
+        # No vLLM usage series in the payload: unknown, so the sentinel (not
+        # the dataclass default, which would read as a 0% pool).
+        self.assertEqual(s.kv_cache_pct, -1.0)
+        self.assertEqual(s.kv_total_tokens, 0)
+        self.assertEqual(s.kv_prefix_hit_rate, -1.0)
+
+    def test_sglang_capacity_is_summed_across_dp_ranks(self):
+        s = collector._parse_engine_metrics(
+            'sglang:max_total_num_tokens{model_name="m",dp_rank="0"} 1000\n'
+            'sglang:max_total_num_tokens{model_name="m",dp_rank="1"} 3000\n'
+        )
+        self.assertEqual(s.kv_total_tokens, 4000)
+
+    def test_sglang_capacity_collapses_ranks_of_one_replica(self):
+        # max_total_num_tokens is published by EVERY rank (emit_metrics_constants
+        # runs in each rank's __init__), and the ranks of a replica share one
+        # pool — summing them would report TP/PP × the real capacity while the
+        # stats-rank-only usage gauges stay at 1×.
+        s = collector._parse_engine_metrics(
+            'sglang:max_total_num_tokens{model_name="m",tp_rank="0",pp_rank="0"} 3200\n'
+            'sglang:max_total_num_tokens{model_name="m",tp_rank="1",pp_rank="0"} 3200\n'
+            'sglang:num_used_tokens{model_name="m",tp_rank="0",pp_rank="0"} 1600\n'
+            'sglang:token_usage{model_name="m",tp_rank="0",pp_rank="0"} 0.5\n'
+        )
+
+        self.assertEqual(s.kv_total_tokens, 3200)
+        self.assertEqual(s.kv_cache_used_tokens, 1600)
+        self.assertAlmostEqual(s.kv_cache_pct, 50.0)
+
+        # …but each DP replica owns its own pool: two replicas × two ranks
+        # still sum to two pools, not four.
+        s = collector._parse_engine_metrics(
+            "".join(
+                f'sglang:max_total_num_tokens{{model_name="m",tp_rank="{t}",dp_rank="{d}"}} 3200\n'
+                for d in (0, 1)
+                for t in (0, 1)
+            )
+            + "".join(
+                f'sglang:num_used_tokens{{model_name="m",tp_rank="0",dp_rank="{d}"}} 1600\n'
+                for d in (0, 1)
+            )
+            + "".join(
+                f'sglang:token_usage{{model_name="m",tp_rank="0",dp_rank="{d}"}} 0.5\n'
+                for d in (0, 1)
+            )
+        )
+
+        self.assertEqual(s.kv_total_tokens, 6400)
+        self.assertEqual(s.kv_cache_used_tokens, 3200)
+        self.assertAlmostEqual(s.kv_cache_pct, 50.0)
+
+    def test_sglang_used_tokens_survive_a_missing_usage_gauge(self):
+        # num_used_tokens is the authoritative figure; it must not be gated on
+        # token_usage being present in the same exposition.
+        s = collector._parse_engine_metrics(
+            'sglang:max_total_num_tokens{model_name="m"} 1000\n'
+            'sglang:num_used_tokens{model_name="m"} 400\n'
+        )
+
+        self.assertEqual(s.kv_cache_used_tokens, 400)
+
+    def test_hostile_vllm_cache_config_degrades_not_raises(self):
+        # A 309-digit integer literal survives int() and then raises
+        # OverflowError from float(); the parse must stay total (HEAD raised
+        # here).
+        huge = "1" + "0" * 308
+        s = collector._parse_engine_metrics(
+            f'vllm:cache_config_info{{engine="0",num_gpu_blocks="{huge}",block_size="16"}} 1\n'
+            'vllm:kv_cache_usage_perc{engine="0"} 1e308\n'
+            'vllm:kv_cache_usage_perc{engine="1"} -1e308\n'
+        )
+        self.assertEqual((s.kv_total_blocks, s.kv_total_tokens), (0, 0))
+        # Both samples are outside the 0-1 contract: pairwise they would
+        # average to a confident 0% pool, so they are rejected sample by
+        # sample and the no-reading sentinel stands.
+        self.assertEqual(s.kv_cache_pct, -1.0)
+
+
+class EngineLoadTests(unittest.IsolatedAsyncioTestCase):
+    """SGLang's load API is the only signal source when ``--enable-metrics``
+    is off, so both its routes and every malformed-field path matter."""
+
+    async def test_v1_loads_sums_dp_ranks_and_carries_kv(self):
+        envelope = {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "version": "0.5.0",
+            "accelerator": "cuda",
+            "num_accelerators": 2,
+            "loads": [
+                {
+                    "dp_rank": 0,
+                    "num_running_reqs": 3,
+                    "num_waiting_reqs": 2,
+                    "num_used_tokens": 100,
+                    "max_total_num_tokens": 1000,
+                    "token_usage": 0.1,
+                    "cache_hit_rate": 0.5,
+                },
+                {
+                    "dp_rank": 1,
+                    "num_running_reqs": 1,
+                    "num_waiting_reqs": 0,
+                    "num_used_tokens": 300,
+                    "max_total_num_tokens": 1000,
+                    "token_usage": 0.3,
+                    "cache_hit_rate": 0.7,
+                },
+            ],
         }
+        patcher, requested = _patch_http({"/v1/loads": envelope})
+        with patcher:
+            load = await collector.fetch_engine_load("http://spark.test:8888")
+
+        self.assertEqual(requested, ["http://spark.test:8888/v1/loads"])
+        self.assertEqual((load.running, load.waiting), (4, 2))
+        self.assertEqual((load.used_tokens, load.total_tokens), (400, 2000))
+        self.assertAlmostEqual(load.kv_pct, 20.0)
+        # The payload's cache_hit_rate is deliberately not carried: the same
+        # producer writes it only under current_scheduler_metrics_enabled, so
+        # on the metrics-disabled server this route exists for it is a
+        # constant 0 — a schema field, not a reading. AC1 pins that at the
+        # poll_unit seam, where it is observable.
+
+    async def test_v1_loads_capacity_weights_the_stated_gauge(self):
+        # Each rank states the fill of its OWN pool, so the aggregate is the
+        # capacity-weighted mean of those gauges: a small pool must not weigh
+        # as much as a large one, and a stated gauge is not recomputed from
+        # the token counts (they answer a different question — what is
+        # resident now, not how full the pool is).
+        envelope = {
+            "loads": [
+                {
+                    "num_running_reqs": 2,
+                    "num_waiting_reqs": 1,
+                    "num_used_tokens": 100,
+                    "max_total_num_tokens": 1000,
+                    "token_usage": 0.1,
+                },
+                {
+                    "num_running_reqs": 1,
+                    "num_waiting_reqs": 0,
+                    "num_used_tokens": 200,
+                    "max_total_num_tokens": 3000,
+                    "token_usage": 0.2,
+                },
+            ]
+        }
+        patcher, _ = _patch_http({"/v1/loads": envelope})
+        with patcher:
+            load = await collector.fetch_engine_load("http://spark.test:8888")
+
+        self.assertEqual((load.running, load.waiting), (3, 1))
+        self.assertEqual((load.used_tokens, load.total_tokens), (300, 4000))
+        self.assertAlmostEqual(load.kv_pct, 17.5)  # (0.1*1000 + 0.2*3000) / 4000
+
+    async def test_get_load_recovers_running_by_subtraction(self):
+        # num_reqs is num_running_reqs + num_waiting_reqs — treating it as
+        # running inflates the count by every waiting request.
+        legacy = [
+            {"dp_rank": 0, "num_reqs": 5, "num_waiting_reqs": 2},
+            {"dp_rank": 1, "num_reqs": 9, "num_waiting_reqs": 4},
+        ]
+        patcher, requested = _patch_http({"/get_load": legacy})
+        with patcher:
+            load = await collector.fetch_engine_load("http://spark.test:8888")
+
+        self.assertEqual(
+            requested, ["http://spark.test:8888/v1/loads", "http://spark.test:8888/get_load"]
+        )
+        self.assertEqual((load.running, load.waiting), (8, 6))
+
+    async def test_get_load_clamps_a_waiting_count_above_num_reqs(self):
+        patcher, _ = _patch_http({"/get_load": [{"num_reqs": 1, "num_waiting_reqs": 4}]})
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertEqual((load.running, load.waiting), (0, 4))
+
+    async def test_get_load_yields_used_tokens_but_no_capacity(self):
+        # num_tokens is in-flight tokens, not the pool: upstream computes it
+        # as used + queued, and the releases that serve this field report no
+        # max_total_num_tokens at all. Deriving capacity from it made a
+        # near-idle server read as a saturated pool (used == total).
+        patcher, _ = _patch_http(
+            {
+                "/get_load": [
+                    {
+                        "num_reqs": 2,
+                        "num_waiting_reqs": 0,
+                        "num_tokens": 1000,
+                        "num_pending_tokens": 700,
+                    }
+                ]
+            }
+        )
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertEqual((load.used_tokens, load.total_tokens), (300, 0))
+        self.assertEqual(load.kv_pct, -1.0)
+
+    async def test_get_load_without_pending_tokens_does_not_saturate(self):
+        # The pre-/v1/loads shape serves num_tokens with no num_pending_tokens:
+        # read as the pool, that made used == total — KV 100% on an idle node.
+        # It is a bare used count.
+        patcher, _ = _patch_http(
+            {
+                "/get_load": [
+                    {"dp_rank": 0, "num_reqs": 3, "num_waiting_reqs": 1, "num_tokens": 4096}
+                ]
+            }
+        )
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertEqual((load.running, load.waiting), (2, 1))
+        self.assertEqual((load.used_tokens, load.total_tokens), (4096, 0))
+        self.assertEqual(load.kv_pct, -1.0)
+
+    async def test_foreign_endpoint_yields_none(self):
+        patcher, _ = _patch_http(
+            {"/v1/loads": {"detail": "Not Found"}, "/get_load": {"detail": "Not Found"}}
+        )
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertIsNone(load)
+
+    async def test_malformed_load_fields_degrade_not_raise(self):
+        # poll_cluster's gather has no return_exceptions, so a non-numeric
+        # field (or JSON 1e999 -> inf) must degrade to 0, never escape.
+        legacy = [
+            {"num_reqs": {"a": 1}, "num_waiting_reqs": [2]},
+            {"num_reqs": "3", "num_waiting_reqs": None},
+            {"num_reqs": 4, "num_waiting_reqs": 1},
+            {"num_reqs": 1e999, "num_waiting_reqs": 0},
+        ]
+        patcher, _ = _patch_http({"/get_load": legacy})
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertEqual((load.running, load.waiting), (6, 1))
+
+    async def test_huge_integer_load_fields_degrade_not_raise(self):
+        # A JSON integer literal with hundreds of digits is an exact Python
+        # int: int() accepts it and every later float()/division raises
+        # OverflowError, which would escape poll_unit and kill the tick.
+        huge = int("9" * 309)
+        envelope = {
+            "loads": [
+                {
+                    "num_running_reqs": 1,
+                    "num_waiting_reqs": 0,
+                    "num_used_tokens": 5,
+                    "max_total_num_tokens": huge,
+                    "token_usage": 0.5,
+                }
+            ]
+        }
+        patcher, _ = _patch_http({"/v1/loads": envelope})
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+        self.assertEqual((load.running, load.total_tokens), (1, 0))
+        self.assertAlmostEqual(load.kv_pct, 50.0)  # falls back to the usage gauge
+
+        patcher, _ = _patch_http(
+            {"/get_load": [{"num_reqs": 3, "num_waiting_reqs": 1, "num_tokens": huge}]}
+        )
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+        self.assertEqual((load.running, load.waiting), (2, 1))
+        self.assertEqual((load.used_tokens, load.total_tokens), (0, 0))
+
+    async def test_out_of_range_load_gauges_are_rejected_not_scaled(self):
+        # token_usage is a 0-1 fraction; rendering a broken 42 as "4200%" KV
+        # is worse than leaving the honest fallback. cache_hit_rate is not
+        # consumed from this route at all (EngineLoad), out-of-band or not.
+        envelope = {
+            "loads": [
+                {
+                    "num_running_reqs": 1,
+                    "num_waiting_reqs": 0,
+                    "num_used_tokens": 5,
+                    "max_total_num_tokens": 100,
+                    "token_usage": 42.0,
+                    "cache_hit_rate": -1.0,
+                }
+            ]
+        }
+        patcher, _ = _patch_http({"/v1/loads": envelope})
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+        self.assertAlmostEqual(load.kv_pct, 5.0)  # used/total, not 4200
+
+    async def test_v1_loads_ignores_entries_without_load_fields(self):
+        patcher, _ = _patch_http(
+            {"/v1/loads": {"loads": ["garbage", {"dp_rank": 0}, {"num_running_reqs": "x"}]}}
+        )
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertEqual((load.running, load.waiting), (0, 0))
+        self.assertEqual(load.kv_pct, -1.0)
+
+    async def test_v1_loads_without_a_single_load_field_is_not_the_protocol(self):
+        # A dict envelope whose entries carry no load field at all is a
+        # foreign/404-ish body: returning a zero load would mark the node
+        # hosted with fabricated figures.
+        patcher, _ = _patch_http({"/v1/loads": {"loads": ["garbage", {"dp_rank": 0}]}})
+        with patcher:
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertIsNone(load)
+
+    async def test_non_json_load_body_is_swallowed(self):
+        # A proxy or port-forward can answer 200 with HTML on SGLang's route;
+        # resp.json() raising must not escape into poll_unit.
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                return FakeResp()
+
+        with patch.object(collector.httpx, "AsyncClient", FakeClient):
+            load = await collector.fetch_engine_load("http://x:1")
+
+        self.assertIsNone(load)
+
+
+class SglangPollUnitTests(unittest.IsolatedAsyncioTestCase):
+    """A metrics-disabled SGLang node must still render concurrency AND KV —
+    the load API carries both — instead of a row of zeros."""
+
+    UNITS = {
+        9: {
+            "label": "spark-sg",
+            "ssh_target": "tester@spark.test",
+            "vllm_url": "http://spark.test:8888",
+            "worker": False,
+            "engine": None,
+        }
+    }
+
+    async def _poll(self, load, units=None):
+        async def metrics_404(url):
+            raise RuntimeError("404 Not Found for url 'http://spark.test:8888/metrics'")
+
+        collector._model_names.clear()
+        collector._model_names[9] = "Nemotron-3.5"
+        probe = AsyncMock(return_value=load)
+        with patch.object(collector, "SPARK_UNITS", units or self.UNITS):
+            with patch.object(collector, "_fetch_metrics", metrics_404):
+                with patch.object(collector, "_fetch_telemetry", AsyncMock(return_value={})):
+                    with patch.object(collector, "fetch_engine_load", probe):
+                        return await collector.poll_unit(9), probe
+
+    async def _poll_http(self, routes, units=None):
+        """Poll with the REAL load parser behind a canned HTTP client, so the
+        path from a raw ``/v1/loads`` body to the published sentinel is
+        exercised rather than a hand-built ``EngineLoad``."""
 
         async def metrics_404(url):
             raise RuntimeError("404 Not Found for url 'http://spark.test:8888/metrics'")
 
         collector._model_names.clear()
         collector._model_names[9] = "Nemotron-3.5"
-        load = AsyncMock(return_value=(2, 1))
-        telemetry_mock = AsyncMock(return_value={})
-        with patch.object(collector, "SPARK_UNITS", units):
-            with patch.object(collector, "_fetch_vllm_metrics", metrics_404):
-                with patch.object(collector, "_fetch_telemetry", telemetry_mock):
-                    with patch.object(collector, "_fetch_sglang_load", load):
-                        stats = await collector.poll_unit(9)
-        load.assert_awaited_once_with("http://spark.test:8888")
+        patcher, requested = _patch_http(routes)
+        with patcher:
+            with patch.object(collector, "SPARK_UNITS", units or self.UNITS):
+                with patch.object(collector, "_fetch_metrics", metrics_404):
+                    with patch.object(collector, "_fetch_telemetry", AsyncMock(return_value={})):
+                        return await collector.poll_unit(9), requested
+
+    async def test_stated_cache_hit_rate_is_never_published(self):
+        # The load API does carry cache_hit_rate, but the metrics reporter
+        # writes it only inside `if self.current_scheduler_metrics_enabled:`
+        # — on the metrics-disabled server that makes this route the only
+        # signal source it is structurally constant 0. A stated fraction is
+        # not a reading of this endpoint either, so nothing may reach the
+        # cache row: the unit keeps the unknown sentinel and the cluster
+        # aggregate stays unknown with it.
+        envelope = {
+            "loads": [
+                {
+                    "num_running_reqs": 2,
+                    "num_waiting_reqs": 1,
+                    "num_used_tokens": 450_000,
+                    "max_total_num_tokens": 1_000_000,
+                    "token_usage": 0.45,
+                    "cache_hit_rate": 0.6,
+                }
+            ]
+        }
+        stats, requested = await self._poll_http({"/v1/loads": envelope})
+
+        self.assertEqual(requested, ["http://spark.test:8888/v1/loads"])
         self.assertTrue(stats.model_hosted)
         self.assertEqual(stats.model_source, "sglang")
         self.assertFalse(stats.model_metrics)
         self.assertEqual((stats.requests_running, stats.requests_waiting), (2, 1))
-        self.assertEqual(stats.model_name, "Nemotron-3.5")
-        self.assertNotIn("vLLM", stats.error)
+        self.assertAlmostEqual(stats.kv_cache_pct, 45.0)
+        self.assertEqual(stats.kv_cache_used_tokens, 450_000)
+        self.assertEqual(stats.kv_prefix_hit_rate, -1.0)
+        self.assertEqual(ClusterStats(units=[stats]).kv_prefix_hit_rate, -1.0)
 
-    def test_sglang_metrics_namespace_is_parsed(self):
-        # SGLang with --enable-metrics mirrors the vLLM metric shape under
-        # the sglang: namespace — one parser must serve both.
-        stats = collector._parse_vllm_metrics(
-            'sglang:generation_tokens_total{model_name="a"} 900.0\n'
-            'sglang:prompt_tokens_total{model_name="a"} 400.0\n'
-            'sglang:num_requests_running{model_name="a"} 2.0\n'
+    async def test_load_fallback_fills_concurrency_and_kv(self):
+        stats, probe = await self._poll(
+            collector.EngineLoad(
+                running=2,
+                waiting=1,
+                used_tokens=450_000,
+                total_tokens=1_000_000,
+                kv_pct=45.0,
+            )
         )
+
+        probe.assert_awaited_once_with("http://spark.test:8888")
         self.assertTrue(stats.model_hosted)
         self.assertEqual(stats.model_source, "sglang")
-        self.assertTrue(stats.model_metrics)
-        self.assertEqual(stats.generation_tokens_total, 900.0)
-        self.assertEqual(stats.prompt_tokens_total, 400.0)
-        self.assertEqual(stats.requests_running, 2)
+        self.assertFalse(stats.model_metrics)
+        self.assertEqual((stats.requests_running, stats.requests_waiting), (2, 1))
+        self.assertEqual(stats.kv_total_tokens, 1_000_000)
+        self.assertEqual(stats.kv_cache_used_tokens, 450_000)
+        self.assertAlmostEqual(stats.kv_cache_pct, 45.0)
+        # The load snapshot states no prefix rate this endpoint actually
+        # measured (EngineLoad), so the unit keeps the unknown sentinel and
+        # the cache row paints "—" rather than a manufactured "hit 0%".
+        self.assertEqual(stats.kv_prefix_hit_rate, -1.0)
+        self.assertEqual(stats.model_name, "Nemotron-3.5")
+        # A healthy load-API fallback reports no metrics error at all.
+        self.assertNotIn("metrics:", stats.error)
 
-    async def test_get_load_sums_dp_ranks(self):
-        class FakeResp:
-            def raise_for_status(self):
-                pass
+    async def test_load_fallback_fabricates_no_throughput(self):
+        # The load API carries no token counters: a tok/s figure here would be
+        # invented, and poll_cluster's delta machinery would publish it.
+        stats, _ = await self._poll(
+            collector.EngineLoad(running=2, waiting=1, used_tokens=450_000, total_tokens=1_000_000)
+        )
 
-            def json(self):
-                return [
-                    {"num_reqs": 2, "num_waiting_reqs": 1},
-                    {"num_reqs": 1, "num_waiting_reqs": 0},
-                ]
+        self.assertFalse(stats.model_metrics)
+        self.assertEqual(stats.throughput_tok_s, 0.0)
+        self.assertEqual(stats.prompt_throughput_tok_s, 0.0)
+        self.assertEqual(stats.generation_tokens_total, 0.0)
+        self.assertEqual(stats.prompt_tokens_total, 0.0)
 
-        class FakeClient:
-            def __init__(self, *a, **k):
-                pass
+    async def test_load_without_capacity_sets_no_kv_denominator(self):
+        # /get_load reports used tokens and no capacity: the used count must
+        # land (it is real) while capacity stays absent rather than being
+        # invented from the token count. The percentage is a reading of its
+        # own — /v1/loads states token_usage, and a fraction needs no
+        # denominator — so a stated one survives; only a route that states
+        # none leaves the sentinel.
+        stats, _ = await self._poll(
+            collector.EngineLoad(
+                running=2,
+                waiting=1,
+                used_tokens=5,
+                total_tokens=0,
+                kv_pct=50.0,
+            )
+        )
 
-            async def __aenter__(self):
-                return self
+        self.assertEqual(stats.kv_cache_used_tokens, 5)
+        self.assertEqual(stats.kv_total_tokens, 0)
+        self.assertEqual(stats.kv_cache_pct, 50.0)
+        self.assertEqual(stats.kv_prefix_hit_rate, -1.0)
 
-            async def __aexit__(self, *a):
-                return False
+    async def test_load_without_a_percentage_keeps_the_sentinel(self):
+        # /get_load states neither capacity nor a fill: the dataclass default
+        # (0.0) would reach the pane as a confidently empty pool, so the
+        # unknown has to arrive as the sentinel the UI paints as "—".
+        stats, _ = await self._poll(collector.EngineLoad(running=2, waiting=1, used_tokens=4096))
 
-            async def get(self, url):
-                return FakeResp()
+        self.assertEqual(stats.kv_cache_used_tokens, 4096)
+        self.assertEqual(stats.kv_total_tokens, 0)
+        self.assertEqual(stats.kv_cache_pct, -1.0)
 
-        with patch.object(collector.httpx, "AsyncClient", FakeClient):
-            got = await collector._fetch_sglang_load("http://x:1")
-        self.assertEqual(got, (3, 1))
+    async def test_declared_vllm_node_never_probes_the_load_api(self):
+        units = {9: {**self.UNITS[9], "engine": "vllm"}}
+        stats, probe = await self._poll(None, units)
 
-    async def test_get_load_none_for_foreign_endpoint(self):
-        class FakeResp:
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return {"detail": "Not Found"}
-
-        class FakeClient:
-            def __init__(self, *a, **k):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *a):
-                return False
-
-            async def get(self, url):
-                return FakeResp()
-
-        with patch.object(collector.httpx, "AsyncClient", FakeClient):
-            got = await collector._fetch_sglang_load("http://x:1")
-        self.assertIsNone(got)
+        probe.assert_not_awaited()
+        self.assertFalse(stats.model_hosted)
+        self.assertIn("metrics:", stats.error)
 
 
 class ClusterStatsKvAggregationTests(unittest.TestCase):
@@ -473,13 +1097,14 @@ class ClusterStatsKvAggregationTests(unittest.TestCase):
 
         self.assertEqual(cs.total_kv_capacity_tokens, 100000)
 
-    def test_kv_aggregates_zero_when_no_hosted_units(self):
+    def test_kv_aggregates_without_hosted_units(self):
         s = SparkUnitStats(label="Spark-0", model_hosted=False)
         cs = self.ClusterStats(units=[s])
 
         self.assertEqual(cs.total_kv_capacity_tokens, 0)
         self.assertEqual(cs.total_kv_used_tokens, 0)
-        self.assertEqual(cs.kv_cache_pct, 0.0)
+        # Nothing hosted is no reading, not an empty pool.
+        self.assertEqual(cs.kv_cache_pct, -1.0)
         self.assertEqual(cs.kv_prefix_hit_rate, -1.0)
         self.assertEqual(cs.total_kv_blocks, 0)
 
@@ -516,7 +1141,7 @@ class PollUnitTests(unittest.IsolatedAsyncioTestCase):
             }
         }
         with patch.object(collector, "SPARK_UNITS", units):
-            with patch.object(collector, "_fetch_vllm_metrics", metrics_mock):
+            with patch.object(collector, "_fetch_metrics", metrics_mock):
                 with patch.object(collector, "_fetch_telemetry", telemetry_mock):
                     poll_task = asyncio.create_task(collector.poll_unit(7))
                     try:
@@ -546,7 +1171,7 @@ class PollUnitTests(unittest.IsolatedAsyncioTestCase):
         collector._model_names.clear()
 
         with patch.object(collector, "SPARK_UNITS", units):
-            with patch.object(collector, "_fetch_vllm_metrics", metrics_mock):
+            with patch.object(collector, "_fetch_metrics", metrics_mock):
                 with patch.object(collector, "_fetch_telemetry", telemetry_mock):
                     with patch.object(collector.httpx, "AsyncClient") as http_client:
                         stats = await collector.poll_unit(7)
@@ -1097,7 +1722,7 @@ class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch.object(collector, "SPARK_UNITS", units):
-            with patch.object(collector, "_fetch_vllm_metrics", metrics_mock):
+            with patch.object(collector, "_fetch_metrics", metrics_mock):
                 with patch.object(collector, "_fetch_telemetry", telemetry_mock):
                     with patch.object(collector.httpx, "AsyncClient") as http_client:
                         stats = await collector.poll_unit(7)
@@ -1204,41 +1829,23 @@ class ReviewHardeningTests(unittest.TestCase):
         self.assertEqual(collector._coerce_count(2.7), 2)
 
     def test_get_load_malformed_entries_degrade_not_raise(self):
-        # A non-numeric num_reqs must never raise out of the parse:
-        # poll_cluster's gather has no return_exceptions, so one bad payload
-        # would kill the whole cluster poll tick.
-        from unittest.mock import patch
-
-        class FakeResp:
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return [
-                    {"num_reqs": {"a": 1}, "num_waiting_reqs": [2]},
-                    {"num_reqs": "3", "num_waiting_reqs": None},
-                    {"num_reqs": 4, "num_waiting_reqs": 1},
-                    # JSON 1e999 parses to float inf — int(inf) raises
-                    # OverflowError, which must degrade to 0, not escape
-                    {"num_reqs": 1e999, "num_waiting_reqs": 0},
-                ]
-
-        class FakeClient:
-            def __init__(self, *a, **k):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *a):
-                return False
-
-            async def get(self, url):
-                return FakeResp()
-
-        with patch.object(collector.httpx, "AsyncClient", FakeClient):
-            got = asyncio.run(collector._fetch_sglang_load("http://x:1"))
-        self.assertEqual(got, (7, 1))
+        # A non-numeric field must never raise out of the parse: poll_cluster's
+        # gather has no return_exceptions, so one bad payload would kill the
+        # whole cluster poll tick.
+        entries = [
+            {"num_reqs": {"a": 1}, "num_waiting_reqs": [2]},
+            {"num_reqs": "3", "num_waiting_reqs": None},
+            {"num_reqs": 4, "num_waiting_reqs": 1},
+            # JSON 1e999 parses to float inf — int(inf) raises OverflowError,
+            # which must degrade to 0, not escape.
+            {"num_reqs": 1e999, "num_waiting_reqs": 0},
+            {"num_reqs": 2, "num_waiting_reqs": 1, "num_tokens": "x", "num_pending_tokens": 1e999},
+        ]
+        patcher, _ = _patch_http({"/get_load": entries})
+        with patcher:
+            load = asyncio.run(collector.fetch_engine_load("http://x:1"))
+        self.assertEqual((load.running, load.waiting), (7, 2))
+        self.assertEqual((load.used_tokens, load.total_tokens), (0, 0))
 
     def test_histogram_skips_garbage_bucket_lines(self):
         lines = [
@@ -1266,7 +1873,7 @@ class ReviewHardeningTests(unittest.TestCase):
             'vllm:kv_cache_usage_perc{engine="0"} 0.2\n'
             'vllm:kv_cache_usage_perc{engine="1"} 0.6\n'
         )
-        s = collector._parse_vllm_metrics(text)
+        s = collector._parse_engine_metrics(text)
         self.assertEqual(s.kv_total_blocks, 400)  # summed, not last-engine
         self.assertEqual(s.kv_total_tokens, 6400)
         self.assertAlmostEqual(s.kv_cache_pct, 50.0)  # (0.2*100 + 0.6*300)/400
@@ -1280,7 +1887,7 @@ class ReviewHardeningTests(unittest.TestCase):
             'vllm:kv_cache_usage_perc{engine="0"} 0.2\n'
             'vllm:kv_cache_usage_perc{engine="1"} 0.6\n'
         )
-        s = collector._parse_vllm_metrics(text)
+        s = collector._parse_engine_metrics(text)
         self.assertAlmostEqual(s.kv_cache_pct, 40.0)
         self.assertEqual(s.kv_total_tokens, 1600)
 
@@ -1291,18 +1898,38 @@ class ReviewHardeningTests(unittest.TestCase):
             "vllm:prompt_tokens_total 2.0\n"
             "sglang:generation_tokens_total 9.0\n"
         )
-        s = collector._parse_vllm_metrics(vllm_majority)
+        s = collector._parse_engine_metrics(vllm_majority)
         self.assertEqual(s.model_source, "vllm")
         self.assertEqual(s.generation_tokens_total, 5.0)
+        self.assertEqual(s.requests_running, 1)
+        # SGLang's concurrency names are not read under the vLLM profile, so
+        # an SGLang-majority payload must be parsed through SGLang's own.
         sglang_majority = (
             "vllm:generation_tokens_total 5.0\n"
             "sglang:generation_tokens_total 9.0\n"
-            "sglang:num_requests_running 2.0\n"
+            "sglang:num_running_reqs 2.0\n"
             "sglang:prompt_tokens_total 3.0\n"
         )
-        s2 = collector._parse_vllm_metrics(sglang_majority)
+        s2 = collector._parse_engine_metrics(sglang_majority)
         self.assertEqual(s2.model_source, "sglang")
         self.assertEqual(s2.generation_tokens_total, 9.0)
+        self.assertEqual(s2.requests_running, 2)
+        self.assertEqual(s2.prompt_tokens_total, 3.0)
+
+    def test_metrics_engine_is_none_without_sample_evidence(self):
+        self.assertIsNone(collector.metrics_engine(""))
+        self.assertIsNone(collector.metrics_engine("# HELP vllm:x help\n"))
+        self.assertEqual(collector.detect_engine("# HELP vllm:x help\n"), "vllm")
+        self.assertEqual(collector.metrics_engine("sglang:num_running_reqs 1\n"), "sglang")
+        self.assertEqual(collector.metrics_engine("vllm:prompt_tokens_total 1\n"), "vllm")
+
+    def test_tie_on_sample_evidence_resolves_to_vllm(self):
+        # Locked rule: majority of sample lines, tie -> vLLM. A one-line-each
+        # payload must not flip the parse to SGLang (which would zero every
+        # vLLM series on a mixed/half-scraped exposition).
+        tie = "vllm:prompt_tokens_total 1\nsglang:num_running_reqs 1\n"
+        self.assertEqual(collector.metrics_engine(tie), "vllm")
+        self.assertEqual(collector._parse_engine_metrics(tie).model_source, "vllm")
 
     def test_help_only_namespace_mention_is_not_sample_evidence(self):
         text = (
@@ -1310,15 +1937,15 @@ class ReviewHardeningTests(unittest.TestCase):
             "# TYPE vllm:generation_tokens_total counter\n"
         )
         self.assertEqual(collector._ns_sample_count(text.splitlines(), "vllm:"), 0)
-        s = collector._parse_vllm_metrics(text)
+        s = collector._parse_engine_metrics(text)
         self.assertFalse(s.model_hosted)
 
     def test_prompt_nan_only_keeps_baseline_source(self):
         # A transient NaN on the modern counter must NOT switch the prompt
         # baseline onto the legacy name (the generation_tokens rule).
         text = "vllm:prompt_tokens_total  NaN\nvllm:prompt_tokens  77.0\n"
-        s = collector._parse_vllm_metrics(text)
+        s = collector._parse_engine_metrics(text)
         self.assertEqual(s.prompt_tokens_total, 0.0)
         # legacy-only payloads still read the legacy name
-        s2 = collector._parse_vllm_metrics("vllm:prompt_tokens  77.0\n")
+        s2 = collector._parse_engine_metrics("vllm:prompt_tokens  77.0\n")
         self.assertEqual(s2.prompt_tokens_total, 77.0)

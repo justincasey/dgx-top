@@ -656,6 +656,329 @@ def test_box_clamps_overlong_title():
     assert all(len(ln.plain) == 24 for ln in lines)
 
 
+async def test_engine_badge_never_clips_or_hides_a_model(tmp_path: Path, monkeypatch):
+    """The engine badge is a fixed-width column on each model's gen row. It is
+    spent only from slack: at any width every row must fit the pane's interior
+    (the tok/s tail is the content that goes first), the badge is monotone in
+    width, and a model name survives it. Below the width where all the columns
+    fit, the elastic name column is what yields — never the tail."""
+    from app import DGXTop, ServingBox, _box_lines, _palette_for
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    head.model_name = "qwen3.8-flash-next-122b-a10b"
+    head.generation_tokens_total = 264348.0
+    worker = _unit("worker", worker=True)
+    worker.model_name = "NVIDIA-Nemotron-3.5-Lightning-49B"
+    worker.model_source = "sglang"
+    worker.generation_tokens_total = 0.0
+    worker.model_metrics = False
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    names = ["qwen3.8-flash-next", "NVIDIA-Nemotron-3.5"]
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        app._update_ui()
+        box = app.query_one("#serving", ServingBox)
+        pal = _palette_for(app)
+        # Every row must fit the box interior: `_box_lines` fits rows to
+        # `width - 4` and ellipsizes whatever is wider, and the tail is what
+        # gets ellipsized first. `_multi_rows` is called directly here, so
+        # only this bound can see the raw row — from the wide grammar's own
+        # minimum width (SERVING_NARROW_WIDTH) up. The tail itself is checked
+        # on the painted line, because `_fit` runs inside `_box_lines` and a
+        # raw gen row always ends with its own `tok/s` segment.
+        for w in range(52, 161):
+            rows = box._multi_rows(pal, w)
+            assert all(r.cell_len <= w - 4 for r in rows), (w, [r.plain for r in rows])
+            painted = [
+                line.plain[2:-2]  # the interior: `_fit` has already run
+                for line in _box_lines(w, [("^", ""), (" serving", "")], None, rows, False, pal)
+            ]
+            for line in painted:
+                if line.startswith("gen ") and "no tok/s" not in line:
+                    assert " tok/s" in line, (w, line)
+        # From 56 up the badge behaves as designed; the fixture's badge
+        # boundary is 69.
+        tagged_at: list[bool] = []
+        for w in range(56, 161):
+            rows = box._multi_rows(pal, w)
+            blob = "\n".join(r.plain for r in rows)
+            tagged = "[sglang]" in blob
+            tagged_at.append(tagged)
+            gen_lines = [ln for ln in blob.split("\n") if ln.startswith("gen ")]
+            assert len(gen_lines) == len(names), (w, blob)
+            for name in names:
+                # Below the width where every column's minimum fits, the
+                # elastic name column truncates a name — it never drops the
+                # model row.
+                assert name in blob or name[:8] in blob, (w, name, blob)
+            if tagged:
+                # Both badges present, and every name in FULL: an admitted
+                # badge implies no column was squeezed for it, so the badge
+                # can never be what costs a name — nor the tail that fits
+                # beside the graph without it.
+                assert "[vllm]" in blob, (w, blob)
+                for name in names:
+                    assert name in blob, (w, name, blob)
+        assert any(tagged_at), "badge never rendered at any width"
+        first = tagged_at.index(True)
+        assert all(tagged_at[first:]), "badge came back at a narrower width"
+
+
+async def test_unknown_kv_renders_as_no_reading_not_zero(tmp_path: Path, monkeypatch):
+    """A node reached over SGLang's load API states its used count and no
+    capacity, so its fill is unknown. The pane must say so: printing the
+    stats default (0%) wrote a confident "empty pool" on a node that reports
+    4096 used tokens — the same wrong-number class as the fabricated 100%
+    denominator this pass removed."""
+    from app import DGXTop, ServingBox, Waybar
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    unit = _unit("head")
+    unit.kv_cache_pct = -1.0  # the collector's "no reading" sentinel
+    unit.kv_total_tokens = 0  # /get_load states no capacity
+    unit.kv_cache_used_tokens = 4096
+    unit.model_metrics = False
+    unit.model_source = "sglang"
+    _stub(monkeypatch, [unit])
+    for size in ((160, 48), (64, 30)):
+        app = DGXTop()
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app._update_ui()
+            box = app.query_one("#serving", ServingBox)
+            painted = box.render().plain.splitlines()
+            interior = [ln[2:-2] for ln in painted]
+            # The meta tab carries capacity, so it is the em dash — not a
+            # "0 tok" nobody measured.
+            tab = interior[0].split("┤ ")[-1].rstrip(" ├")
+            assert tab == "—", (size, interior[0])
+            # No percentage is painted for an unknown fill: not the
+            # dataclass's confident 0%, and not the raw sentinel either.
+            kv_lines = [ln for ln in interior if ln.startswith("kv ")]
+            assert kv_lines and all("%" not in ln for ln in kv_lines), (size, kv_lines)
+            if size == (160, 48):
+                # The wide grammar publishes the real used count; with no
+                # capacity it stands alone (the narrow grammar omits it).
+                kv_row = next(ln for ln in interior if ln.startswith("kv "))
+                assert "4K" in kv_row and "/" not in kv_row, (size, kv_row)
+                assert next(ln for ln in interior if ln.startswith("kv%")).rstrip() == "kv%    —"
+            chip = app.query_one("#waybar", Waybar).render().plain
+            assert "KV —" in chip, chip
+            # The kv spark plots this history: an unknown fill must not seed
+            # a sample the node never reported.
+            assert all(v >= 0 for v in app.history["kv-usage-head"]), app.history["kv-usage-head"]
+
+
+def _load_only(unit, running: int = 2, waiting: int = 1):
+    """A node exactly as ``poll_unit`` leaves it when ``/metrics`` 404s and
+    the load API answers: real requests and KV, no token counter at all."""
+    unit.model_metrics = False
+    unit.model_source = "sglang"
+    unit.throughput_tok_s = 0.0
+    unit.prompt_throughput_tok_s = 0.0
+    unit.generation_tokens_total = 0.0
+    unit.prompt_tokens_total = 0.0
+    unit.ttft_p50_ms = 0.0
+    unit.ttft_p95_ms = 0.0
+    unit.kv_prefix_hit_rate = -1.0
+    unit.requests_running = running
+    unit.requests_waiting = waiting
+    return unit
+
+
+async def test_load_only_cluster_paints_no_rate_and_keeps_no_series(tmp_path: Path, monkeypatch):
+    """AC3/AC4/AC5: SGLang without ``--enable-metrics`` states no token
+    counter, so the 0 it leaves on every rate field is an absent measurement,
+    not an idle server. Recording it drew a flat line and a ``0 tok/s`` tail
+    on a server generating ~60 tok/s, and retaining earlier samples painted a
+    rate nobody was reporting any more."""
+    from app import DGXTop, ServingBox, Waybar
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    units = [
+        _load_only(_unit("head"), running=2, waiting=1),
+        _load_only(_unit("worker", worker=True), running=3, waiting=0),
+    ]
+    _stub(monkeypatch, units)
+    app = DGXTop()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        # A counters-bearing poll preceded this one: those samples must be
+        # dropped, or the pane presents them as the current rate.
+        app.history["throughput"].extend([900.0, 950.0])
+        app.history["prompt-throughput"].extend([1900.0])
+        app.history["gen-Qwen3.6-27B-Instruct"].extend([900.0, 950.0])
+        app._update_ui()
+
+        assert app.cluster.throughput_measured is False
+        assert list(app.history["throughput"]) == []
+        assert list(app.history["prompt-throughput"]) == []
+        assert list(app.history["gen-Qwen3.6-27B-Instruct"]) == []
+
+        interior = [
+            ln[2:-2] for ln in app.query_one("#serving", ServingBox).render().plain.splitlines()
+        ]
+        gen = next(ln for ln in interior if ln.startswith("gen "))
+        assert "no tok/s · sglang" in gen, interior
+        assert "tok/s" in gen and "900" not in gen and "0 tok/s" not in gen, gen
+        # no series means a blank graph, not a flat baseline
+        assert not any("\u2800" <= c <= "\u28ff" for c in gen), gen
+        assert "no tok/s · sglang" in next(ln for ln in interior if ln.startswith("prompt ")), (
+            interior
+        )
+        # the load API's own readings still land
+        assert any(ln.startswith("requests") and "2r · 1w" in ln for ln in interior), interior
+        assert "—" in next(ln for ln in interior if ln.startswith("cache ")), interior
+        assert "1.2M/3.8M tok" in next(ln for ln in interior if ln.startswith("kv ")), interior
+        assert "%" in next(ln for ln in interior if ln.startswith("kv%")), interior
+
+        chip = app.query_one("#waybar", Waybar).render().plain
+        assert "— tok/s" in chip and "0 tok/s" not in chip, chip
+
+        # positive control (AC6): the same pane records and paints a rate as
+        # soon as a counter-bearing unit is there
+        for u in units:
+            u.model_metrics = True
+            u.throughput_tok_s = 42.0
+            u.prompt_throughput_tok_s = 7.0
+        app._update_ui()
+        assert app.cluster.throughput_measured is True
+        assert list(app.history["throughput"]) == [84.0]
+        assert list(app.history["prompt-throughput"]) == [14.0]
+        assert "84 tok/s" in app.query_one("#waybar", Waybar).render().plain
+        measured = [
+            ln[2:-2] for ln in app.query_one("#serving", ServingBox).render().plain.splitlines()
+        ]
+        gen = next(ln for ln in measured if ln.startswith("gen "))
+        assert "no tok/s" not in gen and "42 · 42 · 42 tok/s" in gen, (gen, measured)
+
+
+async def test_two_load_only_models_paint_an_unknown_prompt_rate(tmp_path: Path, monkeypatch):
+    """The multi-model grammar averages the shared prompt row; an absent
+    series averages to 0.0, which is the same manufactured rate in a second
+    place — and the engine is only nameable when the models agree on one."""
+    from app import DGXTop, ServingBox
+
+    _config_cluster(tmp_path / "config.toml", 2)
+    configure(tmp_path / "config.toml")
+    a = _load_only(_unit("node-1"))
+    a.model_name = "model-a"
+    b = _load_only(_unit("node-2", worker=True))
+    b.model_name = "model-b"
+    _stub(monkeypatch, [a, b])
+    app = DGXTop()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        app._update_ui()
+
+        interior = [
+            ln[2:-2] for ln in app.query_one("#serving", ServingBox).render().plain.splitlines()
+        ]
+        assert len(app.query_one("#serving", ServingBox)._models) == 2
+        prompt = next(ln for ln in interior if ln.startswith("prompt "))
+        assert "no tok/s · sglang" in prompt, interior
+        assert "0 tok/s" not in prompt, prompt
+        gen_rows = [ln for ln in interior if ln.startswith("gen")]
+        assert len(gen_rows) == 2, interior
+        assert all("no tok/s · sglang" in ln for ln in gen_rows), gen_rows
+
+
+async def test_per_model_rows_bound_the_name_column(tmp_path: Path, monkeypatch):
+    """The gen row is not the only row spending the name column: the per-model
+    requests and ttft rows share it. When the gen row's own budget is slack —
+    a short tail and no engine badge — those rows are what bound the column;
+    unaccounted for, a 20-cell name pushed `p50 … · p95 … !!` past the
+    interior and `_fit` ate the p95 tail, hiding a stalled latency."""
+    from app import DGXTop, ServingBox, _palette_for
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    worker = _unit("worker", worker=True)
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        box = app.query_one("#serving", ServingBox)
+        pal = _palette_for(app)
+        box.update_models(
+            [
+                {
+                    "name": name,
+                    "color": pal.accent,
+                    "gen": [0.0, 0.0],  # observed but idle: 1-cell hero, short tail
+                    "req": 2,
+                    "wait": 1,
+                    "ttft_p50_ms": 700.0,
+                    "ttft_p95_ms": 20500.0,
+                    "source": source,
+                }
+                for name, source in (
+                    ("NVIDIA-Nemotron-3.5-Lightning-49B", "vllm"),
+                    ("gpt-oss-20b", "sglang"),  # shorter than the column: must pad
+                )
+            ]
+        )
+        for w in range(52, 121):
+            rows = box._multi_rows(pal, w)
+            over = [(r.cell_len, r.plain) for r in rows if r.cell_len > w - 4]
+            assert not over, (w, over)
+        # The rows that bound the column keep their tails in full, and the gen
+        # rows stay flush right although the two names differ in length.
+        painted = [r.plain for r in box._multi_rows(pal, 52)]
+        gen_rows = [ln for ln in painted if ln.startswith("gen")]
+        assert len({len(ln) for ln in gen_rows}) == 1, gen_rows
+        assert len([ln for ln in painted if ln.startswith("ttft")]) == 2
+        assert all("p95" in ln for ln in painted if ln.startswith("ttft")), painted
+        assert all("waiting" in ln for ln in painted if ln.startswith("requests")), painted
+
+
+def test_legend_tag_costs_only_slack():
+    """The title legend's engine tag is secondary: it may be dropped for
+    width, but adding it must never evict a model name or the KV meta tab,
+    and cells never buy it back once it fits."""
+    from app import _box_lines, _legend_segs
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    models = [
+        {"name": "qwen3.8-flash-next", "color": pal.accent, "source": "vllm"},
+        {"name": "Nemotron-3.5-Lightning", "color": pal.ok, "source": "sglang"},
+    ]
+    head = [("^", ""), (" ", ""), ("serving", ""), (" ", "")]
+    rtab = [("1.2M tok", "")]
+    names = [m["name"] for m in models]
+    # The width `_box_lines` really reserves for the tab, not a guess: one
+    # cell short here moves the whole legend boundary.
+    rtab_w = sum(len(t) for t, _ in rtab)
+    shown = []
+    for w in range(20, 201):
+        segs = _legend_segs(models, pal, head_w=10, rtab_w=rtab_w, width=w)
+        tagged = _box_lines(w, head + segs, rtab, [], False, pal)[0].plain
+        # Same names and separators, no engine tags: the legend the tag may
+        # only ever be added beside, never at the expense of.
+        untagged = _box_lines(w, head + [(" · ".join(names), "")], rtab, [], False, pal)[0].plain
+        for name in names:
+            if name in untagged:
+                assert name in tagged, (w, name, tagged)
+        if "tok" in untagged:
+            assert "tok" in tagged, (w, tagged)
+        shown.append(any("[sglang]" in t for t, _ in segs))
+    for w, (before, after) in enumerate(zip(shown, shown[1:])):
+        assert not (before and not after), w
+    assert any(shown), "tag never fit at any legend width"
+
+
 # ─── meter treatments + quiet mode ───────────────────────────────────
 
 
@@ -1185,6 +1508,11 @@ async def test_two_models_share_one_serving_pane(tmp_path: Path, monkeypatch):
         assert "qwen3.8-flash-next" in blob
         assert "NVIDIA-Nemotron" in blob
         assert "no tok/s · sglang" in blob
+        # ... and each model row names the engine serving it, so an SGLang
+        # node is identifiable even when it has a token counter.
+        gen_lines = [ln for ln in blob.split("\n") if "gen    " in ln]
+        assert any("NVIDIA-Nemotron-3.5… [sglang]" in ln for ln in gen_lines), gen_lines
+        assert any("qwen3.8-flash-next" in ln and "[vllm]" in ln for ln in gen_lines), gen_lines
         braille = [ln for ln in blob.split("\n") if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
         assert len(braille) >= 2, braille  # the shared time-series chart
         assert blob.count("requests") == 2, blob  # one concurrency row per model

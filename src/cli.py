@@ -36,7 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     init_parser = subparsers.add_parser("init", help="create an editable example configuration")
     init_parser.add_argument("--force", action="store_true", help="replace an existing file")
-    subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and vLLM")
+    subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and engine access")
     subparsers.add_parser("themes", help="list available color themes")
     return parser
 
@@ -56,7 +56,7 @@ def _init_config(path: Path | None, force: bool) -> int:
     except OSError:
         pass
     print(f"Created {destination}")
-    print("Edit its SSH targets and vLLM URLs, then run: dgx-top check")
+    print("Edit its SSH targets and engine URLs, then run: dgx-top check")
     return 0
 
 

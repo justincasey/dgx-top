@@ -134,6 +134,35 @@ def _clamp_segs(segs: list[tuple[str, str]], maxw: int) -> list[tuple[str, str]]
     return out
 
 
+def _legend_segs(
+    models: list[dict], pal: Palette, head_w: int, rtab_w: int, width: int
+) -> list[tuple[str, str]]:
+    """Chart-legend segments for the serving title rule: each model's name in
+    its own series hue, followed by the engine family serving it.
+
+    The engine tag is secondary to the legend's own content and to the KV meta
+    tab, so it is spent only from slack the top rule has: the untagged legend
+    wins whenever the tag would clip a model name (``width - 7`` is what
+    ``_box_lines`` leaves the title) or evict the meta tab that the untagged
+    legend still fits beside."""
+    plain: list[tuple[str, str]] = []
+    tagged: list[tuple[str, str]] = []
+    for i, m in enumerate(models):
+        if i:
+            plain.append((" · ", pal.dim))
+            tagged.append((" · ", pal.dim))
+        plain.append((m["name"], f"bold {m['color']}"))
+        tagged.append((m["name"], f"bold {m['color']}"))
+        tagged.append((f" [{m['source']}]", pal.dim))
+    tagged_w = head_w + sum(len(t) for t, _ in tagged)
+    plain_w = head_w + sum(len(t) for t, _ in plain)
+    room = width - 12  # corners: 6 cells per cluster, as _box_lines reserves
+    # Beside the tab the tag must also leave a few cells of top rule, or the
+    # two junction glyphs abut into a visible seam (├┤).
+    fits_beside_tab = rtab_w > room - plain_w or rtab_w + 3 <= room - tagged_w
+    return tagged if tagged_w <= width - 7 and fits_beside_tab else plain
+
+
 def _box_lines(
     width: int,
     title: list[tuple[str, str]],
@@ -552,8 +581,16 @@ class Waybar(Static):
         model = hosted[0].model_name if hosted and hosted[0].model_name else "…"
         topo = c.topology.topology_type if c and c.topology else "…"
         risky = any((not u.online) or (u.temp_c >= TEMP_ALERT) for u in c.units)
-        gen = Text(f" {c.total_throughput:.0f} tok/s ", style=f"bold {pal.fg}")
-        kv = Text(f" KV {c.kv_cache_pct:.0f}% ", style=f"bold {pal.accent}")
+        # A cluster with no counter-bearing unit stated no rate; "0 tok/s" would
+        # be a manufactured reading of a live server, so the segment says so.
+        gen = Text(
+            f" {c.total_throughput:.0f} tok/s " if c.throughput_measured else " — tok/s ",
+            style=f"bold {pal.fg}",
+        )
+        kv = Text(
+            f" KV {c.kv_cache_pct:.0f}% " if c.kv_cache_pct >= 0 else " KV — ",
+            style=f"bold {pal.accent}",
+        )
         chip = Text(
             f" ● {online}/{total} ",
             style=f"bold {pal.ok}" if online == total else f"bold {pal.warn}",
@@ -592,6 +629,41 @@ def _fmt_tokens(n: int) -> str:
     if n < 1_000_000:
         return f"{n / 1000:.0f}K"
     return f"{n / 1_000_000:.1f}M"
+
+
+def _kv_tokens_tail(used: int, total: int, pal: Palette) -> tuple[str, list[tuple[str, str]]]:
+    """The kv row's token tail as ``(raw, segments)``.
+
+    ``raw`` is what the caller pads by, so it must be exactly what the
+    segments paint: a capacity-less node (the ``/get_load`` route) states its
+    used count and no denominator, and padding for a denominator nobody
+    reported ran the row one cell past the interior. With neither figure
+    known the tail is the same em dash the rest of the pane uses for "no
+    reading".
+    """
+    if total:
+        return (
+            f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok",
+            [
+                (_fmt_tokens(used), f"bold {pal.accent}"),
+                (f"/{_fmt_tokens(total)} tok", pal.dim),
+            ],
+        )
+    if used:
+        return _fmt_tokens(used), [(_fmt_tokens(used), f"bold {pal.accent}")]
+    return "—", [("—", pal.dim)]
+
+
+def _kv_pct_raw(kv_pct: float) -> str:
+    """The text the kv percentage tail occupies, for padding purposes.
+
+    A negative percentage is the collector's "no reading" sentinel — the
+    gauge was rejected or the route never states one — so its raw width is the
+    em-dash placeholder's, not the ``0%`` the dataclass default would paint.
+    The segment itself is built where the row is drawn: an unknown percentage
+    renders as the pane's placeholder row, with no tail at all.
+    """
+    return f"  {kv_pct:.0f}%" if kv_pct >= 0 else "  —"
 
 
 def _fmt_axis(v: float) -> str:
@@ -762,7 +834,8 @@ class ServingBox(Static):
             else:
                 rows.extend(_area_chart_lines(self._gen_data, chart_rows, max(1, width - 4), pal))
         kv = self._kv or {}
-        rtab = [(f"{_fmt_tokens(kv.get('total_tok', 0))} tok", pal.dim)]
+        total_tok = kv.get("total_tok", 0)
+        rtab = [(f"{_fmt_tokens(total_tok)} tok" if total_tok else "—", pal.dim)]
         title = [
             ("^", f"bold {pal.cyan}"),
             (" ", ""),
@@ -771,11 +844,18 @@ class ServingBox(Static):
         ]
         if self._models:
             # The chart legend: each model's name in its own series hue —
-            # the same hue its chart line, gen row, and sparkline carry.
-            for i, m in enumerate(self._models):
-                if i:
-                    title.append((" · ", pal.dim))
-                title.append((m["name"], f"bold {m['color']}"))
+            # the same hue its chart line, gen row, and sparkline carry —
+            # followed by the engine family serving it, so an SGLang model is
+            # identifiable without waiting for a missing token counter.
+            title.extend(
+                _legend_segs(
+                    self._models,
+                    pal,
+                    sum(len(t) for t, _ in title),
+                    sum(len(t) for t, _ in rtab),
+                    width,
+                )
+            )
         else:
             title.append((self._model(), pal.accent))
         return Text("\n").join(_box_lines(width, title, rtab, rows, False, pal))
@@ -803,16 +883,24 @@ class ServingBox(Static):
         lo = min(rep_gen) if rep_gen else 0.0
         hi = max(rep_gen) if rep_gen else 0.0
         s = self._kv or {}
-        kv_pct = s.get("pct", 0.0)
+        kv_pct = s.get("pct", -1.0)
         used = s.get("used_tok", 0)
         total = s.get("total_tok", 0)
         r = []
         # Top rows share one graph width and a padded tail so the graphs and
         has = bool(rep_gen)
-        tail_gen = f"{lo:.0f} · {gen_avg:.0f} · {hi:.0f} tok/s"
-        tail_prompt = f"{prompt_avg:.0f} tok/s"
-        tail_kv = f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok" if total else "—"
-        tail_kvp = f"  {kv_pct:.0f}%"
+        has_prompt = bool(self._prompt_data)
+        source = self._models[0]["source"] if self._models else ""
+        # No token counter (SGLang without --enable-metrics) means the endpoint
+        # never stated a rate at all: a numeric tail would be a manufactured
+        # zero that reads as "idle" during live generation. Name the reason
+        # instead, in the same words the multi-model grammar uses.
+        unknown_rate = f"no tok/s · {source}" if source else "no tok/s"
+        tail_gen = f"{lo:.0f} · {gen_avg:.0f} · {hi:.0f} tok/s" if has else unknown_rate
+        tail_prompt = f"{prompt_avg:.0f} tok/s" if has_prompt else unknown_rate
+        tail_kv, kv_segs = _kv_tokens_tail(used, total, pal)
+        tail_kvp = _kv_pct_raw(kv_pct)
+        kvp_segs = [(tail_kvp, pal.accent)]  # only drawn when the fill is known
         tail_w = max(len(t) for t in (tail_gen, tail_prompt, tail_kv, tail_kvp))
         graph_w = max(3, width - 4 - 7 - 2 - tail_w)
 
@@ -827,28 +915,26 @@ class ServingBox(Static):
             [
                 (f"{lo:.0f}", pal.dim),
                 (" · ", pal.dim),
-                (f"{gen_avg:.0f}", f"bold {pal.ok}" if has else pal.dim),
+                (f"{gen_avg:.0f}", f"bold {pal.ok}"),
                 (" · ", pal.dim),
                 (f"{hi:.0f}", pal.fg),
                 (" tok/s", pal.dim),
-            ],
+            ]
+            if has
+            else [(tail_gen, pal.dim)],
             tail_gen,
         )
         prompt_tail = tail(
             [
-                (f"{prompt_avg:.0f}", f"bold {pal.fg}" if self._prompt_data else pal.dim),
+                (f"{prompt_avg:.0f}", f"bold {pal.fg}"),
                 (" tok/s", pal.dim),
-            ],
+            ]
+            if has_prompt
+            else [(tail_prompt, pal.dim)],
             tail_prompt,
         )
-        kv_tail = tail(
-            [
-                (_fmt_tokens(used), f"bold {pal.accent}" if total else pal.dim),
-                (f"/{_fmt_tokens(total)} tok" if total else "", pal.dim),
-            ],
-            tail_kv,
-        )
-        kvp_tail = tail([(f"  {kv_pct:.0f}%", pal.accent)], tail_kvp)
+        kv_tail = tail(kv_segs, tail_kv)
+        kvp_tail = tail(kvp_segs, tail_kvp)
 
         def graph_row(label: str, graph: Text, tail_segs: list[Text]) -> Text:
             return Text.assemble(
@@ -869,17 +955,27 @@ class ServingBox(Static):
         hue = self._models[0]["color"] if len(self._models) == 1 else pal.ok
         hero_style = f"bold {hue}" if hero != "—" else pal.dim
         spark_w = max(3, graph_w - len(hero) - 1)
-        duo = _spark_duo_lines(_stretch(rep_gen, spark_w), hue, spark_w, pal)
-        r.append(
-            graph_row(
-                "gen    ",
-                Text.assemble(Text(hero, style=hero_style), Text(" ", style=""), duo[0]),
-                gen_tail,
+        if has:
+            duo = _spark_duo_lines(_stretch(rep_gen, spark_w), hue, spark_w, pal)
+            gen_graph = Text.assemble(Text(hero, style=hero_style), Text(" ", style=""), duo[0])
+            gen_fill = duo[1]
+        else:
+            # Absent series is not a flat zero line: blank the cell rather than
+            # drawing a baseline the endpoint never reported. Both rows stay,
+            # so the fit estimator's budget is unchanged.
+            gen_graph = Text.assemble(
+                Text(hero, style=hero_style),
+                Text(" " * (graph_w - len(hero)), style=""),
             )
-        )
-        r.append(Text.assemble(Text(" " * (7 + len(hero) + 1), style=""), duo[1]))
+            gen_fill = Text(" " * spark_w, style="")
+        r.append(graph_row("gen    ", gen_graph, gen_tail))
+        r.append(Text.assemble(Text(" " * (7 + len(hero) + 1), style=""), gen_fill))
         r.append(Text("", style=""))
-        prompt_duo = _spark_duo_lines(_stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal)
+        prompt_duo = (
+            _spark_duo_lines(_stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal)
+            if has_prompt
+            else (Text(" " * graph_w, style=""), Text(" " * graph_w, style=""))
+        )
         r.append(graph_row("prompt ", prompt_duo[0], prompt_tail))
         r.append(Text.assemble(Text(" " * 7, style=""), prompt_duo[1]))
         r.append(Text("", style=""))
@@ -887,7 +983,8 @@ class ServingBox(Static):
         r.append(graph_row("kv     ", kv_duo[0], kv_tail))
         r.append(Text.assemble(Text(" " * 7, style=""), kv_duo[1]))
         r.append(Text("", style=""))
-        if self._kv is None:
+        if self._kv is None or kv_pct < 0:
+            # No capacity reading: a bar would have to invent a fill of 0.
             r.append(Text.assemble(Text("kv%    ", style=pal.dim), Text("—", style=pal.dim)))
         else:
             r.append(
@@ -922,8 +1019,14 @@ class ServingBox(Static):
         s = self._kv or {}
         used = s.get("used_tok", 0)
         total = s.get("total_tok", 0)
-        kv_pct = s.get("pct", 0.0)
+        kv_pct = s.get("pct", -1.0)
         prompt_avg = sum(self._prompt_data) / len(self._prompt_data) if self._prompt_data else 0.0
+        # The aggregate prompt row speaks for every served model, so it names
+        # an engine only when they agree — and it says "no tok/s" at all when
+        # the cluster published no counter, rather than the 0 that an absent
+        # series averages to.
+        sources = {m["source"] for m in models}
+        unknown_rate = f"no tok/s · {next(iter(sources))}" if len(sources) == 1 else "no tok/s"
 
         gen_tails: list[str] = []
         for m in models:
@@ -933,13 +1036,51 @@ class ServingBox(Static):
                 if gen
                 else f"no tok/s · {m['source']}"
             )
-        tail_prompt = f"{prompt_avg:.0f} tok/s"
-        tail_kv = f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok" if total else "—"
-        tail_kvp = f"  {kv_pct:.0f}%"
+        tail_prompt = f"{prompt_avg:.0f} tok/s" if self._prompt_data else unknown_rate
+        tail_kv, kv_segs = _kv_tokens_tail(used, total, pal)
+        tail_kvp = _kv_pct_raw(kv_pct)
+        kvp_segs = [(tail_kvp, pal.accent)]  # only drawn when the fill is known
         tail_w = max(
             [len(t) for t in gen_tails] + [len(tail_prompt), len(tail_kv), len(tail_kvp), 5]
         )
-        graph_w = max(3, width - 4 - 7 - name_w - 2 - 2 - tail_w)
+        # Engine badge — the model row names the engine serving it, so an
+        # SGLang model is identifiable without waiting for a missing token
+        # counter to give it away. Reserved as a fixed-width column so every
+        # model's graph stays aligned, but only when the pane can hold it
+        # beside the graph's real minimum width: `graph_w` is a budget the
+        # graph content can exceed (a hero number plus the 3-cell spark
+        # floor), and spending cells there would ellipsize the tok/s tail
+        # that fits exactly without the badge (the title legend carries the
+        # same tag when its own segment list has room for it). The badge is
+        # spent from slack only, never from the name column below.
+        hero_w = max((len(f"{m['gen'][-1]:.0f}") for m in models if m["gen"]), default=0)
+        min_graph_w = hero_w + 4 if hero_w else 3
+        tag_w = max(len(f" [{m['source']}]") for m in models)
+        if tag_w > width - (4 + 7 + name_w + 2 + 2 + tail_w) - min_graph_w:
+            tag_w = 0
+        # The row budget is `4 + 7 + name_w + tag_w + 2 + graph + 2 + tail_w`
+        # = width and the graph cannot shrink past its hero + spark floor, so
+        # when the two minima cannot both fit it is the name column — the one
+        # column that already truncates — that yields the cells. `_fit` would
+        # otherwise ellipsize the tok/s tail, which is the content worth
+        # keeping. The badge test above ran first, on the natural name width.
+        slack = width - 4 - 7 - name_w - tag_w - 2 - 2 - tail_w - min_graph_w
+        if slack < 0:
+            name_w = max(4, name_w + slack)  # 3 name cells + the ellipsis
+        # The per-model requests and ttft rows spend the same name column, so
+        # the widest of them bounds it too. Each is linear in `name_w`, so one
+        # measured pass closes its deficit exactly — without it a long name on
+        # a narrow pane ellipsizes the p95 tail on those rows even when the gen
+        # row above fits.
+        for m in models:
+            for row in (
+                self._model_requests_row(pal, m, name_w),
+                self._model_ttft_row(pal, m, name_w),
+            ):
+                over = row.cell_len - (width - 4)
+                if over > 0:
+                    name_w = max(4, name_w - over)
+        graph_w = max(min_graph_w, width - 4 - 7 - name_w - tag_w - 2 - 2 - tail_w)
 
         def tail(text: str, segs: list[tuple[str, str]]) -> list[Text]:
             out = [Text(t, style=st) for t, st in segs]
@@ -968,7 +1109,7 @@ class ServingBox(Static):
                     Text(" ", style=""),
                     duo[0],
                 )
-                fill_prefix = 7 + name_w + 2 + len(hero) + 1
+                fill_prefix = 7 + name_w + tag_w + 2 + len(hero) + 1
                 segs = [
                     (f"{avg:.0f}", f"bold {m['color']}"),
                     (" · ", pal.dim),
@@ -983,6 +1124,7 @@ class ServingBox(Static):
                 Text.assemble(
                     Text("gen    ", style=pal.dim),
                     Text(name, style=m["color"]),
+                    Text(f" [{m['source']}]".ljust(tag_w) if tag_w else "", style=pal.dim),
                     Text("  ", style=""),
                     graph,
                     Text("  ", style=""),
@@ -999,19 +1141,23 @@ class ServingBox(Static):
                     )
                 )
             r.append(Text("", style=""))
-        prompt_duo = _spark_duo_lines(_stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal)
+        if self._prompt_data:
+            prompt_duo = _spark_duo_lines(
+                _stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal
+            )
+            prompt_segs = [(f"{prompt_avg:.0f}", f"bold {pal.fg}"), (" tok/s", pal.dim)]
+        else:
+            # Absent series, as with the gen rows: a blank graph (a flat
+            # baseline reads as "idle") and the reason rather than the 0 an
+            # empty average would print.
+            prompt_duo = (Text(" " * graph_w, style=""), Text(" " * graph_w, style=""))
+            prompt_segs = [(tail_prompt, pal.dim)]
         r.append(
             Text.assemble(
                 Text("prompt ", style=pal.dim),
                 prompt_duo[0],
                 Text("  ", style=""),
-                *tail(
-                    tail_prompt,
-                    [
-                        (f"{prompt_avg:.0f}", f"bold {pal.fg}" if self._prompt_data else pal.dim),
-                        (" tok/s", pal.dim),
-                    ],
-                ),
+                *tail(tail_prompt, prompt_segs),
             )
         )
         r.append(Text.assemble(Text(" " * 7, style=""), prompt_duo[1]))
@@ -1022,28 +1168,26 @@ class ServingBox(Static):
                 Text("kv     ", style=pal.dim),
                 kv_duo[0],
                 Text("  ", style=""),
-                *tail(
-                    tail_kv,
-                    [
-                        (_fmt_tokens(used), f"bold {pal.accent}" if total else pal.dim),
-                        (f"/{_fmt_tokens(total)} tok" if total else "", pal.dim),
-                    ],
-                ),
+                *tail(tail_kv, kv_segs),
             )
         )
         r.append(Text.assemble(Text(" " * 7, style=""), kv_duo[1]))
         r.append(Text("", style=""))
-        r.append(
-            Text.assemble(
-                Text("kv%    ", style=pal.dim),
-                _bar_line(kv_pct, graph_w, pal.accent, pal)
-                if _treatment(self) == "gradient"
-                else _meter_line(
-                    _treatment(self), kv_pct, graph_w, pal, pal.accent, list(self._kv_data)
-                ),
-                *tail(tail_kvp, [(f"  {kv_pct:.0f}%", pal.accent)]),
+        if kv_pct < 0:
+            # No capacity reading: a bar would have to invent a fill of 0.
+            r.append(Text.assemble(Text("kv%    ", style=pal.dim), Text("—", style=pal.dim)))
+        else:
+            r.append(
+                Text.assemble(
+                    Text("kv%    ", style=pal.dim),
+                    _bar_line(kv_pct, graph_w, pal.accent, pal)
+                    if _treatment(self) == "gradient"
+                    else _meter_line(
+                        _treatment(self), kv_pct, graph_w, pal, pal.accent, list(self._kv_data)
+                    ),
+                    *tail(tail_kvp, kvp_segs),
+                )
             )
-        )
         r.append(Text("", style=""))
         for m in models:
             r.append(self._model_requests_row(pal, m, name_w))
@@ -1172,11 +1316,17 @@ class ServingBox(Static):
         else:
             ttft.append("—", style=pal.dim)
         r.append(ttft)
-        # kv% — plain value (the meter is dropped from the narrow grammar).
+        # kv% — plain value (the meter is dropped from the narrow grammar);
+        # a capacity-less node has no fill to state, so the sentinel renders
+        # as the same em dash the adjacent cache row uses.
+        kv_pct = s.get("pct", -1.0)
         r.append(
             Text.assemble(
                 Text("kv ", style=pal.dim),
-                Text(f"{s.get('pct', 0.0):.0f}%", style=f"bold {pal.accent}"),
+                Text(
+                    f"{kv_pct:.0f}%" if kv_pct >= 0 else "—",
+                    style=f"bold {pal.accent}" if kv_pct >= 0 else pal.dim,
+                ),
             )
         )
         # cache — dropped at rail so the base gen/req/ttft surface is minimal.
@@ -1917,11 +2067,22 @@ class DGXTop(App):
         self.history.setdefault(
             "throughput", collections.deque(maxlen=self.settings.history_length)
         )
-        _record("throughput", stats.total_throughput)
         self.history.setdefault(
             "prompt-throughput", collections.deque(maxlen=self.settings.history_length)
         )
-        _record("prompt-throughput", stats.total_prompt_throughput)
+        # A cluster with no counter-bearing unit has no throughput measurement:
+        # every hosted unit's `throughput_tok_s` is the dataclass default, and
+        # recording it would draw a flat line that reads as "idle" rather than
+        # "unknown" — the same reason the per-model series below is gated. The
+        # retained samples go with it: an endpoint that stops reporting (a
+        # restart without --enable-metrics, a flaky poll) must not leave the
+        # pane painting its last-measured rate as the current one.
+        if stats.throughput_measured:
+            _record("throughput", stats.total_throughput)
+            _record("prompt-throughput", stats.total_prompt_throughput)
+        else:
+            self.history["throughput"].clear()
+            self.history["prompt-throughput"].clear()
 
         hosted_units = stats.hosted_units
         hosted_kv_keys = {f"kv-usage-{u.label}" for u in hosted_units}
@@ -1931,7 +2092,10 @@ class DGXTop(App):
         for u in hosted_units:
             key = f"kv-usage-{u.label}"
             self.history.setdefault(key, collections.deque(maxlen=self.settings.history_length))
-            _record(key, u.kv_cache_pct)
+            # An unknown fill (negative sentinel) is not a reading: seeding a
+            # 0 would draw a valley the node never reported.
+            if u.kv_cache_pct >= 0:
+                _record(key, u.kv_cache_pct)
         live_labels = {u.label for u in units if u.online}
         for key in [
             k
@@ -1983,9 +2147,13 @@ class DGXTop(App):
             # An endpoint without a token counter (SGLang without
             # --enable-metrics) has NO throughput series — recording its
             # constant 0 would draw a flat line that reads as "idle", not
-            # "unknown". The gen row and chart leave it blank instead.
+            # "unknown". The gen row and chart leave it blank instead, and
+            # the samples from before it lost its counters are dropped for
+            # the same reason the cluster series above are.
             if u.model_metrics:
                 _record(key, u.throughput_tok_s)
+            else:
+                self.history[key].clear()
         pal = _palette_for(self)
         # One distinct identity hue per served model (themes.SERIES_HUES
         # cycle) — the chart line, title legend, per-model rows and inline

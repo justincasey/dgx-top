@@ -42,15 +42,15 @@ class SparkUnitStats:
     model_name: str = ""
     model_source: str = "vllm"  # "vllm" or "sglang" (engine family)
     model_metrics: bool = True  # False = load-only endpoint (no token counters)
-    kv_cache_pct: float = 0.0  # 0-100, from vllm:kv_cache_usage_perc × 100
-    kv_total_blocks: int = 0  # from cache_config_info num_gpu_blocks (minus null block)
+    kv_cache_pct: float = 0.0  # 0-100; -1 = no reading (gauge absent/rejected, /get_load)
+    kv_total_blocks: int = 0  # from cache_config_info num_gpu_blocks (vLLM only; 0 on SGLang)
     kv_block_size: int = 0  # tokens per block
-    kv_total_tokens: int = 0  # KV capacity: kv_cache_size_tokens, else blocks*block_size
+    kv_total_tokens: int = 0  # KV capacity: vLLM tokens/blocks×size, SGLang max_total_num_tokens
     kv_prefix_hit_rate: float = -1.0  # prefix cache hit rate 0-100, -1 = unavailable
     kv_cache_free_blocks: int = 0  # free blocks = kv_total_blocks * (1 - usage_pct)
-    kv_cache_used_tokens: int = 0  # used token capacity = kv_total_tokens * usage_pct
-    prefix_queries_total: float = 0.0  # cumulative vllm:prefix_cache_queries_total
-    prefix_hits_total: float = 0.0  # cumulative vllm:prefix_cache_hits_total
+    kv_cache_used_tokens: int = 0  # used token capacity (SGLang num_used_tokens when stated)
+    prefix_queries_total: float = 0.0  # cumulative vllm:prefix_cache_queries_total (vLLM only)
+    prefix_hits_total: float = 0.0  # cumulative vllm:prefix_cache_hits_total (vLLM only)
     requests_running: int = 0
     requests_waiting: int = 0
     ttft_p50_ms: float = 0.0
@@ -155,6 +155,19 @@ class ClusterStats:
         return [u for u in self.units if u.model_hosted]
 
     @property
+    def throughput_measured(self) -> bool:
+        """Whether any hosted unit reports token counters, i.e. whether the
+        cluster's throughput sum is a measurement rather than a default.
+
+        An endpoint without counters (SGLang started without
+        ``--enable-metrics``) publishes no rate at all — its
+        ``throughput_tok_s`` is the dataclass's 0.0, not a reading of zero —
+        so the consumers that would otherwise paint "0 tok/s" ask this
+        first and paint the unknown marker instead. Mirrors the per-model
+        gate the serving history already applies (``model_metrics``)."""
+        return any(u.model_metrics for u in self.hosted_units)
+
+    @property
     def total_kv_capacity_tokens(self) -> int:
         """Total KV cache token capacity across all hosted units.
         In TP/DP setups, nodes share the same pool, so this is the
@@ -175,10 +188,12 @@ class ClusterStats:
     @property
     def kv_cache_pct(self) -> float:
         """Aggregate KV cache usage percentage from first hosted unit.
-        In TP setups all nodes share the same pool, so this is accurate."""
+        In TP setups all nodes share the same pool, so this is accurate.
+        No hosted unit is no reading, not an empty pool: -1, like the
+        unit-level sentinel and ``kv_prefix_hit_rate``."""
         hosted = self.hosted_units
         if not hosted:
-            return 0.0
+            return -1.0
         return hosted[0].kv_cache_pct
 
     @property

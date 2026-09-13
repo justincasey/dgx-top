@@ -160,6 +160,53 @@ def test_quiet_validation(tmp_path: Path):
     assert load_config(_write(tmp_path)).quiet is False
 
 
+def _with_node_line(extra: str, tmp_path: Path) -> Path:
+    return _write(tmp_path, VALID_CONFIG.replace("worker = false", f"worker = false\n{extra}"))
+
+
+def test_node_engine_key_is_optional_and_validated(tmp_path: Path):
+    # Absent: the engine is inferred from the endpoint's own metrics.
+    assert load_config(_write(tmp_path)).nodes[0].engine is None
+
+    for engine in ("vllm", "sglang"):
+        path = _with_node_line(f'engine = "{engine}"', tmp_path)
+        assert load_config(path).nodes[0].engine == engine
+
+    path = _with_node_line('engine = "tgi"', tmp_path)
+    with pytest.raises(ConfigError, match="engine"):
+        load_config(path)
+
+    path = _with_node_line("engine = 3", tmp_path)
+    with pytest.raises(ConfigError, match="engine"):
+        load_config(path)
+
+
+def test_engine_reaches_the_collector_units(tmp_path: Path):
+    import config as cfg
+    from config import configure
+
+    configure(_with_node_line('engine = "sglang"', tmp_path))
+    try:
+        assert cfg.SPARK_UNITS[1]["engine"] == "sglang"
+        assert cfg.SPARK_UNITS[1]["vllm_url"] == "http://spark-primary.example.com:8000"
+    finally:
+        configure(_write(tmp_path))
+
+
+def test_declared_engines_match_the_collector_profiles():
+    """``config.ENGINES`` gates the declared value and
+    ``collector.ENGINE_PROFILES`` parses the same engine family, so a profile
+    added without a declared value (or the reverse) leaves the two halves of
+    one vocabulary out of step — the declared key would then name a row's
+    engine while nothing could parse that engine's metrics. The collector
+    imports config, so the two sets cannot be derived from one another — this
+    is the pin that keeps them from drifting apart silently."""
+    import collector
+    import config as cfg
+
+    assert cfg.ENGINES == set(collector.ENGINE_PROFILES)
+
+
 def test_configure_resets_simulate_flag_without_simulate(tmp_path: Path):
     """A non-simulate configure must clear a prior --simulate flag (no leak)."""
     import config as cfg
