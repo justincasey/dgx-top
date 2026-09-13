@@ -26,6 +26,22 @@ class NodeConfig:
     ssh_target: str
     vllm_url: str
     worker: bool = False
+    engine: str | None = None
+    """Expected inference engine (``"vllm"`` or ``"sglang"``); ``None`` means
+    infer it from the endpoint's own metrics. The URL is engine-agnostic, so
+    the field selects no metric profile and no protocol of its own: it
+    suppresses SGLang's load-API probe on a node declared ``"vllm"``, and it
+    names the engine on a load-only row (``collector.poll_unit`` sets
+    ``model_source`` from it)."""
+
+
+ENGINES = {"vllm", "sglang"}
+"""Recognised values for ``NodeConfig.engine``.
+
+Must stay equal to ``collector.ENGINE_PROFILES``: every engine the collector
+can parse needs a declared value. The collector imports this module, so the
+two sets cannot be derived from one another; ``tests/test_config.py`` pins
+the coupling instead of leaving it to drift."""
 
 
 METER_TREATMENTS = {"gradient", "spark", "tick", "line"}
@@ -101,7 +117,14 @@ def _parse_node(raw: object, node_number: int) -> NodeConfig:
     worker = raw.get("worker", False)
     if not isinstance(worker, bool):
         raise ConfigError(f"nodes[{node_number}].worker must be true or false")
-    return NodeConfig(label, ssh_target, vllm_url, worker)
+    engine = raw.get("engine")
+    if engine is not None:
+        if not isinstance(engine, str) or engine.strip().lower() not in ENGINES:
+            raise ConfigError(
+                f"nodes[{node_number}].engine must be one of: " + ", ".join(sorted(ENGINES))
+            )
+        engine = engine.strip().lower()
+    return NodeConfig(label, ssh_target, vllm_url, worker, engine)
 
 
 def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
@@ -212,6 +235,7 @@ def configure(
                 "ssh_target": node.ssh_target,
                 "vllm_url": node.vllm_url,
                 "worker": node.worker,
+                "engine": node.engine,
             }
             for index, node in enumerate(settings.nodes, 1)
         }

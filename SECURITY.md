@@ -12,11 +12,11 @@ Include a concise description, affected version or commit, reproduction steps, a
 - It invokes the local OpenSSH client with non-interactive authentication.
 - SSH host-key verification remains enabled.
 - It executes a fixed read-only telemetry command on configured nodes.
-- It performs unauthenticated HTTP GET requests to configured vLLM endpoints.
+- It performs unauthenticated HTTP GET requests to configured engine endpoints: `/metrics` (vLLM and SGLang), SGLang's `/v1/loads` and `/get_load` load API when metrics are unavailable, and `/v1/models` for served model names.
 - It does not store telemetry, credentials, endpoint responses, or history on disk.
 - Configuration contains connection targets only and should never contain secret material.
 
-Users are responsible for limiting network exposure of vLLM metrics and protecting their SSH private keys using normal operating-system and OpenSSH controls.
+Users are responsible for limiting network exposure of engine metrics endpoints and protecting their SSH private keys using normal operating-system and OpenSSH controls.
 
 ## Supported versions
 

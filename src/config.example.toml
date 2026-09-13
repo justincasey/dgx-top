@@ -14,7 +14,11 @@ meter_treatment = "gradient"
 quiet = false
 
 # ssh_target accepts either user@host or an alias from ~/.ssh/config.
-# vllm_url is accessed directly from the machine running dgx-top.
+# vllm_url is the inference-engine base URL, accessed directly from the machine
+# running dgx-top.
+# engine is optional: "vllm" or "sglang". Leave it out and dgx-top detects the
+# engine from the endpoint's own metrics. Declaring "vllm" skips SGLang's
+# load-API probes.
 [[nodes]]
 label = "spark-1"
 ssh_target = "spark@spark01.example.com"

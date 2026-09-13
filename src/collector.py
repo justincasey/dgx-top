@@ -4,6 +4,7 @@ import asyncio
 import math
 import re
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -160,11 +161,28 @@ def _engine_label(line: str, key: str = "engine") -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _labeled_series(lines: List[str], name: str) -> List[Tuple[Optional[str], float]]:
-    """``_metric_series`` with each sample's engine label attached — for
-    aggregations that must pair samples across metric families BY ENGINE,
+def _label_text(line: str) -> Optional[str]:
+    """The raw ``{…}`` label set of an exposition sample line, if it has one.
+
+    SGLang identifies a series by its whole label set (``model_name``,
+    ``tp_rank``, ``pp_rank``, optional ``dp_rank``) rather than by a single
+    ``engine`` label, and its two KV gauges expose identical label sets — so
+    pairing on the full label text is exact there. vLLM cannot use it: its
+    usage gauge and its ``cache_config_info`` block carry different label
+    sets, so vLLM pairs on the ``engine`` label they share.
+    """
+    m = re.search(r"\{(.*)\}", line)
+    return m.group(1) if m else None
+
+
+def _labeled_series(
+    lines: List[str], name: str, key: Optional[str] = "engine"
+) -> List[Tuple[Optional[str], float]]:
+    """``_metric_series`` with each sample's series key attached — for
+    aggregations that must pair samples across metric families BY SERIES,
     not by line order (two families' label orderings are not guaranteed to
-    correspond)."""
+    correspond). ``key`` selects the pairing identity: a label name, or
+    ``None`` for the full label set (see ``_label_text``)."""
     out: List[Tuple[Optional[str], float]] = []
     for line in lines:
         if not line.startswith(name):
@@ -179,7 +197,8 @@ def _labeled_series(lines: List[str], name: str) -> List[Tuple[Optional[str], fl
             except ValueError:
                 continue
             if math.isfinite(v):
-                out.append((_engine_label(line), v))
+                label = _label_text(line) if key is None else _engine_label(line, key)
+                out.append((label, v))
     return out
 
 
@@ -196,15 +215,118 @@ def _ns_sample_count(lines: List[str], ns: str) -> int:
     return sum(1 for line in lines if line.startswith(ns) and len(line.split()) >= 2)
 
 
-def _parse_vllm_metrics(text: str) -> SparkUnitStats:
-    """Parse vLLM Prometheus metrics into SparkUnitStats.
+# Engine metric profile — which metric name carries each semantic, per engine
+# family. SGLang shares only the token counters and the TTFT histogram with
+# vLLM: its concurrency, KV and prefix-cache series have different NAMES and
+# different TYPES (gauges, where vLLM has a config block and cumulative
+# counters). Nothing is ever derived by prefixing a vLLM name with another
+# namespace — a semantic absent from a profile has no candidates, so an
+# engine-specific fallback can never fire on the other engine.
+ENGINE_PROFILES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "vllm": {
+        "generation_tokens": ("generation_tokens_total", "generation_tokens"),
+        "request_generation_tokens": ("request_generation_tokens_sum",),
+        "prompt_tokens": ("prompt_tokens_total", "prompt_tokens"),
+        "ttft": ("time_to_first_token_seconds",),
+        "itl": ("time_per_output_token_seconds",),
+        "kv_usage": ("kv_cache_usage_perc",),
+        "cache_config": ("cache_config_info",),
+        "running": ("num_requests_running",),
+        "waiting": ("num_requests_waiting",),
+        "prefix_hits": ("prefix_cache_hits_total",),
+        "prefix_queries": ("prefix_cache_queries_total",),
+    },
+    "sglang": {
+        "generation_tokens": ("generation_tokens_total",),
+        "prompt_tokens": ("prompt_tokens_total",),
+        "ttft": ("time_to_first_token_seconds",),
+        # v0.4.5 renamed time_per_output_token_seconds ->
+        # inter_token_latency_seconds; accept both so either generation reads.
+        "itl": ("inter_token_latency_seconds", "time_per_output_token_seconds"),
+        # Gauges (0-1 fractions), not vLLM's block percentage / config block.
+        "kv_usage": ("token_usage",),
+        "kv_capacity": ("max_total_num_tokens",),
+        "kv_used": ("num_used_tokens",),
+        "running": ("num_running_reqs",),
+        "waiting": ("num_queue_reqs",),
+        # A gauge (0-1); SGLang exposes no prefix-cache counters at all.
+        "prefix_hit_rate": ("cache_hit_rate",),
+    },
+}
 
-    Series are selected by exact metric name (see ``_metric_series``) and
-    summed across label sets, so an endpoint exposing several engines reports
-    one honest endpoint-level aggregate instead of whichever engine printed
-    last. Modern vLLM names (``*_total``) win over the legacy bare names.
+DEFAULT_ENGINE = "vllm"
+"""Engine assumed when neither namespace carries sample evidence."""
 
-    KV cache data available from /metrics:
+
+def metrics_engine(text: str) -> Optional[str]:
+    """The engine family a ``/metrics`` payload reports, or None when it
+    carries no sample line from either namespace.
+
+    Sample evidence, not substring matching: majority of actual sample lines,
+    tie -> vLLM, so one stray sample from the other family can never flip the
+    parse and zero out every real series. This is what the *payload* says it
+    is — an endpoint's own metrics are authoritative about which engine
+    serves it.
+    """
+    lines = text.splitlines()
+    vllm_n = _ns_sample_count(lines, "vllm:")
+    sglang_n = _ns_sample_count(lines, "sglang:")
+    if sglang_n > vllm_n:
+        return "sglang"
+    if vllm_n:
+        return DEFAULT_ENGINE
+    return None
+
+
+def detect_engine(text: str) -> str:
+    """``metrics_engine`` with the neutral default applied for callers that
+    need an engine id regardless (metric names must be looked up somewhere)."""
+    return metrics_engine(text) or DEFAULT_ENGINE
+
+
+def _metric_names(engine: str, semantic: str) -> Tuple[str, ...]:
+    """Namespace-qualified candidate names for one semantic on one engine."""
+    profile = ENGINE_PROFILES.get(engine, ENGINE_PROFILES[DEFAULT_ENGINE])
+    return tuple(f"{engine}:{name}" for name in profile.get(semantic, ()))
+
+
+def _series_ladder(lines: List[str], *names: str) -> Tuple[List[float], bool]:
+    """Modern metric name first; a legacy name is tried only when the modern
+    one is entirely ABSENT from the payload.
+
+    The distinction matters: a live-but-non-finite modern sample must not
+    silently rebase a throughput baseline onto a different source, which
+    would paint a false spike when the counter recovers."""
+    if not names:
+        return [], False
+    vals, saw = _metric_series(lines, names[0])
+    if vals or saw or len(names) == 1:
+        return vals, saw
+    return _metric_series(lines, *names[1:])
+
+
+def _capacity_weighted_mean(pairs: List[Tuple[float, float]]) -> float:
+    """Mean of per-series usage fractions weighted by each series' capacity.
+
+    Never one engine's usage over another engine's capacity: if no pair
+    carries a usable capacity, falls back to the plain mean."""
+    cap_sum = sum(c for _v, c in pairs)
+    if cap_sum > 0:
+        return sum(v * c for v, c in pairs) / cap_sum
+    return sum(v for v, _c in pairs) / len(pairs)
+
+
+def _parse_engine_metrics(text: str) -> SparkUnitStats:
+    """Parse engine Prometheus metrics into SparkUnitStats.
+
+    The engine family is chosen by sample evidence (``detect_engine``) and
+    every series is then looked up through that engine's profile
+    (``ENGINE_PROFILES``) — the two families are NOT the same shape. Series
+    are selected by exact metric name (see ``_metric_series``) and summed
+    across label sets, so an endpoint exposing several engines reports one
+    honest endpoint-level aggregate instead of whichever engine printed last.
+
+    vLLM KV cache data available from /metrics:
       - vllm:kv_cache_usage_perc (Gauge): block-level allocation fraction (0-1).
         Usage = 1.0 - (free_blocks / (total_gpu_blocks - 1)). The null block is
         subtracted from total because vLLM reserves 1 block as sentinel. This
@@ -222,6 +344,26 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
         (cumulative Counters): hit rate is derived per poll window in
         _update_prefix_hit_rate (no *_hit_rate gauge exists on modern vLLM).
 
+    SGLang exposes the same semantics as GAUGES instead:
+      - sglang:token_usage (0-1) with sglang:max_total_num_tokens as capacity
+        and sglang:num_used_tokens as the used count; there is no block
+        concept, so kv_total_blocks stays 0 and capacity lives in
+        kv_total_tokens.
+      - sglang:cache_hit_rate (0-1) is a rate, not a counter pair, so it
+        feeds kv_prefix_hit_rate directly and bypasses the per-poll delta
+        machinery in _update_prefix_hit_rate (which is counter-only and
+        early-returns with no queries).
+      - SGLang's mutable scheduler metrics are written only by the stats-logging
+        rank (attn_tp_rank == 0) unless --enable-metrics-for-all-schedulers
+        is set, so summing across their label sets is the correct endpoint
+        total; the non-default all-schedulers flag would over-count
+        replicated per-rank series and is a documented limitation. Its
+        constant gauges are the exception: max_total_num_tokens is published
+        by EVERY rank (Scheduler.emit_metrics_constants runs in each rank's
+        __init__, gated only on --enable-metrics) and every rank of a replica
+        reports the same shared pool, so capacity is collapsed per replica
+        (test_sglang_capacity_collapses_ranks_of_one_replica).
+
     Derived token counts: total_tokens (above) and used_tokens =
     total_tokens * usage_fraction. These are *block-allocated token capacity*,
     not actual stored tokens; the correct "how much of my pool is consumed"
@@ -229,15 +371,13 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     """
     s = SparkUnitStats()
     lines = text.strip().splitlines()
-    # SGLang mirrors the vLLM metric shape under the ``sglang:`` namespace
-    # when started with --enable-metrics; one parser, both namespaces. The
-    # namespace is chosen by sample evidence — majority of actual sample
-    # lines, tie → vllm — so one stray sample from the other family can
-    # never flip the parse and zero out every real series.
-    vllm_n = _ns_sample_count(lines, "vllm:")
-    sglang_n = _ns_sample_count(lines, "sglang:")
-    ns = "sglang:" if sglang_n > vllm_n else "vllm:"
-    s.model_source = "sglang" if ns == "sglang:" else "vllm"
+    engine = detect_engine(text)
+    profile = ENGINE_PROFILES.get(engine, ENGINE_PROFILES[DEFAULT_ENGINE])
+    ns = f"{engine}:"
+    s.model_source = engine
+    # Which label identifies a series for cross-family pairing: vLLM's two KV
+    # families share only engine="…"; SGLang's share their whole label set.
+    cap_key: Optional[str] = "engine" if "cache_config" in profile else None
     # Cache config — block_size and total_blocks from cache_config_info at
     # startup. Pool capacity ACCUMULATES across engines (an endpoint exposing
     # several engines owns the summed pool, consistent with the summation
@@ -246,81 +386,153 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     engine_caps: List[float] = []
     caps_by_engine: Dict[str, float] = {}
     for line in lines:
-        if f"{ns}cache_config_info{{" in line:
+        if "cache_config" in profile and f"{ns}cache_config_info{{" in line:
             m = re.search(r'num_gpu_blocks="(\d+)"', line)
             if m:
-                blocks = int(m.group(1))
+                blocks = _bounded(int(m.group(1)))
                 s.kv_total_blocks += blocks
                 engine_caps.append(float(blocks))
-                lbl = _engine_label(line)
-                if lbl is not None:
-                    caps_by_engine[lbl] = float(blocks)
+                cap_lbl = _engine_label(line)
+                if cap_lbl is not None:
+                    caps_by_engine[cap_lbl] = float(blocks)
             m = re.search(r'block_size="(\d+)"', line)
             if m:
-                s.kv_block_size = max(s.kv_block_size, int(m.group(1)))
+                s.kv_block_size = max(s.kv_block_size, _bounded(int(m.group(1))))
             m = re.search(r'kv_cache_size_tokens="(\d+)"', line)
             if m:
-                size_tokens += int(m.group(1))
+                size_tokens += _bounded(int(m.group(1)))
+    # Remote text can repeat huge literals; keep every downstream integer
+    # float-safe (an unbounded product raises OverflowError mid-parse).
+    s.kv_total_blocks = _bounded(s.kv_total_blocks)
+    size_tokens = _bounded(size_tokens)
     if size_tokens > 0:
         s.kv_total_tokens = size_tokens
-    elif s.kv_total_blocks > 0 and s.kv_block_size > 0:
+    elif "cache_config" in profile and s.kv_total_blocks > 0 and s.kv_block_size > 0:
         s.kv_total_tokens = s.kv_total_blocks * s.kv_block_size
+    elif "kv_capacity" in profile:
+        # SGLang has no cache_config_info block: capacity is a per-scheduler
+        # gauge. There is no block concept either, so kv_total_blocks stays 0
+        # and the token count is the whole pool. Unlike the mutable gauges this
+        # one is published by EVERY rank (`Scheduler.emit_metrics_constants`
+        # runs in each rank's __init__ and is gated only on --enable-metrics),
+        # and every rank of a replica reports its one shared pool — so the
+        # label sets of a replica are collapsed to a single capacity before
+        # summing the replicas.
+        caps_by_replica: Dict[str, float] = {}
+        for cap_lbl, cap in _labeled_series(
+            lines, *_metric_names(engine, "kv_capacity"), key=cap_key
+        ):
+            engine_caps.append(cap)
+            if cap_lbl is not None:
+                caps_by_engine[cap_lbl] = cap
+            # Series values are already finite-filtered by _labeled_series.
+            key = _replica_key(cap_lbl)
+            caps_by_replica[key] = max(caps_by_replica.get(key, 0.0), cap)
+        s.kv_total_tokens = int(_finite_sum(caps_by_replica.values()))
 
-    # KV cache usage — block-level allocation fraction (null block already
-    # netted out by vLLM). The honest endpoint number pairs each engine's
-    # gauge with ITS OWN capacity: by engine label when both families carry
-    # one (line order across two metric families is not guaranteed to
-    # correspond), else by line order when the counts pair, else a plain
-    # mean — never one engine's usage over another engine's capacity.
-    usage = _labeled_series(lines, f"{ns}kv_cache_usage_perc")
-    if usage:
+    # KV cache usage — an allocation fraction of the pool (0-1; vLLM's null
+    # block is already netted out of its block accounting). The honest
+    # endpoint number pairs each series' usage with ITS OWN capacity: by the
+    # shared series key when both families carry it (line order across two
+    # metric families is not guaranteed to correspond), else by line order
+    # when the counts pair, else a plain mean — never one engine's usage over
+    # another engine's capacity.
+    usage_names = _metric_names(engine, "kv_usage")
+    usage = _labeled_series(lines, usage_names[0], key=cap_key) if usage_names else []
+    val = 0.0
+    have_usage = bool(usage)
+    if have_usage:
         if all(lbl is not None and lbl in caps_by_engine for lbl, _v in usage):
             pairs = [(v, caps_by_engine[lbl]) for lbl, v in usage]
         elif len(usage) == len(engine_caps) and sum(engine_caps) > 0:
             pairs = [(v, c) for (_l, v), c in zip(usage, engine_caps)]
         else:
             pairs = [(v, 1.0) for _l, v in usage]
-        cap_sum = sum(c for _v, c in pairs)
-        if cap_sum > 0:
-            val = sum(v * c for v, c in pairs) / cap_sum
+        val = _capacity_weighted_mean(pairs)
+        # The series is an allocation fraction by contract — vLLM's
+        # ``kv_cache_usage_perc`` and SGLang's ``token_usage`` are both 0-1 —
+        # so every sample is banded BEFORE it is averaged: one hostile value
+        # (+1e308 beside -1e308) would otherwise launder through the mean into
+        # a plausible-looking 0% pool. A value outside the band is a foreign or
+        # mis-scaled series, rejected rather than clamped (the policy
+        # ``_coerce_fraction`` applies to the load API); the ×100 happens
+        # below, so this is where the band belongs.
+        pairs = [(v, c) for v, c in pairs if math.isfinite(v) and 0.0 <= v <= 1.0]
+        val = _capacity_weighted_mean(pairs) if pairs else 0.0
+        if pairs and math.isfinite(val) and 0.0 <= val <= 1.0:
+            s.kv_cache_pct = val * 100
         else:
-            val = sum(v for v, _c in pairs) / len(pairs)
-        pct = val * 100
-        # A finite raw value can still overflow the ×100 scaling; a poisoned
-        # gauge would wreck the Sparkline history and the renderer.
-        if math.isfinite(pct):
-            s.kv_cache_pct = pct
-            if s.kv_total_tokens > 0:
-                s.kv_cache_free_blocks = int(s.kv_total_blocks * (1 - val))
-                s.kv_cache_used_tokens = int(s.kv_total_tokens * val)
+            # Rejected: the pool's fill is unknown, which is not the same
+            # reading as empty — the -1 sentinel is what the UI renders as
+            # "no reading" (the prefix hit rate already uses it).
+            have_usage = False
+            s.kv_cache_pct = -1.0
+    else:
+        # No usage series at all: unknown, not empty.
+        s.kv_cache_pct = -1.0
+    if "kv_used" in profile:
+        # SGLang states the used token count outright, so take it even when
+        # the usage fraction is missing, and fall back to the fraction's
+        # product only when the gauge is absent.
+        used = _metric_series(lines, *_metric_names(engine, "kv_used"))[0]
+        if used:
+            s.kv_cache_used_tokens = _safe_int(_finite_sum(used))
+        elif have_usage and s.kv_total_tokens > 0:
+            s.kv_cache_used_tokens = _safe_int(s.kv_total_tokens * val)
+    elif have_usage and s.kv_total_tokens > 0:
+        s.kv_cache_free_blocks = _safe_int(s.kv_total_blocks * (1 - val))
+        s.kv_cache_used_tokens = _safe_int(s.kv_total_tokens * val)
 
-    hits, _ = _metric_series(lines, f"{ns}prefix_cache_hits_total")
-    s.prefix_hits_total = sum(hits)
-    queries, _ = _metric_series(lines, f"{ns}prefix_cache_queries_total")
-    s.prefix_queries_total = sum(queries)
+    # Prefix cache. vLLM exposes cumulative counters, so the hit rate is
+    # derived per poll window in _update_prefix_hit_rate. SGLang exposes a
+    # 0-1 rate gauge instead and no counters at all: average the label sets
+    # (a rate, so capacity weighting would be meaningless) and set the field
+    # directly — _update_prefix_hit_rate early-returns with no queries and
+    # leaves this value standing. Counters stay 0 so nothing downstream can
+    # mistake the gauge for a cumulative pair.
+    if "prefix_hits" in profile:
+        hits, _ = _metric_series(lines, *_metric_names(engine, "prefix_hits"))
+        s.prefix_hits_total = sum(hits)
+        queries, _ = _metric_series(lines, *_metric_names(engine, "prefix_queries"))
+        s.prefix_queries_total = sum(queries)
+    rate_names = _metric_names(engine, "prefix_hit_rate")
+    if rate_names:
+        rates, _ = _metric_series(lines, *rate_names)
+        if rates:
+            raw = sum(rates) / len(rates)
+            # A rate gauge is a 0-1 fraction; anything else (NaN, a negative
+            # or an oversized sample) is not a hit rate, so leave the "no
+            # data" sentinel standing rather than render a nonsense percent.
+            if math.isfinite(raw) and 0.0 <= raw <= 1.0:
+                s.kv_prefix_hit_rate = raw * 100.0
 
     # Concurrency — summed across engines; *_by_reason breakdowns excluded.
-    running, _ = _metric_series(lines, f"{ns}num_requests_running")
+    running, _ = _metric_series(lines, *_metric_names(engine, "running"))
     s.requests_running = int(sum(running))
-    waiting, _ = _metric_series(lines, f"{ns}num_requests_waiting")
+    waiting, _ = _metric_series(lines, *_metric_names(engine, "waiting"))
     s.requests_waiting = int(sum(waiting))
 
     # TTFT histogram
-    ttft_lines = [l for l in lines if l.startswith(f"{ns}time_to_first_token_seconds")]
-    if ttft_lines:
-        buckets, count = _parse_prometheus_histogram(ttft_lines, f"{ns}time_to_first_token_seconds")
+    for ttft_name in _metric_names(engine, "ttft"):
+        ttft_lines = [l for l in lines if l.startswith(ttft_name)]
+        if not ttft_lines:
+            continue
+        buckets, count = _parse_prometheus_histogram(ttft_lines, ttft_name)
         s.ttft_p50_ms = _estimate_quantile(buckets, count, 0.50) * 1000
         s.ttft_p95_ms = _estimate_quantile(buckets, count, 0.95) * 1000
         s.ttft_p99_ms = _estimate_quantile(buckets, count, 0.99) * 1000
+        break
 
-    # ITL histogram
-    itl_lines = [l for l in lines if l.startswith(f"{ns}time_per_output_token_seconds")]
-    if itl_lines:
-        buckets, count = _parse_prometheus_histogram(
-            itl_lines, f"{ns}time_per_output_token_seconds"
-        )
+    # ITL histogram — the first candidate name present wins (SGLang's newer
+    # inter_token_latency_seconds before the pre-v0.4.5 name).
+    for itl_name in _metric_names(engine, "itl"):
+        itl_lines = [l for l in lines if l.startswith(itl_name)]
+        if not itl_lines:
+            continue
+        buckets, count = _parse_prometheus_histogram(itl_lines, itl_name)
         s.itl_p50_ms = _estimate_quantile(buckets, count, 0.50) * 1000
         s.itl_p99_ms = _estimate_quantile(buckets, count, 0.99) * 1000
+        break
 
     # Prefer the live generation token counter. The request histogram fallback
     # only updates when requests finish, so it can lag and spike during long
@@ -330,10 +542,7 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     # the throughput baseline onto a different source and paint a false spike
     # on recovery).
     has_gen_tokens = False
-    gen, saw_gen = _metric_series(lines, f"{ns}generation_tokens_total")
-    if not gen and not saw_gen:
-        # Older vLLM exposes the counter without the _total suffix.
-        gen, saw_gen = _metric_series(lines, f"{ns}generation_tokens")
+    gen, saw_gen = _series_ladder(lines, *_metric_names(engine, "generation_tokens"))
     if gen:
         has_gen_tokens = True
         s.generation_tokens_total = sum(gen)
@@ -342,7 +551,7 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
         # baseline is dropped and recovers cleanly instead of mixing sources.
         s.generation_tokens_total = 0.0
     else:
-        fallback, _ = _metric_series(lines, f"{ns}request_generation_tokens_sum")
+        fallback, _ = _metric_series(lines, *_metric_names(engine, "request_generation_tokens"))
         if fallback:
             has_gen_tokens = True
             s.generation_tokens_total = sum(fallback)
@@ -352,9 +561,7 @@ def _parse_vllm_metrics(text: str) -> SparkUnitStats:
     # a transient NaN on the modern counter must not silently switch the
     # prompt-throughput baseline onto a different source (false spike on
     # recovery).
-    ptot, saw_ptot = _metric_series(lines, f"{ns}prompt_tokens_total")
-    if not ptot and not saw_ptot:
-        ptot, _ = _metric_series(lines, f"{ns}prompt_tokens")
+    ptot, _ = _series_ladder(lines, *_metric_names(engine, "prompt_tokens"))
     s.prompt_tokens_total = sum(ptot)
 
     if has_gen_tokens or s.kv_total_blocks > 0 or s.requests_running > 0 or s.ttft_p50_ms > 0:
@@ -531,53 +738,249 @@ async def _ssh_run(target: str, cmd: str) -> str:
     return stdout.decode()
 
 
-async def _fetch_vllm_metrics(vllm_url: str) -> str:
-    """Fetch vLLM metrics via HTTP."""
-    url = f"{vllm_url}/metrics"
+async def _fetch_metrics(engine_url: str) -> str:
+    """Fetch engine Prometheus metrics via HTTP."""
+    url = f"{engine_url}/metrics"
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.text
 
 
-def _coerce_count(v: object) -> int:
-    """Best-effort int for a /get_load field. A malformed value (dict, list,
-    garbage string) degrades to 0 for that field — it must never raise out
-    of the parse, or one bad payload kills the whole cluster poll tick
-    (``poll_cluster``'s gather has no ``return_exceptions``). JSON ``1e999``
-    parses to float inf, so OverflowError is part of the contract too."""
+_MAX_COUNT = 1 << 62  # 4.6e18 tokens: past any real pool, safe in float math
+
+
+def _bounded(n: int) -> int:
+    """Clamp an integer parsed out of remote text to a float-safe magnitude.
+
+    Huge exact integers survive ``int()`` but every later ``float()`` or
+    ``int(int * float)`` on them raises OverflowError, so they are admitted
+    only up to a bound no real counter reaches."""
+    return n if -_MAX_COUNT <= n <= _MAX_COUNT else 0
+
+
+def _replica_key(label_text: Optional[str]) -> str:
+    """Identity of the KV *pool* a labelled series belongs to.
+
+    SGLang's label set carries the parallel ranks (``tp_rank``/``pp_rank``/
+    ``moe_ep_rank``) alongside the replica identity. Ranks of one replica
+    inside one tensor-parallel group share a single pool with the same token
+    capacity, while each replica (``dp_rank``) owns its own, so pool capacity
+    must be summed per replica, not per rank."""
+    if not label_text:
+        return ""
+    pairs = re.findall(r'(\w+)="([^"]*)"', label_text)
+    drop = {"tp_rank", "pp_rank", "moe_ep_rank", "attn_tp_rank", "attn_cp_rank", "attn_dp_rank"}
+    return "|".join(f"{k}={v}" for k, v in sorted(pairs) if k not in drop)
+
+
+def _safe_int(v: float) -> int:
+    """``int(v)`` that degrades to 0 instead of raising.
+
+    A poisoned gauge can make a product non-finite or too large for a float;
+    one bad sample must not discard the node's whole metrics parse."""
     try:
-        return int(v)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
+        return int(v) if math.isfinite(v) else 0
+    except (OverflowError, ValueError):
         return 0
 
 
-async def _fetch_sglang_load(vllm_url: str) -> tuple[int, int] | None:
-    """Fetch request concurrency from an SGLang server.
+def _finite_sum(values) -> float:
+    """Sum that never yields a non-finite value.
 
-    SGLang without ``--enable-metrics`` does not serve ``/metrics`` (404) but
-    does expose ``/get_load``: a per-DP-rank list of
-    ``{"num_reqs", "num_waiting_reqs", "num_tokens", …}`` dicts. Returns the
-    summed ``(running, waiting)``, or None when the endpoint does not speak
-    SGLang's load protocol (dead port, non-SGLang server).
-    """
+    Two poisoned gauges (``1e308``) add up to ``inf``, and every later
+    ``int()`` on that raises — one node's whole metrics parse would be
+    discarded. Overflow degrades to 0 instead."""
+    total = 0.0
+    for v in values:
+        if not math.isfinite(v):
+            continue
+        total += v
+        if not math.isfinite(total):
+            return 0.0
+    return total
+
+
+def _coerce_count(v: object) -> int:
+    """Best-effort int for a remote load field. A malformed value (dict, list,
+    garbage string) degrades to 0 for that field — it must never raise out
+    of the parse, or one bad payload kills the whole cluster poll tick
+    (``poll_cluster``'s gather has no ``return_exceptions``). JSON ``1e999``
+    parses to float inf, so OverflowError is part of the contract too.
+
+    Exact big integers are part of that contract: a JSON integer literal with
+    hundreds of digits parses to a Python int that ``int()`` accepts happily
+    and every later ``float()``/division on it raises ``OverflowError``, so
+    anything past any plausible token count degrades to 0 here, at the one
+    place remote load numbers enter the process."""
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{vllm_url}/get_load")
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception:
+        n = int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return _bounded(n)
+
+
+def _coerce_fraction(v: object) -> float:
+    """Best-effort 0-1 fraction for a remote load gauge; -1.0 when absent.
+
+    Out-of-range values are rejected rather than clamped: the load API's
+    gauges are fractions, so 42 is a broken payload, and -1.0 (unknown)
+    leaves the honest fallback arithmetic in place instead of rendering
+    \"4200%\" KV."""
+    try:
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return -1.0
+    return f if math.isfinite(f) and 0.0 <= f <= 1.0 else -1.0
+
+
+@dataclass(frozen=True)
+class EngineLoad:
+    """One endpoint's serving load, aggregated across its DP ranks.
+
+    Filled from SGLang's load API when ``/metrics`` is unavailable (metrics
+    disabled), which is the only signal source then. ``kv_pct`` is -1.0 when
+    the payload does not state it.
+
+    Only the fields the endpoint populates **whatever the launch flags** live
+    here. The same payload also carries ``gen_throughput`` and
+    ``cache_hit_rate``, but both are written by the metrics reporter only
+    inside ``if self.current_scheduler_metrics_enabled:``
+    (``srt/managers/scheduler_components/metrics_reporter.py``, the prefill
+    and decode stats paths), so on the metrics-disabled server that is the
+    only reason the load API is consulted at all they are constant 0 — a
+    schema field, not a reading. Consuming them painted ``0 tok/s`` and
+    ``hit 0%`` for a server generating ~60 tok/s.
+    """
+
+    running: int = 0
+    waiting: int = 0
+    used_tokens: int = 0
+    total_tokens: int = 0
+    kv_pct: float = -1.0
+
+
+def _load_from_v1(data: object) -> EngineLoad | None:
+    """Parse ``/v1/loads`` — the supported SGLang load route.
+
+    The body is an envelope dict whose ``loads`` list holds one flat record
+    per DP rank, each carrying ``num_running_reqs``/``num_waiting_reqs`` plus
+    the KV gauges (``num_used_tokens``, ``max_total_num_tokens``,
+    ``token_usage``). Requests come straight from the scheduler's queues and
+    the KV figures from its pool observer, so those survive
+    ``--enable-metrics`` being off; ``gen_throughput`` and ``cache_hit_rate``
+    do not (see ``EngineLoad``) and are deliberately not read. Returns None
+    when the body is not that protocol.
+    """
+    if not isinstance(data, dict):
         return None
-    entries = data if isinstance(data, list) else [data]
-    running = 0
-    waiting = 0
+    entries = data.get("loads")
+    if not isinstance(entries, list) or not entries:
+        return None
+    running = waiting = used = total = 0
+    pairs: List[Tuple[float, float]] = []
     seen = False
     for entry in entries:
-        if isinstance(entry, dict) and "num_reqs" in entry:
-            seen = True
-            running += _coerce_count(entry.get("num_reqs"))
-            waiting += _coerce_count(entry.get("num_waiting_reqs"))
-    return (running, waiting) if seen else None
+        if not isinstance(entry, dict):
+            continue
+        if not ({"num_running_reqs", "num_waiting_reqs"} & entry.keys()):
+            continue
+        seen = True
+        running += _coerce_count(entry.get("num_running_reqs"))
+        waiting += _coerce_count(entry.get("num_waiting_reqs"))
+        used += _coerce_count(entry.get("num_used_tokens"))
+        cap = _coerce_count(entry.get("max_total_num_tokens"))
+        total += cap
+        usage = _coerce_fraction(entry.get("token_usage"))
+        if usage >= 0:
+            pairs.append((usage, float(cap)))
+    if not seen:
+        return None
+    kv_pct = -1.0
+    if pairs:
+        val = _capacity_weighted_mean(pairs)
+        if math.isfinite(val):
+            kv_pct = val * 100.0
+    elif total > 0:
+        kv_pct = used / total * 100.0
+    return EngineLoad(
+        running=running,
+        waiting=waiting,
+        used_tokens=used,
+        total_tokens=total,
+        kv_pct=kv_pct,
+    )
+
+
+def _load_from_get_load(data: object) -> EngineLoad | None:
+    """Parse ``/get_load`` — SGLang's deprecated load route, kept as fallback.
+
+    The body is a list of per-DP-rank dicts in which ``num_reqs`` is
+    ``num_running_reqs + num_waiting_reqs``, so running requests must be
+    recovered BY SUBTRACTION (assigning ``num_reqs`` to running inflates it
+    by the waiting count). ``num_tokens`` is NOT the pool size: both shapes
+    that serve it report in-flight tokens — used in the pool plus queued —
+    so it is netted down by ``num_pending_tokens`` where the route states it
+    (the deprecation shim in ``http_server.py`` serves
+    ``num_tokens = num_total_tokens`` and
+    ``num_pending_tokens = num_total_tokens - num_used_tokens`` on every
+    release from v0.5.11 on). Releases older than the shim omit
+    ``num_pending_tokens``, and there the value is the in-flight total rather
+    than an exact used count. The route never reports capacity, so
+    ``total_tokens`` stays 0 and the percentage stays -1.0 (unknown): a
+    denominator taken from ``num_tokens`` would render a near-idle server as
+    a saturated pool.
+    """
+    entries = data if isinstance(data, list) else [data]
+    running = waiting = used = 0
+    seen = False
+    for entry in entries:
+        if not isinstance(entry, dict) or "num_reqs" not in entry:
+            continue
+        seen = True
+        reqs = _coerce_count(entry.get("num_reqs"))
+        wait = _coerce_count(entry.get("num_waiting_reqs"))
+        waiting += wait
+        running += max(0, reqs - wait)
+        if "num_tokens" in entry:
+            used += max(
+                0,
+                _coerce_count(entry.get("num_tokens"))
+                - _coerce_count(entry.get("num_pending_tokens")),
+            )
+    if not seen:
+        return None
+    return EngineLoad(
+        running=running,
+        waiting=waiting,
+        used_tokens=used,
+        total_tokens=0,  # /get_load reports no capacity to divide by
+        kv_pct=-1.0,
+    )
+
+
+async def fetch_engine_load(engine_url: str) -> EngineLoad | None:
+    """Fetch serving load from an SGLang server's load API.
+
+    ``/v1/loads`` first (the supported route), then ``/get_load`` (deprecated,
+    removed in a future SGLang version). Returns None when the endpoint speaks
+    neither — a dead port or a non-SGLang server. Every failure mode is
+    swallowed: the probe is an optional fallback, never a poll-killing path.
+    """
+    for path, parse in (("/v1/loads", _load_from_v1), ("/get_load", _load_from_get_load)):
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{engine_url}{path}")
+                resp.raise_for_status()
+                data = resp.json()
+            # Inside the try on purpose: the probe must not be able to raise
+            # past poll_unit, whose awaited call sits outside its own try.
+            load = parse(data)
+        except Exception:
+            continue
+        if load is not None:
+            return load
+    return None
 
 
 def _parse_telemetry_output(stdout: str) -> dict:
@@ -925,45 +1328,69 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
     vllm_url = str(cfg["vllm_url"])
     is_worker = cfg.get("worker", False)
     label = str(cfg["label"])
+    declared_engine = cfg.get("engine")
 
     s = SparkUnitStats(label=label, is_worker=is_worker)
     errors: list[str] = []
 
     # Fetch HTTP and SSH telemetry concurrently. All nodes may serve a model.
-    metrics_task = asyncio.create_task(_fetch_vllm_metrics(vllm_url))
+    metrics_task = asyncio.create_task(_fetch_metrics(vllm_url))
     telemetry_task = asyncio.create_task(_fetch_telemetry(ssh_target))
 
-    vllm_error: Exception | None = None
+    metrics_error: Exception | None = None
     try:
         metrics_text = await metrics_task
-        parsed = _parse_vllm_metrics(metrics_text)
-        if (
-            parsed.model_hosted
-            or _ns_sample_count(metrics_text.splitlines(), "vllm:") > 0
-            or _ns_sample_count(metrics_text.splitlines(), "sglang:") > 0
-        ):
+        parsed = _parse_engine_metrics(metrics_text)
+        if parsed.model_hosted or metrics_engine(metrics_text) is not None:
             parsed.label = label
             parsed.is_worker = is_worker
             s = parsed
             s.model_name = _model_names.get(unit_id, "")
         else:
-            vllm_error = RuntimeError("/metrics served no vllm:/sglang: series")
+            metrics_error = RuntimeError("/metrics served no vllm:/sglang: series")
     except Exception as e:
-        vllm_error = e
-    if vllm_error is not None:
-        # Not a vLLM metrics endpoint (or metrics are disabled on it): an
-        # SGLang server still reports its load over /get_load.
-        load = await _fetch_sglang_load(vllm_url)
+        metrics_error = e
+    if metrics_error is not None:
+        # Not a metrics endpoint (or metrics are disabled on it): an SGLang
+        # server still reports its state over its load API — concurrency and
+        # KV tokens from either route, capacity and percentage only from
+        # /v1/loads — so a metrics-disabled SGLang is not reduced to a blank
+        # node. A node declared as vLLM is never probed for SGLang's routes.
+        if declared_engine == "vllm":
+            load = None
+        else:
+            try:
+                load = await fetch_engine_load(vllm_url)
+            except Exception:
+                # fetch_engine_load is total by contract; the belt stays on so
+                # telemetry_task below is always awaited.
+                load = None
         if load is not None:
             s.model_hosted = True
-            s.model_source = "sglang"
-            s.model_metrics = False  # /metrics 404: no token counters to rate
-            s.requests_running, s.requests_waiting = load
+            s.model_source = declared_engine or "sglang"
+            s.model_metrics = False  # no token counters to rate
+            s.requests_running = load.running
+            s.requests_waiting = load.waiting
+            # Used tokens and capacity are independent: /get_load reports the
+            # former and no capacity at all, while /v1/loads reports both.
+            if load.used_tokens > 0:
+                s.kv_cache_used_tokens = load.used_tokens
+            if load.total_tokens > 0:
+                s.kv_total_tokens = load.total_tokens
+            # The sentinel survives the hop: /get_load states no capacity, so
+            # an unknown fill must not arrive as the dataclass's confident 0%
+            # — a negative value is what the UI renders as "no reading".
+            s.kv_cache_pct = load.kv_pct if load.kv_pct >= 0 else -1.0
+            # Throughput and prefix reuse are NOT set from the load snapshot:
+            # the endpoint states those two fields only when it was started
+            # with --enable-metrics (EngineLoad), so a value taken from here
+            # would be a manufactured 0 rather than the missing reading it is.
+            # They stay at the dataclass sentinels, and the UI paints a dash.
             s.model_name = _model_names.get(unit_id, "")
         else:
-            errors.append(f"vLLM: {vllm_error}")
+            errors.append(f"metrics: {metrics_error}")
 
-    # Hardware telemetry started alongside the vLLM request above.
+    # Hardware telemetry started alongside the metrics request above.
     telemetry = await telemetry_task
 
     # Parse GPU stats

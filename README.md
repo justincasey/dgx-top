@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/justincasey/dgx-top/actions/workflows/ci.yml/badge.svg)](https://github.com/justincasey/dgx-top/actions/workflows/ci.yml)
 
-`dgx-top` is an agentless terminal dashboard for monitoring one- to twelve-node NVIDIA DGX Spark clusters running vLLM. It combines hardware telemetry collected over SSH with vLLM's HTTP metrics—nothing is installed on the Spark nodes.
+`dgx-top` is an agentless terminal dashboard for monitoring one- to twelve-node NVIDIA DGX Spark clusters serving models with vLLM or SGLang. It combines hardware telemetry collected over SSH with the engine's HTTP metrics—nothing is installed on the Spark nodes.
 
 ## What it shows
 
@@ -14,6 +14,7 @@
 - Prompt-to-generation ratio
 - Running and waiting requests
 - KV-cache utilization, block-allocated token capacity, and prefix-cache hit rate
+- The engine serving each model (`vllm` / `sglang` badge), detected from its own metrics
 - Time-to-first-token p50–p95, with the tail taking warn past 2s and an `!!`
   alarm past 8s
 - GPU utilization, temperature, SM clock, memory, and power draw
@@ -28,14 +29,27 @@
 - macOS or Linux
 - Python 3.10 or newer
 - OpenSSH client
-- Network access to each configured vLLM HTTP endpoint
+- Network access to each configured inference-engine HTTP endpoint
 
 **Each DGX Spark node**
 
 - Passwordless SSH public-key authentication
 - `nvidia-smi`
 - Read access to `/proc` and `/sys`
-- A running vLLM server exposing `/metrics`
+- A running inference server:
+  - vLLM exposing `/metrics`, or
+  - SGLang started with `--enable-metrics` (exposes the `sglang:` series), or
+    plain SGLang, whose load API `dgx-top` reads instead
+
+`dgx-top` reads whichever engine is there. It identifies the engine family from
+the metric names in `/metrics`; a server without `--enable-metrics` is detected
+through SGLang's load API (`/v1/loads`, then the deprecated `/get_load`). The
+supported route carries the request queues and the KV gauges — used tokens,
+capacity and percentage — while `/get_load` states requests and a used-token
+count only, so capacity and percentage read `—` on it. The load API says nothing
+about token throughput or the prefix-cache hit rate at all: those come from
+`/metrics`, so a server started without `--enable-metrics` paints
+`no tok/s · sglang` and a `—` cache row rather than a zero nobody measured.
 
 `dgx-top` never needs an SSH password, private key contents, sudo credentials, or an API token in its configuration.
 
@@ -50,7 +64,7 @@ uv sync
 uv run dgx-top init      # writes ~/.config/dgx-top/config.toml (mode 0600)
 ```
 
-Edit the SSH targets and vLLM URLs in `~/.config/dgx-top/config.toml`, then
+Edit the SSH targets and engine URLs in `~/.config/dgx-top/config.toml`, then
 validate access and launch:
 
 ```bash
@@ -109,6 +123,7 @@ label = "spark-1"
 ssh_target = "spark-primary"
 vllm_url = "http://spark01.example.com:8000"
 worker = false
+# engine = "sglang"  # optional; inferred from the endpoint's metrics when absent
 
 [[nodes]]
 label = "spark-2"
@@ -121,15 +136,16 @@ worker = true
 | ---------------- | --------------------------------------------------------------------------- |
 | `label`          | Short unique name shown in the dashboard                                    |
 | `ssh_target`     | Any target accepted by `ssh`, such as `user@host` or an SSH alias           |
-| `vllm_url`       | vLLM base URL reachable from the control machine; do not include `/metrics` |
+| `vllm_url`       | Inference-engine base URL reachable from the control machine; do not include `/metrics` |
 | `worker`         | Marks a worker node in a tensor-parallel deployment                         |
+| `engine`         | Optional `"vllm"` or `"sglang"`. Absent: inferred from the endpoint's own metrics (authoritative). Set to `"vllm"` to skip SGLang's load-API probes entirely |
 | `poll_interval`  | Initial polling interval in seconds, from 1 to 60                           |
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
 | `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 
-The SSH target and vLLM URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
+The SSH target and engine URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
 
 To use a different file:
 
@@ -224,7 +240,7 @@ exact reference hues.
 
 1. The SSH target accepts key-based, non-interactive authentication.
 2. `nvidia-smi` is available and `/proc/stat` is readable.
-3. The configured vLLM `/metrics` endpoint is reachable and contains vLLM metrics.
+3. The configured engine's `/metrics` endpoint (or its SGLang load API) is reachable and carries engine metrics.
 
 No collected telemetry or endpoint response body is written to disk.
 
@@ -280,7 +296,7 @@ model and one shared time axis in the line chart, one hue per model.
 
 ## Synthetic data
 
-Run a whole cluster offline with no SSH or vLLM access:
+Run a whole cluster offline with no SSH or engine access:
 
 ```bash
 uv run dgx-top --simulate 12
@@ -321,19 +337,21 @@ The connection is probably relying on password authentication. Confirm non-inter
 ssh -o BatchMode=yes YOUR_SSH_TARGET true
 ```
 
-### vLLM metrics fail while SSH passes
+### Engine metrics fail while SSH passes
 
 The metrics URL is accessed directly from the control machine, not through SSH. Verify it there:
 
 ```bash
-curl --fail http://YOUR_VLLM_HOST:8000/metrics
+curl --fail http://YOUR_ENGINE_HOST:8000/metrics
 ```
 
-Check the vLLM bind address, firewall rules, and `vllm_url`.
+SGLang only serves `/metrics` when it was started with `--enable-metrics`. Without it, `dgx-top` falls back to SGLang's load API (`/v1/loads`, then `/get_load`), which fills the request queues and a used-token count but no token throughput—those rows read `no tok/s · sglang`. Only the newer `/v1/loads` carries capacity and the KV percentage; on the deprecated `/get_load` those read an em dash, and its used count is the in-flight total (used plus queued) rather than an exact pool figure. The prefix-cache hit rate and TTFT/ITL come from `/metrics` alone, so they read `—` on either load route however new it is; add `--enable-metrics` to the server's launch flags to get them.
+
+Check the engine bind address, firewall rules, and `vllm_url` (the key keeps its original name for compatibility; it is the engine's base URL).
 
 ### A node appears offline
 
-Run `dgx-top check`, then verify `nvidia-smi` and the Linux telemetry files using the same SSH target. A vLLM failure alone does not mark hardware offline.
+Run `dgx-top check`, then verify `nvidia-smi` and the Linux telemetry files using the same SSH target. An engine failure alone does not mark hardware offline.
 
 ## Development
 
@@ -352,7 +370,7 @@ through `uv` while developing:
 
 ```bash
 uv run dgx-top init   # write ~/.config/dgx-top/config.toml
-uv run dgx-top check  # verify SSH, telemetry, and vLLM endpoints
+uv run dgx-top check  # verify SSH, telemetry, and engine endpoints
 uv run dgx-top        # launch the dashboard
 ```
 

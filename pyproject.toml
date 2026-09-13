@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "dgx-top contributors" }]
-keywords = ["dgx", "nvidia", "spark", "vllm", "monitoring", "tui"]
+keywords = ["dgx", "nvidia", "spark", "vllm", "sglang", "monitoring", "tui"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

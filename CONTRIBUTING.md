@@ -20,7 +20,7 @@ uv run pytest
 uv build
 ```
 
-Add tests for parsing, configuration, or failure behavior whenever those boundaries change. Keep remote collection agentless and preserve graceful handling when either SSH telemetry or vLLM metrics are unavailable.
+Add tests for parsing, configuration, or failure behavior whenever those boundaries change. Keep remote collection agentless and preserve graceful handling when either SSH telemetry or engine metrics are unavailable.
 
 ## Privacy
 
