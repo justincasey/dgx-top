@@ -345,7 +345,7 @@ The metrics URL is accessed directly from the control machine, not through SSH. 
 curl --fail http://YOUR_ENGINE_HOST:8000/metrics
 ```
 
-SGLang only serves `/metrics` when it was started with `--enable-metrics`. Without it, `dgx-top` falls back to SGLang's load API (`/v1/loads`, then `/get_load`), which fills the request queues and a used-token count but no token throughput—those rows read `no tok/s · sglang`. Only the newer `/v1/loads` carries capacity and the KV percentage; on the deprecated `/get_load` those read an em dash, and its used count is the in-flight total (used plus queued) rather than an exact pool figure. The prefix-cache hit rate and TTFT/ITL come from `/metrics` alone, so they read `—` on either load route however new it is; add `--enable-metrics` to the server's launch flags to get them.
+SGLang only serves `/metrics` when it was started with `--enable-metrics`. Without it, `dgx-top` falls back to SGLang's load API (`/v1/loads`, then `/get_load`), which fills the request queues and a used-token count but no token throughput—those rows read `no tok/s · sglang`. Only the newer `/v1/loads` carries capacity and the KV percentage; on the deprecated `/get_load` those read an em dash. Its used count is exact on SGLang v0.5.11 and newer (the deprecation shim nets queued tokens out); on older releases, which omit that field, it is the in-flight total (used plus queued). The prefix-cache hit rate and TTFT/ITL come from `/metrics` alone, so they read `—` on either load route however new it is; add `--enable-metrics` to the server's launch flags to get them.
 
 Check the engine bind address, firewall rules, and `vllm_url` (the key keeps its original name for compatibility; it is the engine's base URL).
 

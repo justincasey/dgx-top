@@ -639,9 +639,10 @@ def _kv_tokens_tail(used: int, total: int, pal: Palette) -> tuple[str, list[tupl
     used count and no denominator, and padding for a denominator nobody
     reported ran the row one cell past the interior. With neither figure
     known the tail is the same em dash the rest of the pane uses for "no
-    reading".
+    reading". A negative ``used`` is the cluster's unknown-used sentinel:
+    capacity alone is stated, dim, with no fabricated numerator.
     """
-    if total:
+    if total and used >= 0:
         return (
             f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok",
             [
@@ -649,7 +650,9 @@ def _kv_tokens_tail(used: int, total: int, pal: Palette) -> tuple[str, list[tupl
                 (f"/{_fmt_tokens(total)} tok", pal.dim),
             ],
         )
-    if used:
+    if total:
+        return f"{_fmt_tokens(total)} tok", [(f"{_fmt_tokens(total)} tok", pal.dim)]
+    if used > 0:
         return _fmt_tokens(used), [(_fmt_tokens(used), f"bold {pal.accent}")]
     return "—", [("—", pal.dim)]
 
@@ -794,7 +797,9 @@ class ServingBox(Static):
             ttft_p95_ms=ttft_p95_ms,
             ttft_p99_ms=ttft_p99_ms,
         )
-        if kv_history:
+        # The caller always passes a list: an empty (cleared) buffer must
+        # empty the pane's series, not freeze the last poll's paint.
+        if kv_history is not None:
             self._kv_data = kv_history
         self.refresh()
 
@@ -2093,10 +2098,14 @@ class DGXTop(App):
         for u in hosted_units:
             key = f"kv-usage-{u.label}"
             self.history.setdefault(key, collections.deque(maxlen=self.settings.history_length))
-            # An unknown fill (negative sentinel) is not a reading: seeding a
-            # 0 would draw a valley the node never reported.
+            # An unknown fill (negative sentinel) is not a reading: seeding
+            # a 0 would draw a valley the node never reported — and keeping
+            # the old samples would paint a fill nobody reported any more,
+            # the same policy as the throughput series on lost counters.
             if u.kv_cache_pct >= 0:
                 _record(key, u.kv_cache_pct)
+            else:
+                self.history[key].clear()
         live_labels = {u.label for u in units if u.online}
         for key in [
             k
