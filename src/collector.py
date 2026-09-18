@@ -472,10 +472,18 @@ def _parse_engine_metrics(text: str) -> SparkUnitStats:
     if "kv_used" in profile:
         # SGLang states the used token count outright, so take it even when
         # the usage fraction is missing, and fall back to the fraction's
-        # product only when the gauge is absent.
-        used = _metric_series(lines, *_metric_names(engine, "kv_used"))[0]
-        if used:
-            s.kv_cache_used_tokens = _safe_int(_finite_sum(used))
+        # product only when the gauge is absent. Like the capacity gauge it
+        # pairs with, the used count is a shared-pool figure published by
+        # every rank of a replica: collapse the replica's ranks to one
+        # reading (max) before summing replicas, or a TP>1 deployment
+        # multiplies the pool's fill by its rank count.
+        used_pairs = _labeled_series(lines, *_metric_names(engine, "kv_used"), key=cap_key)
+        if used_pairs:
+            used_by_replica: Dict[str, float] = {}
+            for _lbl, u in used_pairs:
+                key = _replica_key(_lbl)
+                used_by_replica[key] = max(used_by_replica.get(key, 0.0), float(u))
+            s.kv_cache_used_tokens = _safe_int(_finite_sum(used_by_replica.values()))
         elif have_usage and s.kv_total_tokens > 0:
             s.kv_cache_used_tokens = _safe_int(s.kv_total_tokens * val)
     elif have_usage and s.kv_total_tokens > 0:
@@ -901,7 +909,13 @@ def _load_from_v1(data: object) -> EngineLoad | None:
         if math.isfinite(val):
             kv_pct = val * 100.0
     elif total > 0:
-        kv_pct = used / total * 100.0
+        # ``used`` sums entries that stated a count while ``total`` only
+        # accumulates stated capacities, so a partial payload can push the
+        # ratio past the pool's own 0-100 envelope — a reading we cannot
+        # trust: the -1 sentinel, like every other percentage here.
+        ratio = used / total
+        if 0.0 <= ratio <= 1.0:
+            kv_pct = ratio * 100.0
     return EngineLoad(
         running=running,
         waiting=waiting,

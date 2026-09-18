@@ -182,27 +182,38 @@ class ClusterStats:
     @property
     def total_kv_used_tokens(self) -> int:
         """Total KV cache used tokens from the first hosted unit that
-        states a pool. Used pairs with the capacity it belongs to — the
-        two figures always come from the same unit, so a shared pool is
-        never split across units. A unit with a used count but no capacity
-        (SGLang's ``/get_load``) states a standalone measurement, which
-        surfaces only when no unit states a pool."""
-        for u in self.hosted_units:
-            if u.kv_total_tokens > 0:
-                return u.kv_cache_used_tokens
+        states a used figure; -1 when none does. Used pairs with the
+        capacity it belongs to — the two figures always come from the same
+        unit, so a shared pool is never split across units. A unit that
+        states a pool whose fill gauge was rejected states no used count
+        (its 0 is the dataclass default, not an idle reading); a genuine
+        idle pool has a known fill (0%) and its 0 surfaces. A unit with a
+        used count but no capacity (SGLang's ``/get_load``) states a
+        standalone measurement, which surfaces only when no unit states a
+        pool — a capacityless count is never paired with another unit's
+        denominator."""
+        pool_units = [u for u in self.hosted_units if u.kv_total_tokens > 0]
+        if pool_units:
+            for u in pool_units:
+                if u.kv_cache_pct >= 0 or u.kv_cache_used_tokens > 0:
+                    return u.kv_cache_used_tokens
+            return -1
         for u in self.hosted_units:
             if u.kv_cache_used_tokens > 0:
                 return u.kv_cache_used_tokens
-        return 0
+        return -1
 
     @property
     def kv_cache_pct(self) -> float:
         """Aggregate KV cache usage percentage from the first hosted unit
         with a known reading. In TP setups all nodes share the same pool,
-        so this is accurate; in a mixed-engine cluster the first unit
-        that states its fill wins. No hosted unit, or none with a
-        reading, is no reading, not an empty pool: -1, like the
-        unit-level sentinel and ``kv_prefix_hit_rate``."""
+        so the first unit that states its fill wins. The scans are
+        per-attribute, so in a mixed-engine cluster the percentage and the
+        token figures may describe different units' pools — no correct
+        aggregation exists for heterogeneous pools, so each attribute
+        reports its best reading. No hosted unit, or none with a reading,
+        is no reading, not an empty pool: -1, like the unit-level sentinel
+        and ``kv_prefix_hit_rate``."""
         for u in self.hosted_units:
             if u.kv_cache_pct >= 0:
                 return u.kv_cache_pct

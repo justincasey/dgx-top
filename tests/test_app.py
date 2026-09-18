@@ -808,6 +808,77 @@ async def test_kv_history_follows_the_unit_with_a_reading(tmp_path: Path, monkey
         assert not app.history["kv-usage-head"], app.history["kv-usage-head"]
 
 
+async def test_kv_spark_clears_when_the_reading_unit_loses_its_fill(tmp_path: Path, monkeypatch):
+    """Poll 1: the only hosted unit reports a fill and the spark records it.
+    Poll 2: the same unit's usage gauge is rejected (pct -1). The headline
+    flips to "KV —" and the spark must plot nothing — skipping the sample
+    but keeping the buffer (or freezing on the falsy kv_history guard)
+    painted a fill nobody reported any more."""
+    from app import DGXTop, ServingBox, Waybar
+
+    _config(tmp_path / "config.toml", n=1)
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    _stub(monkeypatch, [head])
+    app = DGXTop()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        app._update_ui()
+        serving = app.query_one("#serving", ServingBox)
+        assert serving._kv_data, serving._kv_data
+        # Poll 2 (and 3): the usage gauge is rejected — the cleared buffer
+        # must reach the pane, and stay cleared.
+        head.kv_cache_pct = -1.0
+        app._update_ui()
+        assert serving._kv_data == [], serving._kv_data
+        # The headline agrees: no reading, not the stale 32%.
+        assert "KV —" in app.query_one("#waybar", Waybar).render().plain
+        app._update_ui()
+        assert serving._kv_data == [], serving._kv_data
+
+
+async def test_unknown_used_paints_capacity_without_a_numerator(tmp_path: Path, monkeypatch):
+    """A unit whose usage gauge was rejected states its pool but no fill:
+    the kv row must not fabricate "0/3.8M tok" — capacity alone, dim —
+    beside a kv% row that correctly reads "no reading"."""
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml", n=1)
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    head.kv_cache_pct = -1.0
+    head.kv_total_tokens = 3_800_000
+    head.kv_cache_used_tokens = 0
+    _stub(monkeypatch, [head])
+    app = DGXTop()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        app._update_ui()
+        box = app.query_one("#serving", ServingBox)
+        painted = box.render().plain.splitlines()
+        interior = [ln[2:-2] for ln in painted]
+        kv_row = next(ln for ln in interior if ln.startswith("kv "))
+        assert "3.8M" in kv_row and "/" not in kv_row, (kv_row,)
+        # Neither figure stated (used at the cluster's -1 sentinel, no
+        # capacity): the tail is the em dash, never a literal "-1".
+        bare = _unit("head")
+        bare.kv_cache_pct = -1.0
+        bare.kv_total_tokens = 0
+        bare.kv_cache_used_tokens = 0
+        _stub(monkeypatch, [bare])
+        app2 = DGXTop()
+        async with app2.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app2._update_ui()
+            box2 = app2.query_one("#serving", ServingBox)
+            interior2 = [ln[2:-2] for ln in box2.render().plain.splitlines()]
+            kv_row2 = next(ln for ln in interior2 if ln.startswith("kv "))
+            assert "-1" not in kv_row2 and "—" in kv_row2, (kv_row2,)
+
+
 def _load_only(unit, running: int = 2, waiting: int = 1):
     """A node exactly as ``poll_unit`` leaves it when ``/metrics`` 404s and
     the load API answers: real requests and KV, no token counter at all."""

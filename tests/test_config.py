@@ -172,6 +172,12 @@ def test_node_engine_key_is_optional_and_validated(tmp_path: Path):
         path = _with_node_line(f'engine = "{engine}"', tmp_path)
         assert load_config(path).nodes[0].engine == engine
 
+    # Case and surrounding whitespace are normalized away; a regression
+    # that compares the raw value would reject valid mixed-case configs.
+    for raw, expected in ((" SGLang ", "sglang"), ("VLLM", "vllm")):
+        path = _with_node_line(f'engine = "{raw}"', tmp_path)
+        assert load_config(path).nodes[0].engine == expected
+
     path = _with_node_line('engine = "tgi"', tmp_path)
     with pytest.raises(ConfigError, match="engine"):
         load_config(path)

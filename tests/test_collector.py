@@ -634,6 +634,21 @@ class SglangMetricsTests(unittest.TestCase):
 
         self.assertEqual(s.kv_cache_used_tokens, 400)
 
+    def test_sglang_used_tokens_collapse_replicas_like_capacity(self):
+        # num_used_tokens is the same shared-pool figure the capacity gauge
+        # is: when BOTH ranks of a replica report it, summing the ranks
+        # would multiply the pool's fill by tp_size.
+        s = collector._parse_engine_metrics(
+            'sglang:max_total_num_tokens{model_name="m",tp_rank="0",pp_rank="0"} 3200\n'
+            'sglang:max_total_num_tokens{model_name="m",tp_rank="1",pp_rank="0"} 3200\n'
+            'sglang:num_used_tokens{model_name="m",tp_rank="0",pp_rank="0"} 1600\n'
+            'sglang:num_used_tokens{model_name="m",tp_rank="1",pp_rank="0"} 1600\n'
+            'sglang:token_usage{model_name="m",tp_rank="0",pp_rank="0"} 0.5\n'
+        )
+
+        self.assertEqual(s.kv_total_tokens, 3200)
+        self.assertEqual(s.kv_cache_used_tokens, 1600)
+
     def test_hostile_vllm_cache_config_degrades_not_raises(self):
         # A 309-digit integer literal survives int() and then raises
         # OverflowError from float(); the parse must stay total (HEAD raised
@@ -727,6 +742,48 @@ class EngineLoadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((load.running, load.waiting), (3, 1))
         self.assertEqual((load.used_tokens, load.total_tokens), (300, 4000))
         self.assertAlmostEqual(load.kv_pct, 17.5)  # (0.1*1000 + 0.2*3000) / 4000
+
+    async def test_v1_loads_derived_pct_is_banded(self):
+        # ``used`` sums entries that stated a count while ``total`` only
+        # accumulates stated capacities: a partial payload can push the
+        # derived ratio far past the pool's 0-100 envelope, and that is not
+        # a reading — it is the -1 sentinel.
+        envelope = {
+            "loads": [
+                {"dp_rank": 0, "num_running_reqs": 1, "num_used_tokens": 500},
+                {
+                    "dp_rank": 1,
+                    "num_running_reqs": 1,
+                    "num_used_tokens": 10,
+                    "max_total_num_tokens": 100,
+                },
+            ]
+        }
+        patcher, _ = _patch_http({"/v1/loads": envelope})
+        with patcher:
+            load = await collector.fetch_engine_load("http://spark.test:8888")
+
+        self.assertEqual(load.used_tokens, 510)
+        self.assertEqual(load.total_tokens, 100)
+        self.assertEqual(load.kv_pct, -1.0)
+
+    async def test_v1_loads_derived_pct_boundary_values_survive(self):
+        for used, expect in ((0, 0.0), (100, 100.0)):
+            envelope = {
+                "loads": [
+                    {
+                        "dp_rank": 0,
+                        "num_running_reqs": 1,
+                        "num_used_tokens": used,
+                        "max_total_num_tokens": 100,
+                    }
+                ]
+            }
+            patcher, _ = _patch_http({"/v1/loads": envelope})
+            with patcher:
+                load = await collector.fetch_engine_load("http://spark.test:8888")
+
+            self.assertAlmostEqual(load.kv_pct, expect, msg=used)
 
     async def test_get_load_recovers_running_by_subtraction(self):
         # num_reqs is num_running_reqs + num_waiting_reqs — treating it as
@@ -1102,7 +1159,9 @@ class ClusterStatsKvAggregationTests(unittest.TestCase):
         cs = self.ClusterStats(units=[s])
 
         self.assertEqual(cs.total_kv_capacity_tokens, 0)
-        self.assertEqual(cs.total_kv_used_tokens, 0)
+        # No hosted unit states a used figure: unknown, not a confident
+        # empty count.
+        self.assertEqual(cs.total_kv_used_tokens, -1)
         # Nothing hosted is no reading, not an empty pool.
         self.assertEqual(cs.kv_cache_pct, -1.0)
         self.assertEqual(cs.kv_prefix_hit_rate, -1.0)
@@ -1193,7 +1252,7 @@ class ClusterStatsKvAggregationTests(unittest.TestCase):
 
         self.assertEqual(cs.kv_cache_pct, -1.0)
         self.assertEqual(cs.total_kv_capacity_tokens, 0)
-        self.assertEqual(cs.total_kv_used_tokens, 0)
+        self.assertEqual(cs.total_kv_used_tokens, -1)
         self.assertEqual(cs.kv_prefix_hit_rate, -1.0)
         self.assertEqual(cs.total_kv_blocks, 0)
 
@@ -1209,6 +1268,62 @@ class ClusterStatsKvAggregationTests(unittest.TestCase):
 
         self.assertEqual(cs.total_kv_used_tokens, 500)
         self.assertEqual(cs.total_kv_capacity_tokens, 0)
+
+    def test_kv_used_is_unknown_when_pool_fill_was_rejected(self):
+        """A pool whose usage gauge was rejected states capacity but no
+        fill: its used count is the dataclass default 0, not an idle
+        reading. Painting "0/3.8M tok" beside a kv% row that correctly
+        reads "no reading" is the same unknown-as-zero class the pass
+        fixes for the percentage."""
+        s = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            kv_cache_pct=-1.0,
+            kv_total_tokens=3_800_000,
+            kv_cache_used_tokens=0,
+        )
+        cs = self.ClusterStats(units=[s])
+
+        self.assertEqual(cs.total_kv_used_tokens, -1)
+        self.assertEqual(cs.total_kv_capacity_tokens, 3_800_000)
+
+    def test_kv_used_surfaces_for_a_genuine_idle_pool(self):
+        """A pool with a known 0% fill genuinely states zero used tokens:
+        the count is a reading, not the dataclass default."""
+        s = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            kv_cache_pct=0.0,
+            kv_total_tokens=1000,
+            kv_cache_used_tokens=0,
+        )
+        cs = self.ClusterStats(units=[s])
+
+        self.assertEqual(cs.total_kv_used_tokens, 0)
+
+    def test_kv_standalone_used_yields_to_an_unknown_pool(self):
+        """A pool-stating unit with a rejected fill leaves the cluster's
+        used count unknown; another unit's capacityless used count
+        describes a DIFFERENT pool and must not be paired with this
+        denominator."""
+        pooled = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            kv_cache_pct=-1.0,
+            kv_total_tokens=1000,
+            kv_cache_used_tokens=0,
+        )
+        standalone = SparkUnitStats(
+            label="Spark-1",
+            model_hosted=True,
+            kv_cache_pct=-1.0,
+            kv_total_tokens=0,
+            kv_cache_used_tokens=500,
+        )
+        cs = self.ClusterStats(units=[pooled, standalone])
+
+        self.assertEqual(cs.total_kv_used_tokens, -1)
+        self.assertEqual(cs.total_kv_capacity_tokens, 1000)
 
     def test_kv_used_prefers_the_pooled_unit_over_a_standalone_used(self):
         """When one unit states a pool, its used count wins over another
