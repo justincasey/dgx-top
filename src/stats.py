@@ -42,7 +42,7 @@ class SparkUnitStats:
     model_name: str = ""
     model_source: str = "vllm"  # "vllm" or "sglang" (engine family)
     model_metrics: bool = True  # False = load-only endpoint (no token counters)
-    kv_cache_pct: float = 0.0  # 0-100; -1 = no reading (gauge absent/rejected, /get_load)
+    kv_cache_pct: float = -1.0  # 0-100; -1 = no reading (gauge absent/rejected, /get_load)
     kv_total_blocks: int = 0  # from cache_config_info num_gpu_blocks (vLLM only; 0 on SGLang)
     kv_block_size: int = 0  # tokens per block
     kv_total_tokens: int = 0  # KV capacity: vLLM tokens/blocks×size, SGLang max_total_num_tokens
@@ -171,44 +171,60 @@ class ClusterStats:
     def total_kv_capacity_tokens(self) -> int:
         """Total KV cache token capacity across all hosted units.
         In TP/DP setups, nodes share the same pool, so this is the
-        first hosted unit's total (others would be duplicates)."""
-        hosted = self.hosted_units
-        if not hosted:
-            return 0
-        return hosted[0].kv_total_tokens
+        first hosted unit's total (others would be duplicates). In a
+        mixed-engine cluster a load-only unit states no capacity, so
+        the first unit that states one wins; none does, 0."""
+        for u in self.hosted_units:
+            if u.kv_total_tokens > 0:
+                return u.kv_total_tokens
+        return 0
 
     @property
     def total_kv_used_tokens(self) -> int:
-        """Total KV cache used tokens (block-allocated capacity) from first hosted unit."""
-        hosted = self.hosted_units
-        if not hosted:
-            return 0
-        return hosted[0].kv_cache_used_tokens
+        """Total KV cache used tokens from the first hosted unit that
+        states a pool. Used pairs with the capacity it belongs to — the
+        two figures always come from the same unit, so a shared pool is
+        never split across units. A unit with a used count but no capacity
+        (SGLang's ``/get_load``) states a standalone measurement, which
+        surfaces only when no unit states a pool."""
+        for u in self.hosted_units:
+            if u.kv_total_tokens > 0:
+                return u.kv_cache_used_tokens
+        for u in self.hosted_units:
+            if u.kv_cache_used_tokens > 0:
+                return u.kv_cache_used_tokens
+        return 0
 
     @property
     def kv_cache_pct(self) -> float:
-        """Aggregate KV cache usage percentage from first hosted unit.
-        In TP setups all nodes share the same pool, so this is accurate.
-        No hosted unit is no reading, not an empty pool: -1, like the
+        """Aggregate KV cache usage percentage from the first hosted unit
+        with a known reading. In TP setups all nodes share the same pool,
+        so this is accurate; in a mixed-engine cluster the first unit
+        that states its fill wins. No hosted unit, or none with a
+        reading, is no reading, not an empty pool: -1, like the
         unit-level sentinel and ``kv_prefix_hit_rate``."""
-        hosted = self.hosted_units
-        if not hosted:
-            return -1.0
-        return hosted[0].kv_cache_pct
+        for u in self.hosted_units:
+            if u.kv_cache_pct >= 0:
+                return u.kv_cache_pct
+        return -1.0
 
     @property
     def kv_prefix_hit_rate(self) -> float:
-        hosted = self.hosted_units
-        if not hosted:
-            return -1.0
-        return hosted[0].kv_prefix_hit_rate
+        """Prefix cache hit rate from the first hosted unit with a known
+        reading; -1 when none has one."""
+        for u in self.hosted_units:
+            if u.kv_prefix_hit_rate >= 0:
+                return u.kv_prefix_hit_rate
+        return -1.0
 
     @property
     def total_kv_blocks(self) -> int:
-        hosted = self.hosted_units
-        if not hosted:
-            return 0
-        return hosted[0].kv_total_blocks
+        """Block-pool size from the first hosted unit that states one
+        (vLLM only — SGLang has no block concept); 0 when none does."""
+        for u in self.hosted_units:
+            if u.kv_total_blocks > 0:
+                return u.kv_total_blocks
+        return 0
 
 
 class ThrashLevel(enum.IntEnum):

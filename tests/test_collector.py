@@ -1114,6 +1114,134 @@ class ClusterStatsKvAggregationTests(unittest.TestCase):
 
         self.assertAlmostEqual(cs.kv_cache_pct, 42.0)
 
+    def test_kv_prefers_first_hosted_unit_with_a_reading(self):
+        """Mixed cluster: the first hosted unit is a load-only SGLang
+        endpoint (no KV reading anywhere), the second is a vLLM node with a
+        real pool. The cluster must surface the real reading, not the first
+        unit's sentinels — hidden KV is the same wrong-render class as a
+        fabricated one."""
+        load_only = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            model_metrics=False,
+            kv_cache_pct=-1.0,
+            kv_total_tokens=0,
+            kv_total_blocks=0,
+            kv_prefix_hit_rate=-1.0,
+        )
+        vllm = SparkUnitStats(
+            label="Spark-1",
+            model_hosted=True,
+            kv_cache_pct=45.0,
+            kv_total_tokens=1000,
+            kv_cache_used_tokens=450,
+            kv_total_blocks=100,
+            kv_prefix_hit_rate=60.0,
+        )
+        cs = self.ClusterStats(units=[load_only, vllm])
+
+        self.assertEqual(cs.kv_cache_pct, 45.0)
+        self.assertEqual(cs.total_kv_capacity_tokens, 1000)
+        self.assertEqual(cs.total_kv_used_tokens, 450)
+        self.assertEqual(cs.kv_prefix_hit_rate, 60.0)
+        self.assertEqual(cs.total_kv_blocks, 100)
+
+    def test_kv_scan_is_ordered_first_reading_wins(self):
+        """The scan is in hosted order and stops at the first qualifying
+        unit: a second unit with DIFFERENT readings must never displace the
+        first, for every property (a fixture whose later unit is load-only
+        could not tell first-wins from last-wins)."""
+        first = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            kv_cache_pct=45.0,
+            kv_total_tokens=1000,
+            kv_cache_used_tokens=450,
+            kv_total_blocks=100,
+            kv_prefix_hit_rate=60.0,
+        )
+        second = SparkUnitStats(
+            label="Spark-1",
+            model_hosted=True,
+            kv_cache_pct=80.0,
+            kv_total_tokens=2000,
+            kv_cache_used_tokens=1600,
+            kv_total_blocks=200,
+            kv_prefix_hit_rate=90.0,
+        )
+        cs = self.ClusterStats(units=[first, second])
+
+        self.assertEqual(cs.kv_cache_pct, 45.0)
+        self.assertEqual(cs.total_kv_capacity_tokens, 1000)
+        self.assertEqual(cs.total_kv_used_tokens, 450)
+        self.assertEqual(cs.kv_prefix_hit_rate, 60.0)
+        self.assertEqual(cs.total_kv_blocks, 100)
+
+    def test_kv_all_unknown_cluster_stays_sentinel(self):
+        """Every hosted unit load-only: the cluster answers in sentinels —
+        no reading, not an empty pool."""
+        load_only = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            model_metrics=False,
+            kv_cache_pct=-1.0,
+            kv_total_tokens=0,
+            kv_total_blocks=0,
+            kv_prefix_hit_rate=-1.0,
+        )
+        cs = self.ClusterStats(units=[load_only])
+
+        self.assertEqual(cs.kv_cache_pct, -1.0)
+        self.assertEqual(cs.total_kv_capacity_tokens, 0)
+        self.assertEqual(cs.total_kv_used_tokens, 0)
+        self.assertEqual(cs.kv_prefix_hit_rate, -1.0)
+        self.assertEqual(cs.total_kv_blocks, 0)
+
+    def test_kv_used_surfaces_standalone_when_no_unit_states_a_pool(self):
+        """A /get_load-shaped unit states used tokens but no capacity. With
+        no pool anywhere in the cluster that used count is a genuine
+        standalone measurement (the wide pane publishes it alone), so it
+        surfaces; used pairs with capacity whenever a unit states one."""
+        s = SparkUnitStats(
+            label="Spark-0", model_hosted=True, kv_cache_used_tokens=500, kv_total_tokens=0
+        )
+        cs = self.ClusterStats(units=[s])
+
+        self.assertEqual(cs.total_kv_used_tokens, 500)
+        self.assertEqual(cs.total_kv_capacity_tokens, 0)
+
+    def test_kv_used_prefers_the_pooled_unit_over_a_standalone_used(self):
+        """When one unit states a pool, its used count wins over another
+        unit's capacityless used figure: the two would not describe the
+        same pool."""
+        standalone = SparkUnitStats(
+            label="Spark-0",
+            model_hosted=True,
+            model_metrics=False,
+            kv_cache_used_tokens=500,
+            kv_total_tokens=0,
+            kv_cache_pct=-1.0,
+            kv_prefix_hit_rate=-1.0,
+        )
+        pooled = SparkUnitStats(
+            label="Spark-1",
+            model_hosted=True,
+            kv_cache_pct=45.0,
+            kv_total_tokens=1000,
+            kv_cache_used_tokens=450,
+            kv_prefix_hit_rate=60.0,
+        )
+        cs = self.ClusterStats(units=[standalone, pooled])
+
+        self.assertEqual(cs.total_kv_used_tokens, 450)
+        self.assertEqual(cs.total_kv_capacity_tokens, 1000)
+
+    def test_kv_cache_pct_default_is_the_no_reading_sentinel(self):
+        """The dataclass default is the sentinel, never a confident 0% pool:
+        a unit that becomes hosted without a collector write renders as no
+        reading, like ``kv_prefix_hit_rate`` beside it."""
+        self.assertEqual(SparkUnitStats().kv_cache_pct, -1.0)
+
 
 class PollUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_hardware_fetch_starts_before_vllm_finishes(self):

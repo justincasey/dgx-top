@@ -658,8 +658,9 @@ def _kv_pct_raw(kv_pct: float) -> str:
     """The text the kv percentage tail occupies, for padding purposes.
 
     A negative percentage is the collector's "no reading" sentinel — the
-    gauge was rejected or the route never states one — so its raw width is the
-    em-dash placeholder's, not the ``0%`` the dataclass default would paint.
+    gauge was rejected, the route never states one, or no collector branch
+    ever wrote the field (the dataclass default IS the sentinel) — so its
+    raw width is the em-dash placeholder's.
     The segment itself is built where the row is drawn: an unknown percentage
     renders as the pane's placeholder row, with no tail at all.
     """
@@ -2205,7 +2206,15 @@ class DGXTop(App):
             gen_vals=list(self.history["throughput"]),
             prompt_vals=list(self.history["prompt-throughput"]),
         )
-        kv_key = f"kv-usage-{hosted_units[0].label}" if hosted_units else ""
+        # The kv spark must plot the same pool the headline percentage comes
+        # from: the first hosted unit with a known fill (a load-only unit in
+        # a mixed cluster states none and never records). No unit with a
+        # reading: the first hosted unit, exactly as before this rule.
+        kv_unit = next(
+            (u for u in hosted_units if u.kv_cache_pct >= 0),
+            hosted_units[0] if hosted_units else None,
+        )
+        kv_key = f"kv-usage-{kv_unit.label}" if kv_unit else ""
         serving.update_kv(
             stats.kv_cache_pct,
             hosted_units[0].requests_running if hosted_units else 0,
