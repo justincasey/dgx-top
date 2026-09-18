@@ -448,7 +448,6 @@ def _parse_engine_metrics(text: str) -> SparkUnitStats:
             pairs = [(v, c) for (_l, v), c in zip(usage, engine_caps)]
         else:
             pairs = [(v, 1.0) for _l, v in usage]
-        val = _capacity_weighted_mean(pairs)
         # The series is an allocation fraction by contract — vLLM's
         # ``kv_cache_usage_perc`` and SGLang's ``token_usage`` are both 0-1 —
         # so every sample is banded BEFORE it is averaged: one hostile value
@@ -1378,8 +1377,9 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
             if load.total_tokens > 0:
                 s.kv_total_tokens = load.total_tokens
             # The sentinel survives the hop: /get_load states no capacity, so
-            # an unknown fill must not arrive as the dataclass's confident 0%
-            # — a negative value is what the UI renders as "no reading".
+            # an unknown fill travels as the -1 the UI renders as "no
+            # reading" — which is also the dataclass default, never a
+            # confident 0%.
             s.kv_cache_pct = load.kv_pct if load.kv_pct >= 0 else -1.0
             # Throughput and prefix reuse are NOT set from the load snapshot:
             # the endpoint states those two fields only when it was started

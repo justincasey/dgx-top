@@ -775,6 +775,39 @@ async def test_unknown_kv_renders_as_no_reading_not_zero(tmp_path: Path, monkeyp
             assert all(v >= 0 for v in app.history["kv-usage-head"]), app.history["kv-usage-head"]
 
 
+async def test_kv_history_follows_the_unit_with_a_reading(tmp_path: Path, monkeypatch):
+    """Mixed cluster: the first hosted unit is load-only (states no fill and
+    never records), the second reports a real one. The kv spark must plot
+    the same pool the headline percentage comes from — keying the history on
+    hosted_units[0] fed the chart a buffer that stayed empty forever while
+    the headline showed the other unit's fill."""
+    from app import DGXTop
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _load_only(_unit("head"))
+    # _load_only clears the token counters but not the fill: a load-only
+    # endpoint states no KV reading at all.
+    head.kv_cache_pct = -1.0
+    head.kv_total_tokens = 0
+    head.kv_cache_used_tokens = 0
+    worker = _unit("worker", worker=True)
+    _stub(monkeypatch, [head, worker])
+    app = DGXTop()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        app._update_ui()
+        # The kv spark must PLOT the worker's series, not just record it:
+        # kv_key picks which history buffer feeds the pane, and history
+        # itself is recorded under every hosted label regardless.
+        from app import ServingBox
+
+        serving = app.query_one("#serving", ServingBox)
+        assert serving._kv_data, serving._kv_data
+        assert not app.history["kv-usage-head"], app.history["kv-usage-head"]
+
+
 def _load_only(unit, running: int = 2, waiting: int = 1):
     """A node exactly as ``poll_unit`` leaves it when ``/metrics`` 404s and
     the load API answers: real requests and KV, no token counter at all."""
