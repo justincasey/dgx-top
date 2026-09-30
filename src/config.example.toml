@@ -9,6 +9,11 @@ theme = "dgx-dark"
 #   tick     = dim scale with a single bright marker at the current value
 #   line     = thin hairline fill over a hairline track
 meter_treatment = "gradient"
+# Decode chart renderer in the SERVING pane:
+#   oscilloscope = dim graticule, bright leading window, edge markers and
+#                  inline labels, Δ5 slope readout (default)
+#   lines        = legacy smooth braille lines with translucent fills
+chart = "oscilloscope"
 # Quiet mode: calm the whole UI — identity hues render neutral and colour
 # appears only on caution/critical. Composes with any meter treatment.
 quiet = false

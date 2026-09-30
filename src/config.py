@@ -45,6 +45,9 @@ the coupling instead of leaving it to drift."""
 
 
 METER_TREATMENTS = {"gradient", "spark", "tick", "line"}
+CHART_MODES = {"oscilloscope", "lines"}
+"""Decode-chart renderers: the oscilloscope (default) and the legacy
+braille-fill line chart."""
 
 MAX_NODES = 12
 """Largest cluster dgx-top displays (one or more Sparks)."""
@@ -57,6 +60,7 @@ class Settings:
     history_length: int = 40
     theme: str = DEFAULT_THEME
     meter_treatment: str = "gradient"
+    chart: str = "oscilloscope"
     quiet: bool = False
 
 
@@ -140,9 +144,9 @@ def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
     )
 
 
-def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, bool]:
+def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, bool]:
     """Validate the ``[app]`` block and return (poll_interval, history_length,
-    theme, meter_treatment, quiet)."""
+    theme, meter_treatment, chart, quiet)."""
     app = raw.get("app", {})
     if not isinstance(app, dict):
         raise ConfigError("[app] must be a TOML table")
@@ -157,6 +161,9 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, bool]:
         raise ConfigError(
             "app.meter_treatment must be one of: " + ", ".join(sorted(METER_TREATMENTS))
         )
+    chart = app.get("chart", "oscilloscope")
+    if not isinstance(chart, str) or chart not in CHART_MODES:
+        raise ConfigError("app.chart must be one of: " + ", ".join(sorted(CHART_MODES)))
     quiet = app.get("quiet", False)
     if not isinstance(quiet, bool):
         raise ConfigError("app.quiet must be true or false")
@@ -165,6 +172,7 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, bool]:
         history_length,
         _parse_theme(app, theme),
         meter_treatment,
+        chart,
         quiet,
     )
 
