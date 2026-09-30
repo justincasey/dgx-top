@@ -143,6 +143,21 @@ def test_meter_treatment_validation(tmp_path: Path):
     assert load_config(_write(tmp_path)).meter_treatment == "gradient"
 
 
+def test_chart_validation(tmp_path: Path):
+    for chart in ("oscilloscope", "lines"):
+        path = tmp_path / f"{chart}.toml"
+        path.write_text(_with_app_line(f'chart = "{chart}"'))
+        assert load_config(path).chart == chart
+
+    path = tmp_path / "bogus.toml"
+    path.write_text(_with_app_line('chart = "sparklines"'))
+    with pytest.raises(ConfigError, match="app.chart"):
+        load_config(path)
+
+    # default is the oscilloscope
+    assert load_config(_write(tmp_path)).chart == "oscilloscope"
+
+
 def test_quiet_validation(tmp_path: Path):
     path = tmp_path / "quiet.toml"
     path.write_text(_with_app_line("quiet = true"))

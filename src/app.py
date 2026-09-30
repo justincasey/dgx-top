@@ -65,10 +65,15 @@ NODE_ROWS_TEXT = 3  # text card interior (gpu, mem, cpu; no meter/core/RoCE)
 # roomy/dense = the wide design row set (no window stat) + area chart; compact =
 # the prioritized narrow grammar + the inline gen sparkline (no area chart);
 # rail = prioritized grammar, no cache; floor = base gen/req/ttft.
-WIDE_BASE = 11  # gen/prompt/kv/kv% rows + requests/cache/ttft (no window)
-NARROW_BASE = 5  # gen, requests, ttft, kv%, cache
-SERVING_ROWS_RAIL = 4  # gen, requests, ttft, kv%
-SERVING_ROWS_FLOOR = 3  # gen, requests, ttft
+WIDE_BASE = 8  # oscilloscope wide grammar WITHOUT the gen rows — the chart
+# carries the decode series, so gen renders only when no chart does:
+# prompt/kv duo rows and their spacers, requests/cache/ttft, the Δ5 slope.
+WIDE_BASE_LINES = 7  # legacy `chart = "lines"` grammar: same condense, no
+# slope row. When no chart renders, the gen duo rows add 3 more per model.
+NARROW_BASE = 4  # requests, ttft, kv (merged tail), cache — the gen row
+# joins only when no chart renders (then the base is NARROW_BASE + 1).
+SERVING_ROWS_RAIL = 4  # gen, requests, ttft, kv (merged tail) — no chart
+SERVING_ROWS_FLOOR = 3  # gen, requests, ttft — no chart
 
 # Box-painting charsets — HEAVY is the focused window ("neon glow" in pure
 # text), LIGHT is every unfocused window (the option-F grammar).
@@ -280,15 +285,6 @@ def _meter_line(
         parts.append(Text("┈" * max(0, width - f), style=pal.dim))
         return Text.assemble(*parts)
     return _gmeter_line(pct, width, pal)
-
-
-def _bar_line(pct: float, width: int, color: str, pal: Palette) -> Text:
-    """Single-hue meter (identity metrics): fill in the owning hue, dim track."""
-    f = round(max(0.0, min(100.0, pct)) / 100 * width)
-    return Text.assemble(
-        Text("█" * f, style=f"bold {color}"),
-        Text("▓" * max(0, width - f), style=f"bold {pal.track}"),
-    )
 
 
 def _stretch(data: list[float], width: int) -> list[float]:
@@ -550,6 +546,128 @@ def _lines_chart_lines(
     return out
 
 
+BRIGHT_CELLS = 24
+"""Columns of the oscilloscope's bright leading window — the "now"."""
+
+GRATICULE_STEP = 12
+"""Column interval of the oscilloscope's graticule verticals."""
+
+
+def _oscilloscope_lines(
+    series: list[tuple[str, str, list[float]]],
+    rows: int,
+    width: int,
+    pal: Palette,
+    label_w: int = 0,
+) -> list[Text]:
+    """Multi-series decode trace in the oscilloscope grammar the design's
+    reference mock validates: a dim graticule (``·`` verticals over a dotted
+    ``┄`` baseline) behind connected braille staircases with NO area fill —
+    history dimmed 55% toward the background, the trailing ``BRIGHT_CELLS``
+    at the full hue — and each series' newest sample marked ``◉`` with an
+    inline ``value name`` label on its own row (collision-resolved to one
+    series per row, topmost first). ``label_w`` reserves that many right
+    columns; 0 disables labels. The scale is shared (0…max over all series)
+    so the traces stay comparable; like ``_lines_chart_lines`` the renderer
+    is total over non-finite input. Every returned row is exactly ``width``
+    cells."""
+    if rows <= 0:
+        return []
+    if width <= 0:
+        return [Text("") for _ in range(rows)]
+    plotted = [
+        (label, color, [v for v in hist if math.isfinite(v)])
+        for label, color, hist in series
+        if hist
+    ]
+    plotted = [(label, color, d) for label, color, d in plotted if d]
+    hi = max((max(d) for _, _, d in plotted), default=0.0)
+    span = hi if hi > 0 else 1.0
+    # ``label_w`` counts the whole right label area: one gap cell + the
+    # label text (label_w - 1), so the returned rows are exactly ``width``.
+    body = max(1, width - label_w) if label_w else width
+    subw = body * 2
+    dotrows = rows * 4
+    line = [[0] * body for _ in range(rows)]
+    style: list[list[tuple[str, str] | None]] = [[None] * body for _ in range(rows)]
+    marks: list[tuple[int, str, str]] = []
+    for label, color, hist in plotted:
+        ys = _interp_dot_rows(hist, subw, dotrows, hi, span)
+        dim = blend_toward(color, pal.bg, 0.55)
+        for j, y in enumerate(ys):
+            cx, dx = divmod(j, 2)
+            top = y if not j else min(ys[j - 1], y)
+            bot = y if not j else max(ys[j - 1], y)
+            for dr in range(top, bot + 1):
+                cy, dy = divmod(dr, 4)
+                line[cy][cx] |= _BRAILLE_BITS[(dx, dy)]
+                if style[cy][cx] is None:
+                    bright = cx >= body - BRIGHT_CELLS
+                    style[cy][cx] = (f"bold {color}" if bright else dim, color)
+        y_edge = min(ys[-1] >> 2, rows - 1)
+        raw = f"{hist[-1]:.0f} {label}".rstrip() if label else f"{hist[-1]:.0f}"
+        marks.append((y_edge, raw, color))
+    # Edge markers + labels: one series per row, nearest free row wins.
+    taken: set[int] = set()
+    labels: dict[int, tuple[str, str]] = {}
+    for y_edge, raw, color in sorted(marks, key=lambda m: m[0]):
+        row = _free_row(y_edge, taken, rows)
+        taken.add(row)
+        labels[row] = (raw[: label_w - 1] if label_w else "", color)
+    out: list[Text] = []
+    for r in range(rows):
+        parts: list[Text] = []
+        for c in range(body):
+            if r in labels and c == body - 1:
+                parts.append(Text("◉", style=f"bold {labels[r][1]}"))
+            elif line[r][c]:
+                style_str, _color = style[r][c]
+                parts.append(Text(chr(0x2800 + line[r][c]), style=style_str))
+            elif r == rows - 1:
+                parts.append(Text("┄", style=blend_toward(pal.dim, pal.bg, 0.4)))
+            elif rows >= 4 and c % GRATICULE_STEP == GRATICULE_STEP - 1:
+                parts.append(Text("·", style=blend_toward(pal.dim, pal.bg, 0.5)))
+            else:
+                parts.append(Text(" "))
+        if label_w:
+            raw, color = labels.get(r, ("", ""))
+            text = " " + raw.ljust(label_w - 1)
+            parts.append(Text(text, style=f"bold {color}" if color else ""))
+        out.append(_fit(Text.assemble(*parts), width))
+    return out
+
+
+def _free_row(want: int, taken: set[int], rows: int) -> int:
+    """Nearest row to ``want`` not in ``taken`` (ties downward), in range."""
+    for offset in range(rows):
+        up = want - offset
+        if up >= 0 and up not in taken:
+            return up
+        down = want + offset
+        if down < rows and down not in taken:
+            return down
+    return want
+
+
+def _slope_row(series: list[tuple[str, str, list[float]]], pal: Palette) -> Text:
+    """The oscilloscope's slope-into-it readout: the aggregate decode delta
+    vs 5 ticks ago. Falling >8% of the current rate escalates to the warn
+    ``▼ sagging``; anything else reads ``steady``; with under 6 ticks of
+    history the row is the honest em dash — a fabricated 0 would read as
+    idle."""
+    live = [d for _, _, d in series]
+    if not live or any(len(d) < 6 for d in live):
+        return Text.assemble(Text("Δ5     ", style=pal.dim), Text("—", style=pal.dim))
+    cur = sum(d[-1] for d in live)
+    delta = cur - sum(d[-6] for d in live)
+    falling = delta < -cur * 0.08
+    return Text.assemble(
+        Text("Δ5     ", style=pal.dim),
+        Text(f"{delta:+.0f} tok/s", style=f"bold {pal.warn if falling else pal.ok}"),
+        Text("  ▼ sagging" if falling else "  steady", style=pal.warn if falling else pal.dim),
+    )
+
+
 # ─── Chrome: waybar (the only chrome; footer removed) ────────────────
 
 
@@ -631,43 +749,36 @@ def _fmt_tokens(n: int) -> str:
     return f"{n / 1_000_000:.1f}M"
 
 
-def _kv_tokens_tail(used: int, total: int, pal: Palette) -> tuple[str, list[tuple[str, str]]]:
-    """The kv row's token tail as ``(raw, segments)``.
+def _kv_tail(
+    used: int, total: int, kv_pct: float, pal: Palette
+) -> tuple[str, list[tuple[str, str]]]:
+    """The kv row's merged token + percentage tail as ``(raw, segments)``.
 
     ``raw`` is what the caller pads by, so it must be exactly what the
-    segments paint: a capacity-less node (the ``/get_load`` route) states its
-    used count and no denominator, and padding for a denominator nobody
-    reported ran the row one cell past the interior. With neither figure
-    known the tail is the same em dash the rest of the pane uses for "no
-    reading". A negative ``used`` is the cluster's unknown-used sentinel:
-    capacity alone is stated, dim, with no fabricated numerator.
+    segments paint. The percentage rides the same tail — the kv% row is
+    folded away — but only when a reading exists: a capacity without a
+    usage gauge states capacity alone, a capacity-less node states its used
+    count plus the reading it does have, and with neither figure known the
+    tail is the same em dash the rest of the pane uses for "no reading".
+    A negative ``used`` is the cluster's unknown-used sentinel: capacity is
+    stated, dim, with no fabricated numerator.
     """
     if total and used >= 0:
-        return (
-            f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok",
-            [
-                (_fmt_tokens(used), f"bold {pal.accent}"),
-                (f"/{_fmt_tokens(total)} tok", pal.dim),
-            ],
-        )
-    if total:
-        return f"{_fmt_tokens(total)} tok", [(f"{_fmt_tokens(total)} tok", pal.dim)]
-    if used > 0:
-        return _fmt_tokens(used), [(_fmt_tokens(used), f"bold {pal.accent}")]
-    return "—", [("—", pal.dim)]
-
-
-def _kv_pct_raw(kv_pct: float) -> str:
-    """The text the kv percentage tail occupies, for padding purposes.
-
-    A negative percentage is the collector's "no reading" sentinel — the
-    gauge was rejected, the route never states one, or no collector branch
-    ever wrote the field (the dataclass default IS the sentinel) — so its
-    raw width is the em-dash placeholder's.
-    The segment itself is built where the row is drawn: an unknown percentage
-    renders as the pane's placeholder row, with no tail at all.
-    """
-    return f"  {kv_pct:.0f}%" if kv_pct >= 0 else "  —"
+        raw = f"{_fmt_tokens(used)}/{_fmt_tokens(total)} tok"
+        segs = [
+            (_fmt_tokens(used), f"bold {pal.accent}"),
+            (f"/{_fmt_tokens(total)} tok", pal.dim),
+        ]
+    elif total:
+        raw, segs = f"{_fmt_tokens(total)} tok", [(f"{_fmt_tokens(total)} tok", pal.dim)]
+    elif used > 0:
+        raw, segs = _fmt_tokens(used), [(_fmt_tokens(used), f"bold {pal.accent}")]
+    else:
+        return "—", [("—", pal.dim)]
+    if kv_pct >= 0:
+        raw += f" · {kv_pct:.0f}%"
+        segs += [(" · ", pal.dim), (f"{kv_pct:.0f}%", f"bold {pal.accent}")]
+    return raw, segs
 
 
 def _fmt_axis(v: float) -> str:
@@ -812,11 +923,53 @@ class ServingBox(Static):
         if getattr(self.app, "floor", False):
             return Text("\n").join(_fit(r, width) for r in self._floor_rows(pal, width))
         tier = "rail" if getattr(self.app, "rail", False) else _density(self)
-        interior = self._interior_rows(pal, width, _density(self), tier)
-        rows = list(interior)
         chart_rows = getattr(self.app, "_chart_rows", 0)
+        # The gen rows duplicate the decode chart's own edge labels: they
+        # render only when no chart does (rail/floor, or a chart-less pane).
+        interior = self._interior_rows(pal, width, _density(self), tier, show_gen=not chart_rows)
+        rows = list(interior)
         if chart_rows:
-            if self._models:
+            narrow = _density(self) == "compact" or width < SERVING_NARROW_WIDTH
+            if getattr(self.app, "settings", None).chart != "lines":
+                series = [(m["name"], m["color"], m["gen"]) for m in self._models]
+                if not series and self._gen_data:
+                    series = [(self._model(), pal.ok, self._gen_data)]
+                # Y ticks need the shared scale; with nothing plotted there
+                # is no range to label, and a narrow pane cannot spare the
+                # gutter — either way the chart renders unlabeled.
+                hi = max((max(d) for _, _, d in series if d), default=0.0)
+                # the mid tick (hi/2) can be WIDER than the top tick in the
+                # ~1000-1049 band ('524' vs '1K') — size the gutter for both
+                gutter = len(_fmt_axis(hi)) if hi > 0 else 0
+                if hi > 0 and chart_rows >= 4:
+                    gutter = max(gutter, len(_fmt_axis(hi / 2)))
+                # Inline labels ride the chart's right edge (value + name,
+                # collision-resolved); they need 3+ rows and spare width.
+                label_w = 0
+                if series and chart_rows >= 3:
+                    widest = max(
+                        (len(f"{d[-1]:.0f} {name}".rstrip()) for name, _, d in series if d),
+                        default=0,
+                    )
+                    room = width - 4 - gutter - 1 - 12
+                    if widest and widest + 1 <= room:
+                        label_w = widest + 1
+                body = max(1, width - 4 - gutter - 1 - label_w)
+                if body < 12:
+                    if label_w:
+                        label_w = 0
+                        body = max(1, width - 4 - gutter - 1)
+                    if gutter and body < 12:
+                        gutter = 0
+                        body = max(1, width - 4)
+                chart = _oscilloscope_lines(series, chart_rows, body + label_w, pal, label_w)
+                if gutter:
+                    labels = _axis_labels(hi, chart_rows, gutter, pal)
+                    chart = [Text.assemble(lab, row) for lab, row in zip(labels, chart)]
+                rows.extend(chart)
+                if not narrow:
+                    rows.append(_slope_row(series, pal))
+            elif self._models:
                 series = [(m["name"], m["color"], m["gen"]) for m in self._models]
                 # Y ticks need the shared scale; with nothing plotted there
                 # is no range to label, and a narrow pane cannot spare the
@@ -866,18 +1019,23 @@ class ServingBox(Static):
             title.append((self._model(), pal.accent))
         return Text("\n").join(_box_lines(width, title, rtab, rows, False, pal))
 
-    def _interior_rows(self, pal: Palette, width: int, density: str, tier: str) -> list[Text]:
+    def _interior_rows(
+        self, pal: Palette, width: int, density: str, tier: str, show_gen: bool = True
+    ) -> list[Text]:
         narrow = density == "compact" or width < SERVING_NARROW_WIDTH
         if narrow:
-            return self._narrow_rows(pal, width, tier)
-        return self._wide_rows(pal, width)
+            return self._narrow_rows(pal, width, tier, show_gen)
+        return self._wide_rows(pal, width, show_gen)
 
-    def _wide_rows(self, pal: Palette, width: int) -> list[Text]:
-        """The design's serving rows (4 aligned metric rows with graph
-        spacers, then requests/cache/ttft/window). With several served
-        models the gen/requests/ttft rows go per-model instead."""
+    def _wide_rows(self, pal: Palette, width: int, show_gen: bool = True) -> list[Text]:
+        """The design's serving rows (aligned metric rows with graph spacers,
+        then requests/cache/ttft). With several served models the
+        requests/ttft rows go per-model instead. The per-model gen rows
+        duplicate what the decode chart's edge labels carry, so they render
+        only when no chart does (``show_gen``)."""
         if len(self._models) > 1:
-            return self._multi_rows(pal, width)
+            return self._multi_rows(pal, width, show_gen)
+
         # One model name on N endpoints: the cluster aggregate reads N× the
         # pane's own chart — the gen row's value AND its lo/avg/hi tail all
         # come from the authoritative rep's series.
@@ -904,10 +1062,9 @@ class ServingBox(Static):
         unknown_rate = f"no tok/s · {source}" if source else "no tok/s"
         tail_gen = f"{lo:.0f} · {gen_avg:.0f} · {hi:.0f} tok/s" if has else unknown_rate
         tail_prompt = f"{prompt_avg:.0f} tok/s" if has_prompt else unknown_rate
-        tail_kv, kv_segs = _kv_tokens_tail(used, total, pal)
-        tail_kvp = _kv_pct_raw(kv_pct)
-        kvp_segs = [(tail_kvp, pal.accent)]  # only drawn when the fill is known
-        tail_w = max(len(t) for t in (tail_gen, tail_prompt, tail_kv, tail_kvp))
+        tail_kv, kv_segs = _kv_tail(used, total, kv_pct, pal)
+        tails = [tail_gen, tail_prompt, tail_kv] if show_gen else [tail_prompt, tail_kv]
+        tail_w = max(len(t) for t in tails)
         graph_w = max(3, width - 4 - 7 - 2 - tail_w)
 
         def tail(segs: list[tuple[str, str]], raw: str) -> list[Text]:
@@ -940,7 +1097,6 @@ class ServingBox(Static):
             tail_prompt,
         )
         kv_tail = tail(kv_segs, tail_kv)
-        kvp_tail = tail(kvp_segs, tail_kvp)
 
         def graph_row(label: str, graph: Text, tail_segs: list[Text]) -> Text:
             return Text.assemble(
@@ -974,9 +1130,10 @@ class ServingBox(Static):
                 Text(" " * (graph_w - len(hero)), style=""),
             )
             gen_fill = Text(" " * spark_w, style="")
-        r.append(graph_row("gen    ", gen_graph, gen_tail))
-        r.append(Text.assemble(Text(" " * (7 + len(hero) + 1), style=""), gen_fill))
-        r.append(Text("", style=""))
+        if show_gen:
+            r.append(graph_row("gen    ", gen_graph, gen_tail))
+            r.append(Text.assemble(Text(" " * (7 + len(hero) + 1), style=""), gen_fill))
+            r.append(Text("", style=""))
         prompt_duo = (
             _spark_duo_lines(_stretch(self._prompt_data, graph_w), pal.blue, graph_w, pal)
             if has_prompt
@@ -989,22 +1146,6 @@ class ServingBox(Static):
         r.append(graph_row("kv     ", kv_duo[0], kv_tail))
         r.append(Text.assemble(Text(" " * 7, style=""), kv_duo[1]))
         r.append(Text("", style=""))
-        if self._kv is None or kv_pct < 0:
-            # No capacity reading: a bar would have to invent a fill of 0.
-            r.append(Text.assemble(Text("kv%    ", style=pal.dim), Text("—", style=pal.dim)))
-        else:
-            r.append(
-                Text.assemble(
-                    Text("kv%    ", style=pal.dim),
-                    _bar_line(kv_pct, graph_w, pal.accent, pal)
-                    if _treatment(self) == "gradient"
-                    else _meter_line(
-                        _treatment(self), kv_pct, graph_w, pal, pal.accent, list(self._kv_data)
-                    ),
-                    *kvp_tail,
-                )
-            )
-        r.append(Text("", style=""))
         if self._kv is None:
             r.append(Text.assemble(Text("requests  ", style=pal.dim), Text("—", style=pal.dim)))
         else:
@@ -1013,13 +1154,13 @@ class ServingBox(Static):
         r.append(self._ttft_row(pal, s, width))
         return r
 
-    def _multi_rows(self, pal: Palette, width: int) -> list[Text]:
-        """Multi-model serving pane: one aligned gen row per served model
-        (its hue is its identity in the shared braille chart below), the
-        aggregate prompt/kv rows, then per-model requests and ttft rows.
-        Row count is ``WIDE_BASE + models + 2 + 4*(models-1)`` — mirrored by
-        the fit estimator so nothing ever clips (each gen row is 2 rows: dot
-        line + fill; prompt/kv are duo too)."""
+    def _multi_rows(self, pal: Palette, width: int, show_gen: bool = True) -> list[Text]:
+        """Multi-model serving pane: the aggregate prompt/kv rows, then
+        per-model requests and ttft rows. The per-model gen rows duplicate
+        what the shared braille chart's edge labels carry, so they render
+        only when no chart does (``show_gen``). Row count is mirrored by
+        the fit estimator so nothing ever clips (each gen row is 2 rows:
+        dot line + fill; prompt/kv are duo too)."""
         models = self._models
         name_w = min(20, max(len(m["name"]) for m in models))
         s = self._kv or {}
@@ -1043,11 +1184,11 @@ class ServingBox(Static):
                 else f"no tok/s · {m['source']}"
             )
         tail_prompt = f"{prompt_avg:.0f} tok/s" if self._prompt_data else unknown_rate
-        tail_kv, kv_segs = _kv_tokens_tail(used, total, pal)
-        tail_kvp = _kv_pct_raw(kv_pct)
-        kvp_segs = [(tail_kvp, pal.accent)]  # only drawn when the fill is known
+        tail_kv, kv_segs = _kv_tail(used, total, kv_pct, pal)
         tail_w = max(
-            [len(t) for t in gen_tails] + [len(tail_prompt), len(tail_kv), len(tail_kvp), 5]
+            [len(t) for t in gen_tails] + [len(tail_prompt), len(tail_kv), 5]
+            if show_gen
+            else [len(tail_prompt), len(tail_kv), 5]
         )
         # Engine badge — the model row names the engine serving it, so an
         # SGLang model is identifiable without waiting for a missing token
@@ -1096,7 +1237,9 @@ class ServingBox(Static):
             return out
 
         r: list[Text] = []
-        for m, gen_tail in zip(models, gen_tails):
+        # The gen rows duplicate the chart's edge labels; they render only
+        # when no chart does.
+        for m, gen_tail in zip(models if show_gen else [], gen_tails):
             name = (m["name"][: name_w - 1] + "…") if len(m["name"]) > name_w else m["name"]
             name = name.ljust(name_w)
             gen = m["gen"]
@@ -1178,22 +1321,6 @@ class ServingBox(Static):
             )
         )
         r.append(Text.assemble(Text(" " * 7, style=""), kv_duo[1]))
-        r.append(Text("", style=""))
-        if kv_pct < 0:
-            # No capacity reading: a bar would have to invent a fill of 0.
-            r.append(Text.assemble(Text("kv%    ", style=pal.dim), Text("—", style=pal.dim)))
-        else:
-            r.append(
-                Text.assemble(
-                    Text("kv%    ", style=pal.dim),
-                    _bar_line(kv_pct, graph_w, pal.accent, pal)
-                    if _treatment(self) == "gradient"
-                    else _meter_line(
-                        _treatment(self), kv_pct, graph_w, pal, pal.accent, list(self._kv_data)
-                    ),
-                    *tail(tail_kvp, kvp_segs),
-                )
-            )
         r.append(Text("", style=""))
         for m in models:
             r.append(self._model_requests_row(pal, m, name_w))
@@ -1277,27 +1404,30 @@ class ServingBox(Static):
             row.append(f" {marker}", style=tail_style)
         return row
 
-    def _narrow_rows(self, pal: Palette, width: int, tier: str) -> list[Text]:
-        """Prioritized narrow grammar (compact): gen · requests · ttft · kv% ·
-        cache. The inline gen sparkline is the last chart visual; the window
-        stat and the per-node serving rates are dropped (aggregate gen is the
-        priority)."""
-        gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
+    def _narrow_rows(
+        self, pal: Palette, width: int, tier: str, show_gen: bool = True
+    ) -> list[Text]:
+        """Prioritized narrow grammar (compact): requests · ttft · kv (merged
+        token + pct tail) · cache, plus the gen row — value + inline
+        sparkline — only when no chart renders. The window stat and the
+        per-node serving rates are dropped (aggregate gen is the priority)."""
         s = self._kv or {}
         r = []
-        # gen — value + inline sparkline (the last chart visual at compact).
-        gen = Text.assemble(
-            Text("gen ", style=pal.dim),
-            Text(f"{gen_avg:.0f}", style=f"bold {pal.ok}")
-            if self._gen_data
-            else Text("—", style=pal.dim),
-            Text(" tok/s", style=pal.dim),
-        )
-        if self._gen_data and width > 26:
-            spark_w = min(18, max(4, width - 22))
-            gen.append(" ", style=pal.dim)
-            gen.append(_spark_line(self._gen_data, pal.ok, spark_w))
-        r.append(gen)
+        # gen — value + inline sparkline; hidden while the chart carries it.
+        if show_gen:
+            gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
+            gen = Text.assemble(
+                Text("gen ", style=pal.dim),
+                Text(f"{gen_avg:.0f}", style=f"bold {pal.ok}")
+                if self._gen_data
+                else Text("—", style=pal.dim),
+                Text(" tok/s", style=pal.dim),
+            )
+            if self._gen_data and width > 26:
+                spark_w = min(18, max(4, width - 22))
+                gen.append(" ", style=pal.dim)
+                gen.append(_spark_line(self._gen_data, pal.ok, spark_w))
+            r.append(gen)
         # requests — running/waiting concurrency.
         r.append(
             Text.assemble(
@@ -1322,19 +1452,13 @@ class ServingBox(Static):
         else:
             ttft.append("—", style=pal.dim)
         r.append(ttft)
-        # kv% — plain value (the meter is dropped from the narrow grammar);
-        # a capacity-less node has no fill to state, so the sentinel renders
-        # as the same em dash the adjacent cache row uses.
-        kv_pct = s.get("pct", -1.0)
-        r.append(
-            Text.assemble(
-                Text("kv ", style=pal.dim),
-                Text(
-                    f"{kv_pct:.0f}%" if kv_pct >= 0 else "—",
-                    style=f"bold {pal.accent}" if kv_pct >= 0 else pal.dim,
-                ),
-            )
+        # kv — the merged token + percentage tail; the kv% row is folded
+        # away, so capacity and reading (or the honest em dash when neither
+        # is known) live on this one row.
+        tail_kv, kv_segs = _kv_tail(
+            s.get("used_tok", 0), s.get("total_tok", 0), s.get("pct", -1.0), pal
         )
+        r.append(Text.assemble(Text("kv ", style=pal.dim), *kv_segs))
         # cache — dropped at rail so the base gen/req/ttft surface is minimal.
         if tier != "rail":
             hit = s.get("prefix_hit", -1.0)
@@ -1676,22 +1800,38 @@ def _palette_for(app: "DGXTop") -> Palette:
 # ─── Fit-driven layout ───────────────────────────────────────────────
 
 
-def _serving_base(tier: str, serv_width: int, models: int = 1) -> int:
-    """SERVING interior rows without the area chart for (tier, serving width,
-    model count). Rail/floor are the fixed base surfaces; the prioritized
-    fused grammar is used below SERVING_NARROW_WIDTH and always at compact (a
-    height-driven fold); the wide design grammar (no window stat) elsewhere.
-    Each model beyond the first gains an extra gen row + spacer, its own
-    requests row and its own ttft row (4 rows) in the wide grammar only. In
-    the wide grammar every gen row is 2 rows (dot line + fill) and the
-    prompt/kv sparks are duo as well — the ``+ models + 2`` term."""
+def _serving_base(
+    tier: str,
+    serv_width: int,
+    models: int = 1,
+    chart: str = "oscilloscope",
+    chart_rows: int = 1,
+) -> int:
+    """SERVING interior rows without the chart for (tier, serving width,
+    model count, chart mode, chart presence). Rail/floor are the fixed base
+    surfaces; the prioritized fused grammar is used below
+    SERVING_NARROW_WIDTH and always at compact (a height-driven fold); the
+    wide design grammar (no window stat) elsewhere.
+
+    The per-model gen rows duplicate what the chart's own edge labels
+    carry, so they render only when NO chart does (``chart_rows == 0``):
+    the wide base is the prompt/kv duo blocks, the per-model requests and
+    ttft rows, cache, and — oscilloscope mode only, with a chart — the Δ5
+    slope row. When no chart renders the gen dot + fill + spacer returns
+    (``+ 3 * models``) and the slope row leaves (``- 1``, oscilloscope
+    only — it rides the chart). Narrow is the same fold at one row (4 with
+    a chart, 5 without)."""
     if tier == "rail":
         return SERVING_ROWS_RAIL
     if tier == "floor":
         return SERVING_ROWS_FLOOR
     if tier == "compact" or serv_width < SERVING_NARROW_WIDTH:
-        return NARROW_BASE
-    return WIDE_BASE + max(1, models) + 2 + 4 * max(0, models - 1)
+        return NARROW_BASE if chart_rows else NARROW_BASE + 1
+    base = (WIDE_BASE if chart != "lines" else WIDE_BASE_LINES) + 2 * models
+    if not chart_rows:
+        # the gen duo rows return; the Δ5 row does not (it rides the chart)
+        base += 3 * models - (1 if chart != "lines" else 0)
+    return base
 
 
 def _serving_chart(tier: str, room: int) -> int:
@@ -1773,7 +1913,13 @@ def _grid_height(n: int, cols: int, tile: int, tier: str) -> int:
 
 
 def _tier_fit(
-    n: int, width: int, avail: int, tier: str, tiled: bool, models: int = 1
+    n: int,
+    width: int,
+    avail: int,
+    tier: str,
+    tiled: bool,
+    models: int = 1,
+    chart_mode: str = "oscilloscope",
 ) -> tuple[bool, int, int, int, int]:
     """(fits, cols, node_h, serv_h, chart) for one tier in one arrangement.
     Mirrors the CSS row grammar exactly (estimate/layout duality): the stacked
@@ -1790,7 +1936,9 @@ def _tier_fit(
             cols = _node_grid_columns(n, nw, tiled)
         tile = _node_tile_rows(tier, -(-nw // cols))
         node_h = _grid_height(n, cols, tile, tier)
-        base = _serving_base(tier, sw, models)
+        base = _serving_base(
+            tier, sw, models, chart_mode, chart_rows=0 if tier in ("rail", "floor") else 1
+        )
         chart = _serving_chart(tier, avail - base - 2)
         serv_h = base + chart + (2 if tier != "floor" else 0)
         fits = node_h <= avail and serv_h <= avail
@@ -1801,7 +1949,9 @@ def _tier_fit(
         cols = _node_grid_columns(n, width, tiled)
     tile = _node_tile_rows(tier, -(-width // cols))
     node_h = _grid_height(n, cols, tile, tier)
-    base = _serving_base(tier, width, models)
+    base = _serving_base(
+        tier, width, models, chart_mode, chart_rows=0 if tier in ("rail", "floor") else 1
+    )
     if tier == "floor":
         serv_h = base  # bare floor lines, no window frame
         fits = serv_h + node_h <= avail
@@ -1816,12 +1966,19 @@ def _tier_fit(
 _TIER_RANK = {name: i for i, name in enumerate(("roomy", "dense", "compact", "rail", "floor"))}
 
 
-def _tier_for(n: int, width: int, height: int, tiled: bool, models: int = 1) -> str:
+def _tier_for(
+    n: int,
+    width: int,
+    height: int,
+    tiled: bool,
+    models: int = 1,
+    chart_mode: str = "oscilloscope",
+) -> str:
     """Densest tier whose estimated body fits (loosest first) for one
     arrangement; the floor is the unconditional fallback."""
     avail = height - WAYBAR_HEIGHT
     for tier in ("roomy", "dense", "compact", "rail"):
-        if _tier_fit(n, width, avail, tier, tiled, models)[0]:
+        if _tier_fit(n, width, avail, tier, tiled, models, chart_mode)[0]:
             return tier
     return "floor"
 
@@ -1934,8 +2091,8 @@ class DGXTop(App):
         right column must never densify the serving surface (the hero chart is
         the priority). Ties prefer the tiled layout the request asks for."""
         tiled = _arrangement(width)
-        tier_t = _tier_for(n, width, height, True, self._models_n)
-        tier_s = _tier_for(n, width, height, False, self._models_n)
+        tier_t = _tier_for(n, width, height, True, self._models_n, self.settings.chart)
+        tier_s = _tier_for(n, width, height, False, self._models_n, self.settings.chart)
         if tiled and _TIER_RANK[tier_t] <= _TIER_RANK[tier_s]:
             return True, tier_t
         return False, tier_s
@@ -1944,7 +2101,9 @@ class DGXTop(App):
         n = len(self.settings.nodes)
         avail = height - WAYBAR_HEIGHT
         tiled, tier = self._choose_layout(n, width, height)
-        _fits, cols, node_h, serv_h, chart = _tier_fit(n, width, avail, tier, tiled, self._models_n)
+        _fits, cols, node_h, serv_h, chart = _tier_fit(
+            n, width, avail, tier, tiled, self._models_n, self.settings.chart
+        )
         node_mode = "table" if tier == "floor" else "card"
         rail = tier == "rail"
         floor = tier == "floor"
