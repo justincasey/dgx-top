@@ -413,6 +413,26 @@ async def test_node_meter_is_gradient_kv_is_single_hue(tmp_path: Path, monkeypat
         assert re.search(r"\d+%", kv_line), kv_line
 
 
+async def test_node_meters_fill_the_tile_interior(tmp_path: Path, monkeypatch):
+    """Meters span the full tile interior: no trailing blank cells before the
+    right border (the old 20-cell cap left dead space at wider tiles)."""
+    from app import DGXTop, NodeBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        node = app.query_one("#node-0", NodeBox).render().plain
+        lines = node.split("\n")
+        for row_idx in (2, 4):  # gpu meter, mem meter (top, gpu, meter, mem, meter)
+            content = lines[row_idx][2:-2]  # strip border + one pad cell each side
+            assert content == content.rstrip(), (row_idx, repr(lines[row_idx]))
+            assert len(content) == len(lines[1][2:-2]), (row_idx, len(content))
+
+
 # ─── AC6: serving area chart ─────────────────────────────────────────
 
 
@@ -460,11 +480,13 @@ async def test_waybar_shows_cluster_chrome(tmp_path: Path, monkeypatch):
 # ─── AC8: CPU frequency renders MHz ──────────────────────────────────
 
 
-def test_fmt_freq_renders_mhz():
+def test_fmt_freq_renders_ghz():
     from app import _fmt_freq
 
-    assert _fmt_freq(2808.0) == "2808MHz"
-    assert _fmt_freq(3900.0) == "3900MHz"
+    assert _fmt_freq(2405.0) == "2.4GHz"
+    assert _fmt_freq(2808.0) == "2.8GHz"
+    assert _fmt_freq(3900.0) == "3.9GHz"
+    assert _fmt_freq(999.0) == "999MHz"
     assert _fmt_freq(0) == ""
 
 
@@ -479,7 +501,7 @@ async def test_node_gpu_row_shows_sm_clock(tmp_path: Path, monkeypatch):
         await pilot.pause()
         node = app.query_one("#node-0", NodeBox).render().plain
         gpu_line = next(ln for ln in node.split("\n") if "gpu" in ln)
-        assert "2411MHz" in gpu_line
+        assert "2.4GHz" in gpu_line
 
 
 # ─── AC9: bottom bar only in the most compressed tiers ───────────────
