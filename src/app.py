@@ -806,9 +806,11 @@ def _axis_labels(hi: float, rows: int, gutter: int, pal: Palette) -> list[Text]:
 
 
 def _fmt_freq(mhz: float) -> str:
-    """Format a clock frequency in MHz as ``2411MHz``."""
+    """Format a clock frequency compactly: ``2.4GHz`` at/above 1000MHz, else ``990MHz``."""
     if mhz <= 0:
         return ""
+    if mhz >= 1000:
+        return f"{mhz / 1000:.1f}GHz"
     return f"{mhz:.0f}MHz"
 
 
@@ -1671,7 +1673,7 @@ class NodeBox(Static):
     ) -> list[Text]:
         compact = density == "compact" or (width - 4) <= 18
         iw = max(1, width - 4)
-        mw = min(20, max(4, iw - 6))
+        mw = iw  # meters fill the interior; _fit pads/truncates to iw either way
         dash = Text("—", style=pal.dim)
         rows: list[Text] = []
         # GPU: util (headline) + temp + power; gradient meter beneath.
