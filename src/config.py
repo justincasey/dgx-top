@@ -27,15 +27,16 @@ class NodeConfig:
     vllm_url: str
     worker: bool = False
     engine: str | None = None
-    """Expected inference engine (``"vllm"`` or ``"sglang"``); ``None`` means
-    infer it from the endpoint's own metrics. The URL is engine-agnostic, so
-    the field selects no metric profile and no protocol of its own: it
-    suppresses SGLang's load-API probe on a node declared ``"vllm"``, and it
-    names the engine on a load-only row (``collector.poll_unit`` sets
-    ``model_source`` from it)."""
+    """Expected inference engine (``"vllm"``, ``"sglang"`` or
+    ``"tensorfold"``); ``None`` means infer it from the endpoint's own
+    metrics. The URL is engine-agnostic, so the field selects no metric
+    profile and no protocol of its own: it suppresses SGLang's load-API
+    probe on a node declared as an engine without one (vLLM, TensorFold),
+    and it names the engine on a load-only row (``collector.poll_unit``
+    sets ``model_source`` from it)."""
 
 
-ENGINES = {"vllm", "sglang"}
+ENGINES = {"vllm", "sglang", "tensorfold"}
 """Recognised values for ``NodeConfig.engine``.
 
 Must stay equal to ``collector.ENGINE_PROFILES``: every engine the collector

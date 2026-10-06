@@ -40,7 +40,7 @@ class SparkUnitStats:
     is_worker: bool = False
     model_hosted: bool = False
     model_name: str = ""
-    model_source: str = "vllm"  # "vllm" or "sglang" (engine family)
+    model_source: str = "vllm"  # engine family: "vllm" / "sglang" / "tensorfold"
     model_metrics: bool = True  # False = load-only endpoint (no token counters)
     kv_cache_pct: float = -1.0  # 0-100; -1 = no reading (gauge absent/rejected, /get_load)
     kv_total_blocks: int = 0  # from cache_config_info num_gpu_blocks (vLLM only; 0 on SGLang)

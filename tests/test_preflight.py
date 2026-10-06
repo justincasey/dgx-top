@@ -71,15 +71,21 @@ SGLANG_METRICS = (
     'sglang:num_running_reqs{model_name="qwen",tp_rank="0",pp_rank="0"} 2.0\n'
 )
 VLLM_METRICS = 'vllm:num_requests_running{model_name="qwen"} 2.0\n'
+TENSORFOLD_METRICS = "tensorfold:num_requests_running 2.0\n"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "text, engine",
-    [(SGLANG_METRICS, "sglang"), (VLLM_METRICS, "vllm")],
+    [
+        (SGLANG_METRICS, "sglang"),
+        (VLLM_METRICS, "vllm"),
+        (TENSORFOLD_METRICS, "tensorfold"),
+    ],
 )
-async def test_engine_check_accepts_either_namespace(text, engine):
-    # The old check required the literal "vllm:", so every SGLang node failed.
+async def test_engine_check_accepts_any_namespace(text, engine):
+    # The old check required the literal "vllm:", so every SGLang node failed;
+    # any engine's own namespace is sample evidence now.
     node = NodeConfig("node-a", "node-a", "http://node-a.example.com")
     with patch("preflight.httpx.AsyncClient", _Client(_Resp(text))):
         result = await _check_engine(node)
@@ -121,6 +127,22 @@ async def test_engine_check_skips_the_load_api_for_a_declared_vllm_node():
     # (matching the collector): a dead /metrics is a real failure there, not
     # a hint to look for a load endpoint.
     node = NodeConfig("node-a", "node-a", "http://node-a.example.com", engine="vllm")
+    load = AsyncMock(return_value=EngineLoad(running=2, waiting=1))
+    with patch("preflight.httpx.AsyncClient", _Client(_Resp(status_error=RuntimeError("404")))):
+        with patch("preflight.fetch_engine_load", load):
+            result = await _check_engine(node)
+
+    assert not result.ok
+    assert "no metrics endpoint" in result.detail
+    load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_engine_check_skips_the_load_api_for_a_declared_tensorfold_node():
+    # TensorFold has no load API (matching the collector's LOAD_API_ENGINES):
+    # a dead /metrics is a real failure there, never a probe for SGLang's
+    # routes on a foreign server.
+    node = NodeConfig("node-a", "node-a", "http://node-a.example.com", engine="tensorfold")
     load = AsyncMock(return_value=EngineLoad(running=2, waiting=1))
     with patch("preflight.httpx.AsyncClient", _Client(_Resp(status_error=RuntimeError("404")))):
         with patch("preflight.fetch_engine_load", load):

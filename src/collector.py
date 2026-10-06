@@ -219,7 +219,8 @@ def _ns_sample_count(lines: List[str], ns: str) -> int:
 # family. SGLang shares only the token counters and the TTFT histogram with
 # vLLM: its concurrency, KV and prefix-cache series have different NAMES and
 # different TYPES (gauges, where vLLM has a config block and cumulative
-# counters). Nothing is ever derived by prefixing a vLLM name with another
+# counters). TensorFold instead repeats vLLM's own names behind its own
+# namespace. Nothing is ever derived by prefixing a vLLM name with another
 # namespace — a semantic absent from a profile has no candidates, so an
 # engine-specific fallback can never fire on the other engine.
 ENGINE_PROFILES: Dict[str, Dict[str, Tuple[str, ...]]] = {
@@ -252,36 +253,60 @@ ENGINE_PROFILES: Dict[str, Dict[str, Tuple[str, ...]]] = {
         # A gauge (0-1); SGLang exposes no prefix-cache counters at all.
         "prefix_hit_rate": ("cache_hit_rate",),
     },
+    "tensorfold": {
+        # TensorFold repeats every reading under vLLM-compatible names with
+        # identical values, all behind its own namespace ("a dashboard copied
+        # from vLLM fills by swapping the prefix"). Only those names are
+        # listed: the engine's own aliases (requests_running, the
+        # kv_cache_usage_ratio pools) state the same values and must never be
+        # summed in beside them.
+        "generation_tokens": ("generation_tokens_total",),
+        "prompt_tokens": ("prompt_tokens_total",),
+        "ttft": ("time_to_first_token_seconds",),
+        # A 0-1 fraction of each stream's own context window. TensorFold
+        # states no block pool, no capacity gauge, no prefix-cache series and
+        # no ITL histogram — those semantics stay at their sentinels.
+        "kv_usage": ("kv_cache_usage_perc",),
+        "running": ("num_requests_running",),
+        "waiting": ("num_requests_waiting",),
+    },
 }
 
 DEFAULT_ENGINE = "vllm"
-"""Engine assumed when neither namespace carries sample evidence."""
+"""Engine assumed when no namespace carries sample evidence."""
 
 
 def metrics_engine(text: str) -> Optional[str]:
     """The engine family a ``/metrics`` payload reports, or None when it
-    carries no sample line from either namespace.
+    carries no sample line from any known namespace.
 
-    Sample evidence, not substring matching: majority of actual sample lines,
-    tie -> vLLM, so one stray sample from the other family can never flip the
-    parse and zero out every real series. This is what the *payload* says it
-    is — an endpoint's own metrics are authoritative about which engine
-    serves it.
+    Sample evidence, not substring matching: the namespace holding the
+    majority of actual sample lines wins, a tie resolves to the default
+    engine, so one stray sample from another family can never flip the parse
+    and zero out every real series. This is what the *payload* says it is —
+    an endpoint's own metrics are authoritative about which engine serves it.
     """
     lines = text.splitlines()
-    vllm_n = _ns_sample_count(lines, "vllm:")
-    sglang_n = _ns_sample_count(lines, "sglang:")
-    if sglang_n > vllm_n:
-        return "sglang"
-    if vllm_n:
-        return DEFAULT_ENGINE
-    return None
+    counts = {engine: _ns_sample_count(lines, f"{engine}:") for engine in ENGINE_PROFILES}
+    best = max(counts.values(), default=0)
+    if not best:
+        return None
+    leaders = [engine for engine, n in counts.items() if n == best]
+    # Dict order puts the default engine first, so any tie resolves to it.
+    return leaders[0] if len(leaders) == 1 else DEFAULT_ENGINE
 
 
 def detect_engine(text: str) -> str:
     """``metrics_engine`` with the neutral default applied for callers that
     need an engine id regardless (metric names must be looked up somewhere)."""
     return metrics_engine(text) or DEFAULT_ENGINE
+
+
+LOAD_API_ENGINES = {"sglang"}
+"""Engines with a load API to fall back to when ``/metrics`` yields nothing.
+
+TensorFold and vLLM have no such route, so a node declared as either is
+never probed for SGLang's ``/v1/loads``/``/get_load``."""
 
 
 def _metric_names(engine: str, semantic: str) -> Tuple[str, ...]:
@@ -363,6 +388,16 @@ def _parse_engine_metrics(text: str) -> SparkUnitStats:
         __init__, gated only on --enable-metrics) and every rank of a replica
         reports the same shared pool, so capacity is collapsed per replica
         (test_sglang_capacity_collapses_ranks_of_one_replica).
+
+      TensorFold publishes vLLM's own metric names behind its own
+      ``tensorfold:`` namespace (every reading is repeated under a
+      vLLM-compatible name with identical values, so a vLLM dashboard fills
+      by swapping the prefix): the token counters, the request gauges and
+      the TTFT histogram match vLLM's modern names, and
+      ``kv_cache_usage_perc`` is a 0-1 fraction of each stream's own context
+      window. It states no block pool, no capacity gauge, no prefix-cache
+      series and no ITL histogram, so those semantics stay at their
+      sentinels and the UI paints its "no reading" dash.
 
     Derived token counts: total_tokens (above) and used_tokens =
     total_tokens * usage_fraction. These are *block-allocated token capacity*,
@@ -1360,7 +1395,7 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
             s = parsed
             s.model_name = _model_names.get(unit_id, "")
         else:
-            metrics_error = RuntimeError("/metrics served no vllm:/sglang: series")
+            metrics_error = RuntimeError("/metrics served no vllm:/sglang:/tensorfold: series")
     except Exception as e:
         metrics_error = e
     if metrics_error is not None:
@@ -1368,16 +1403,17 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
         # server still reports its state over its load API — concurrency and
         # KV tokens from either route, capacity and percentage only from
         # /v1/loads — so a metrics-disabled SGLang is not reduced to a blank
-        # node. A node declared as vLLM is never probed for SGLang's routes.
-        if declared_engine == "vllm":
-            load = None
-        else:
+        # node. A node declared as vLLM or TensorFold is never probed for
+        # SGLang's routes (see LOAD_API_ENGINES).
+        if declared_engine is None or declared_engine in LOAD_API_ENGINES:
             try:
                 load = await fetch_engine_load(vllm_url)
             except Exception:
                 # fetch_engine_load is total by contract; the belt stays on so
                 # telemetry_task below is always awaited.
                 load = None
+        else:
+            load = None
         if load is not None:
             s.model_hosted = True
             s.model_source = declared_engine or "sglang"
