@@ -183,13 +183,13 @@ def test_node_engine_key_is_optional_and_validated(tmp_path: Path):
     # Absent: the engine is inferred from the endpoint's own metrics.
     assert load_config(_write(tmp_path)).nodes[0].engine is None
 
-    for engine in ("vllm", "sglang"):
+    for engine in ("vllm", "sglang", "tensorfold"):
         path = _with_node_line(f'engine = "{engine}"', tmp_path)
         assert load_config(path).nodes[0].engine == engine
 
     # Case and surrounding whitespace are normalized away; a regression
     # that compares the raw value would reject valid mixed-case configs.
-    for raw, expected in ((" SGLang ", "sglang"), ("VLLM", "vllm")):
+    for raw, expected in ((" SGLang ", "sglang"), ("VLLM", "vllm"), ("TensorFold", "tensorfold")):
         path = _with_node_line(f'engine = "{raw}"', tmp_path)
         assert load_config(path).nodes[0].engine == expected
 

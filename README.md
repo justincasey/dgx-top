@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/justincasey/dgx-top/actions/workflows/ci.yml/badge.svg)](https://github.com/justincasey/dgx-top/actions/workflows/ci.yml)
 
-`dgx-top` is an agentless terminal dashboard for monitoring one- to twelve-node NVIDIA DGX Spark clusters serving models with vLLM or SGLang. It combines hardware telemetry collected over SSH with the engine's HTTP metrics—nothing is installed on the Spark nodes.
+`dgx-top` is an agentless terminal dashboard for monitoring one- to twelve-node NVIDIA DGX Spark clusters serving models with vLLM, SGLang, or TensorFold. It combines hardware telemetry collected over SSH with the engine's HTTP metrics—nothing is installed on the Spark nodes.
 
 ## What it shows
 
@@ -14,7 +14,7 @@
 - Prompt-to-generation ratio
 - Running and waiting requests
 - KV-cache utilization, block-allocated token capacity, and prefix-cache hit rate
-- The engine serving each model (`vllm` / `sglang` badge), detected from its own metrics
+- The engine serving each model (`vllm` / `sglang` / `tensorfold` badge), detected from its own metrics
 - Time-to-first-token p50–p95, with the tail taking warn past 2s and an `!!`
   alarm past 8s
 - GPU utilization, temperature, SM clock, memory, and power draw
@@ -39,7 +39,9 @@
 - A running inference server:
   - vLLM exposing `/metrics`, or
   - SGLang started with `--enable-metrics` (exposes the `sglang:` series), or
-    plain SGLang, whose load API `dgx-top` reads instead
+    plain SGLang, whose load API `dgx-top` reads instead, or
+  - TensorFold exposing `/metrics` (its `tensorfold:` series repeats every
+    reading under vLLM-compatible names)
 
 `dgx-top` reads whichever engine is there. It identifies the engine family from
 the metric names in `/metrics`; a server without `--enable-metrics` is detected
@@ -50,6 +52,12 @@ count only, so capacity and percentage read `—` on it. The load API says nothi
 about token throughput or the prefix-cache hit rate at all: those come from
 `/metrics`, so a server started without `--enable-metrics` paints
 `no tok/s · sglang` and a `—` cache row rather than a zero nobody measured.
+
+TensorFold publishes its `tensorfold:` series with every reading repeated
+under a vLLM-compatible name, so its request queues, token throughput, TTFT
+and KV percentage read like vLLM's. It states no block pool, no token
+capacity, no prefix-cache hit rate and no inter-token latency, so those rows
+paint `—` rather than a zero nobody measured.
 
 `dgx-top` never needs an SSH password, private key contents, sudo credentials, or an API token in its configuration.
 
@@ -138,7 +146,7 @@ worker = true
 | `ssh_target`     | Any target accepted by `ssh`, such as `user@host` or an SSH alias           |
 | `vllm_url`       | Inference-engine base URL reachable from the control machine; do not include `/metrics` |
 | `worker`         | Marks a worker node in a tensor-parallel deployment                         |
-| `engine`         | Optional `"vllm"` or `"sglang"`. Absent: inferred from the endpoint's own metrics (authoritative). Set to `"vllm"` to skip SGLang's load-API probes entirely |
+| `engine`         | Optional `"vllm"`, `"sglang"` or `"tensorfold"`. Absent: inferred from the endpoint's own metrics (authoritative). Set to `"vllm"` or `"tensorfold"` to skip SGLang's load-API probes entirely |
 | `poll_interval`  | Initial polling interval in seconds, from 1 to 60                           |
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |

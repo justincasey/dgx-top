@@ -666,6 +666,98 @@ class SglangMetricsTests(unittest.TestCase):
         self.assertEqual(s.kv_cache_pct, -1.0)
 
 
+class TensorFoldMetricsTests(unittest.TestCase):
+    """TensorFold's exposition is vLLM's metric names behind the
+    ``tensorfold:`` namespace: every reading is repeated under both the
+    engine's own alias and a vLLM-compatible name with identical values, so
+    the profile reads only the vLLM names — an alias listed beside them
+    would double every count."""
+
+    def _payload(self) -> str:
+        return (
+            "tensorfold:requests_running 2\n"
+            "tensorfold:requests_waiting 1\n"
+            "tensorfold:num_requests_running 2\n"
+            "tensorfold:num_requests_waiting 1\n"
+            "tensorfold:prompt_tokens_total 4000\n"
+            "tensorfold:generation_tokens_total 9000\n"
+            'tensorfold:kv_cache_usage_ratio{pool="0"} 0.45\n'
+            'tensorfold:kv_cache_usage_perc{stream="0"} 0.45\n'
+            'tensorfold:time_to_first_token_seconds_bucket{le="1.0"} 10\n'
+            'tensorfold:time_to_first_token_seconds_bucket{le="+Inf"} 10\n'
+            "tensorfold:time_to_first_token_seconds_count 10\n"
+        )
+
+    def test_tensorfold_payload_populates_every_stated_semantic(self):
+        s = collector._parse_engine_metrics(self._payload())
+
+        self.assertEqual(s.model_source, "tensorfold")
+        self.assertTrue(s.model_hosted)
+        self.assertEqual((s.requests_running, s.requests_waiting), (2, 1))
+        self.assertAlmostEqual(s.kv_cache_pct, 45.0)
+        self.assertAlmostEqual(s.ttft_p50_ms, 500.0)
+        self.assertEqual(s.generation_tokens_total, 9000.0)
+        self.assertEqual(s.prompt_tokens_total, 4000.0)
+        self.assertTrue(s.model_metrics)
+
+    def test_tensorfold_aliases_are_never_summed_beside_the_vllm_names(self):
+        # requests_running mirrors num_requests_running and
+        # kv_cache_usage_ratio mirrors kv_cache_usage_perc; counting both
+        # would report 4 running requests and a 90% pool.
+        s = collector._parse_engine_metrics(self._payload())
+
+        self.assertEqual((s.requests_running, s.requests_waiting), (2, 1))
+        self.assertAlmostEqual(s.kv_cache_pct, 45.0)
+
+    def test_tensorfold_unstated_semantics_keep_their_sentinels(self):
+        # No block pool, no capacity gauge, no used-token count, no
+        # prefix-cache series, no ITL histogram: unknown, not zero.
+        s = collector._parse_engine_metrics(self._payload())
+
+        self.assertEqual(s.kv_total_blocks, 0)
+        self.assertEqual(s.kv_total_tokens, 0)
+        self.assertEqual(s.kv_cache_used_tokens, 0)
+        self.assertEqual(s.kv_prefix_hit_rate, -1.0)
+        self.assertEqual(s.itl_p50_ms, 0.0)
+
+    def test_tensorfold_usage_is_the_mean_of_its_streams(self):
+        # Each stream's fraction is of its OWN context window: two
+        # half-full streams are 50% occupancy, not a summed 100%.
+        s = collector._parse_engine_metrics(
+            'tensorfold:kv_cache_usage_perc{stream="0"} 0.5\n'
+            'tensorfold:kv_cache_usage_perc{stream="1"} 0.5\n'
+        )
+
+        self.assertAlmostEqual(s.kv_cache_pct, 50.0)
+
+    def test_tensorfold_out_of_range_usage_gauge_is_rejected_not_scaled(self):
+        # kv_cache_usage_perc is a 0-1 fraction; a mis-scaled or hostile
+        # sample must leave the no-reading sentinel, as on the other engines.
+        s = collector._parse_engine_metrics('tensorfold:kv_cache_usage_perc{stream="0"} 42\n')
+
+        self.assertEqual(s.kv_cache_pct, -1.0)
+
+    def test_tensorfold_majority_wins_detection(self):
+        mixed = (
+            "vllm:generation_tokens_total 5.0\n"
+            "tensorfold:generation_tokens_total 9.0\n"
+            "tensorfold:num_requests_running 2.0\n"
+        )
+        s = collector._parse_engine_metrics(mixed)
+
+        self.assertEqual(s.model_source, "tensorfold")
+        self.assertEqual(s.generation_tokens_total, 9.0)
+        self.assertEqual(s.requests_running, 2)
+
+    def test_tensorfold_namespace_is_detected_on_its_own(self):
+        self.assertEqual(collector.metrics_engine(self._payload()), "tensorfold")
+        # A stray foreign sample must not flip a TensorFold-majority payload.
+        self.assertEqual(
+            collector.metrics_engine(self._payload() + "vllm:prompt_tokens_total 1\n"),
+            "tensorfold",
+        )
+
+
 class EngineLoadTests(unittest.IsolatedAsyncioTestCase):
     """SGLang's load API is the only signal source when ``--enable-metrics``
     is off, so both its routes and every malformed-field path matter."""
