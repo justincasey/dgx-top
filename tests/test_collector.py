@@ -2284,3 +2284,113 @@ class ReviewHardeningTests(unittest.TestCase):
         # legacy-only payloads still read the legacy name
         s2 = collector._parse_engine_metrics("vllm:prompt_tokens  77.0\n")
         self.assertEqual(s2.prompt_tokens_total, 77.0)
+
+
+# ─── live endpoint switch (collector.set_unit_endpoint) ──────────────
+
+
+def _switch_config(tmp_path, engine_line: str = ""):
+    import config
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[[nodes]]\n"
+        'label = "head"\n'
+        'ssh_target = "head"\n'
+        'vllm_url = "http://192.0.2.10:8000"\n' + engine_line
+    )
+    config.configure(path)
+    return path
+
+
+def _isolate_rate_state(monkeypatch):
+    for name in ("_prev_tokens", "_prev_prompt_tokens", "_prev_prefix", "_model_names"):
+        monkeypatch.setattr(collector, name, {})
+    monkeypatch.setattr(collector, "_endpoint_epoch", {})
+
+    async def no_model(_client, _url):
+        return "NewModel"
+
+    monkeypatch.setattr(collector, "_fetch_model_name", no_model)
+
+
+def _hosted(gen_total: float, prompt_total: float = 0.0) -> SparkUnitStats:
+    s = SparkUnitStats(label="head")
+    s.model_hosted = True
+    s.generation_tokens_total = gen_total
+    s.prompt_tokens_total = prompt_total
+    s.prefix_queries_total = gen_total
+    s.prefix_hits_total = gen_total / 2
+    return s
+
+
+async def test_switch_never_turns_the_counter_jump_into_a_rate(tmp_path, monkeypatch):
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    totals = iter([1_000_000.0, 1_000_100.0, 5_000_000.0, 5_000_050.0])
+
+    async def fake_poll_unit(uid):
+        return _hosted(next(totals), prompt_total=2_000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+
+    await collector.poll_cluster()  # seeds the old engine's baseline
+    before = await collector.poll_cluster()
+    assert before.units[0].throughput_tok_s > 0
+
+    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
+    after = await collector.poll_cluster()  # new engine: +4M tokens vs old
+    assert after.units[0].throughput_tok_s == 0.0
+
+    later = await collector.poll_cluster()  # rated against the new engine only
+    assert 0 < later.units[0].throughput_tok_s
+
+
+async def test_poll_in_flight_across_a_switch_does_not_seed_the_new_baseline(tmp_path, monkeypatch):
+    import asyncio
+
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    release = asyncio.Event()
+    totals = iter([1_000_000.0, 1_000_100.0, 5_000_000.0])
+
+    async def fake_poll_unit(uid):
+        value = next(totals)
+        if value == 1_000_100.0:
+            await release.wait()  # this poll straddles the switch
+        return _hosted(value)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    await collector.poll_cluster()
+
+    in_flight = asyncio.create_task(collector.poll_cluster())
+    await asyncio.sleep(0)
+    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
+    release.set()
+    await in_flight
+
+    assert 1 not in collector._prev_tokens  # old counters never became the baseline
+    first_new = await collector.poll_cluster()
+    assert first_new.units[0].throughput_tok_s == 0.0
+
+
+async def test_switch_updates_settings_and_model_name_with_the_engine_rule(tmp_path, monkeypatch):
+    import config
+
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    collector._model_names[1] = "OldModel"
+
+    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001/", "sglang")
+
+    node = config.get_settings().nodes[0]
+    assert node.vllm_url == "http://192.0.2.10:8001"
+    assert config.SPARK_UNITS[1]["vllm_url"] == "http://192.0.2.10:8001"
+    # Undeclared engine stays detected from the endpoint's own metrics.
+    assert node.engine is None and config.SPARK_UNITS[1]["engine"] is None
+    assert collector._model_names[1] == "NewModel"
+
+    _switch_config(tmp_path, 'engine = "vllm"\n')
+    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
+    assert config.get_settings().nodes[0].engine == "sglang"
+    assert config.SPARK_UNITS[1]["engine"] == "sglang"

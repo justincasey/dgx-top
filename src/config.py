@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import stat
 import sysconfig
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
+
+import tomlkit
 
 from themes import DEFAULT_THEME, theme_names
 
@@ -183,7 +187,7 @@ def load_config(
     theme: str | None = None,
     simulate: int | None = None,
 ) -> Settings:
-    config_path = Path(path).expanduser() if path else default_config_path()
+    config_path = effective_config_path(path)
     raw: dict = {}
     if config_path.is_file():
         try:
@@ -218,7 +222,13 @@ def load_config(
     return Settings(nodes, *app_settings)
 
 
+def effective_config_path(path: str | Path | None = None) -> Path:
+    """The file ``load_config`` reads: an explicit path, else the default."""
+    return Path(path).expanduser() if path else default_config_path()
+
+
 _SETTINGS: Settings | None = None
+_CONFIG_PATH: Path | None = None
 SPARK_UNITS: dict[int, dict[str, object]] = {}
 HISTORY_LEN = 40
 SIMULATION_NODES: int | None = None
@@ -231,9 +241,11 @@ def configure(
     path: str | Path | None = None, theme: str | None = None, simulate: int | None = None
 ) -> Settings:
     """Load settings and update compatibility globals used by the collector."""
-    global _SETTINGS, HISTORY_LEN, SIMULATION_NODES
+    global _SETTINGS, _CONFIG_PATH, HISTORY_LEN, SIMULATION_NODES
     settings = load_config(path, theme=theme, simulate=simulate)
     _SETTINGS = settings
+    # Simulated nodes have no file behind them: nothing may be written back.
+    _CONFIG_PATH = None if simulate is not None else effective_config_path(path)
     HISTORY_LEN = settings.history_length
     SIMULATION_NODES = simulate
     SPARK_UNITS.clear()
@@ -256,6 +268,96 @@ def get_settings() -> Settings:
     if _SETTINGS is None:
         raise ConfigError("dgx-top has not loaded a configuration")
     return _SETTINGS
+
+
+def config_path() -> Path | None:
+    """The configuration file backing the loaded settings; None when the
+    settings are synthetic (``--simulate``) and nothing may be saved."""
+    return _CONFIG_PATH
+
+
+def set_node_endpoint(unit_id: int, url: str, engine: str | None) -> NodeConfig:
+    """Point a configured node (1-based ``unit_id``) at another engine URL.
+
+    Updates the loaded ``Settings`` and the collector's ``SPARK_UNITS`` view
+    together. ``engine`` replaces the node's engine only when the node
+    declares one; an undeclared engine stays detected from the endpoint's
+    own metrics, exactly as ``save_node_endpoint`` leaves the file."""
+    global _SETTINGS
+    settings = get_settings()
+    old = settings.nodes[unit_id - 1]
+    node = replace(
+        old,
+        vllm_url=url.rstrip("/"),
+        engine=engine if old.engine is not None else None,
+    )
+    nodes = settings.nodes[: unit_id - 1] + (node,) + settings.nodes[unit_id:]
+    _SETTINGS = replace(settings, nodes=nodes)
+    SPARK_UNITS[unit_id]["vllm_url"] = node.vllm_url
+    SPARK_UNITS[unit_id]["engine"] = node.engine
+    return node
+
+
+def save_node_endpoint(
+    path: str | Path, unit_id: int, label: str, url: str, engine: str | None
+) -> None:
+    """Write one node's new endpoint into the configuration file.
+
+    Edits the ``unit_id``-th (1-based) ``[[nodes]]`` entry in place with
+    tomlkit, so comments and every other key survive. ``engine`` is written
+    only when the entry already declares one; ``worker`` is never touched.
+    The entry's label must equal ``label`` — a file edited since it was
+    loaded is refused rather than written to the wrong node. The edited text
+    must load through ``load_config`` before it replaces the original, which
+    happens atomically (sibling temp file, ``os.replace``) with the
+    original permission bits. Every refusal raises ``ConfigError`` and leaves
+    the file byte-for-byte unchanged."""
+    target = Path(path).expanduser().resolve()
+    url = url.rstrip("/")
+    try:
+        original = target.read_text(encoding="utf-8")
+        mode = stat.S_IMODE(target.stat().st_mode)
+    except (OSError, UnicodeError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+        raise ConfigError(f"cannot read {target}: {reason}") from exc
+    try:
+        doc = tomlkit.parse(original)
+    except Exception as exc:
+        raise ConfigError(f"invalid TOML in {target}: {exc}") from exc
+    nodes = doc.get("nodes")
+    if not isinstance(nodes, list) or not 1 <= unit_id <= len(nodes):
+        raise ConfigError(f"{target} has no nodes[{unit_id}] entry")
+    entry = nodes[unit_id - 1]
+    if not isinstance(entry, dict) or str(entry.get("label", "")).strip() != label:
+        raise ConfigError(f"nodes[{unit_id}] in {target} is no longer {label!r}")
+    entry["vllm_url"] = url
+    if engine is not None and "engine" in entry:
+        entry["engine"] = engine
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    except OSError as exc:
+        raise ConfigError(f"cannot write {target.parent}: {exc.strerror or exc}") from exc
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tomlkit.dumps(doc))
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        # Re-validate what this edit can break. The theme rides as an
+        # override: a session started with --theme may run on a file whose
+        # own theme name is not valid, and that is no reason to refuse.
+        saved = load_config(tmp, theme=DEFAULT_THEME).nodes[unit_id - 1]
+        if saved.label != label or saved.vllm_url != url:
+            raise ConfigError(f"edited nodes[{unit_id}] did not read back as {label!r} at {url}")
+        os.replace(tmp, target)
+    except ConfigError:
+        tmp.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
+        raise ConfigError(f"cannot write {target}: {reason}") from exc
 
 
 NVIDIA_SMI_CMD = (

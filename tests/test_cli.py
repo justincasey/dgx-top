@@ -65,3 +65,48 @@ def test_check_with_simulate_is_rejected(capsys):
     """`check` verifies real SSH/HTTP endpoints and must refuse --simulate."""
     assert main(["--simulate", "5", "check"]) == 2
     assert "cannot run with" in capsys.readouterr().err
+
+
+def test_discover_json_reports_every_node_and_changes_nothing(tmp_path: Path, capsys):
+    import json
+
+    import config
+
+    path = tmp_path / "config.toml"
+    assert main(["--config", str(path), "init"]) == 0
+    before = path.read_bytes()
+    capsys.readouterr()
+    try:
+        assert main(["--config", str(path), "--simulate", "3", "discover", "--json"]) == 0
+    finally:
+        config.configure(path)
+
+    scans = json.loads(capsys.readouterr().out)
+    assert [scan["label"] for scan in scans] == ["spark-1", "spark-2", "spark-3"]
+    assert {ep["status"] for ep in scans[0]["endpoints"]} == {"monitored", "new"}
+    assert scans[2]["error"] and scans[2]["endpoints"] == []
+    assert path.read_bytes() == before
+
+
+def test_discover_table_passes_all_ports_to_the_sweep(tmp_path: Path, capsys, monkeypatch):
+    import discovery
+    from discovery import NodeScan
+
+    path = tmp_path / "config.toml"
+    assert main(["--config", str(path), "init"]) == 0
+    capsys.readouterr()
+    seen = []
+
+    async def fake_sweep(nodes, all_ports=False):
+        seen.append(all_ports)
+        for uid, node in enumerate(nodes, 1):
+            yield NodeScan(uid, node.label, node.worker, error="ssh: timed out")
+
+    monkeypatch.setattr(discovery, "sweep", fake_sweep)
+
+    assert main(["--config", str(path), "discover", "--all-ports"]) == 0
+
+    out = capsys.readouterr().out
+    assert seen == [True]
+    assert out.count("ssh-failed") == 2
+    assert out.rstrip().endswith("No nodes could be scanned.")

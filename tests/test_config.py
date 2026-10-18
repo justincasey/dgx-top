@@ -240,3 +240,131 @@ def test_configure_resets_simulate_flag_without_simulate(tmp_path: Path):
         assert cfg.SIMULATION_NODES is None
     finally:
         configure(_write(tmp_path), simulate=None)  # ensure clean
+
+
+# ─── save_node_endpoint (scan write-back) ────────────────────────────
+
+SCAN_CONFIG = """# dgx-top cluster
+[app]
+poll_interval = 5  # seconds
+
+# the head serves the model
+[[nodes]]
+label = "head"
+ssh_target = "spark@head"
+vllm_url = "http://head:8000"  # recipe port
+engine = "vllm"
+
+[[nodes]]
+label = "worker"
+ssh_target = "spark@worker"
+vllm_url = "http://worker:8000"
+worker = true
+"""
+
+
+def _scan_config(tmp_path: Path, mode: int = 0o600) -> Path:
+    path = tmp_path / "config.toml"
+    path.write_text(SCAN_CONFIG)
+    path.chmod(mode)
+    return path
+
+
+def test_save_edits_one_node_and_keeps_comments_and_other_keys(tmp_path: Path):
+    from config import save_node_endpoint
+
+    path = _scan_config(tmp_path)
+
+    save_node_endpoint(path, 1, "head", "http://head:8001", "sglang")
+    save_node_endpoint(path, 2, "worker", "http://worker:30000/", "sglang")
+
+    text = path.read_text()
+    for comment in ("# dgx-top cluster", "# seconds", "# the head serves the model"):
+        assert comment in text
+    assert 'vllm_url = "http://head:8001"  # recipe port' in text
+    settings = load_config(path)
+    head, worker = settings.nodes
+    assert (head.vllm_url, head.engine, head.worker) == ("http://head:8001", "sglang", False)
+    # No engine key is invented; worker is untouched.
+    assert (worker.vllm_url, worker.engine, worker.worker) == ("http://worker:30000", None, True)
+    assert "engine" not in text.split('label = "worker"')[1]
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640])
+def test_save_keeps_the_file_mode(tmp_path: Path, mode: int):
+    from config import save_node_endpoint
+
+    path = _scan_config(tmp_path, mode)
+
+    save_node_endpoint(path, 1, "head", "http://head:8001", "vllm")
+
+    assert path.stat().st_mode & 0o777 == mode
+
+
+def test_save_refuses_a_node_whose_label_changed_and_leaves_bytes(tmp_path: Path):
+    from config import save_node_endpoint
+
+    path = _scan_config(tmp_path)
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigError, match="no longer 'worker'"):
+        save_node_endpoint(path, 1, "worker", "http://head:8001", "vllm")
+
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["config.toml"]
+
+
+def test_save_never_replaces_the_file_with_an_invalid_result(tmp_path: Path):
+    from config import save_node_endpoint
+
+    path = _scan_config(tmp_path)
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigError, match="http"):
+        save_node_endpoint(path, 1, "head", "ftp://head:8001", "vllm")
+
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["config.toml"]
+
+
+def test_save_through_a_symlink_edits_the_target(tmp_path: Path):
+    from config import save_node_endpoint
+
+    target = _scan_config(tmp_path)
+    link = tmp_path / "link.toml"
+    link.symlink_to(target)
+
+    save_node_endpoint(link, 1, "head", "http://head:8001", "vllm")
+
+    assert link.is_symlink()
+    assert load_config(target).nodes[0].vllm_url == "http://head:8001"
+
+
+def test_save_failure_to_write_is_a_config_error(tmp_path: Path):
+    from config import save_node_endpoint
+
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    path = _scan_config(directory)
+    before = path.read_bytes()
+    directory.chmod(0o555)
+    try:
+        with pytest.raises(ConfigError, match="cannot write"):
+            save_node_endpoint(path, 1, "head", "http://head:8001", "vllm")
+    finally:
+        directory.chmod(0o755)
+    assert path.read_bytes() == before
+
+
+def test_packaging_ships_every_src_module_and_tomlkit():
+    """setuptools' ``py-modules`` is a hand-written allowlist: a module left
+    out builds green and crashes non-editable installs at import."""
+    from config import tomllib
+
+    root = Path(__file__).resolve().parent.parent
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+    shipped = set(project["tool"]["setuptools"]["py-modules"])
+    modules = {p.stem for p in (root / "src").glob("*.py")}
+
+    assert modules <= shipped, f"unshipped modules: {sorted(modules - shipped)}"
+    assert any(dep.startswith("tomlkit") for dep in project["project"]["dependencies"])

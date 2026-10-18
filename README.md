@@ -302,6 +302,66 @@ never disappears at any size. With several models served at once, the wide
 SERVING pane becomes a single multi-model view: a gen/requests/ttft row per
 model and one shared time axis in the line chart, one hue per model.
 
+## Finding inference endpoints
+
+Recipes don't always start the engine on the port your config names. `dgx-top`
+can sweep the configured nodes once and list every vLLM, SGLang or TensorFold
+endpoint it finds.
+
+**In the dashboard**, press `s`. The scan window fills in node by node while the
+dashboard keeps polling behind it:
+
+```text
+ SCAN · 4 nodes · 3.1s
+ spark-1
+   ● http://spark01:8000  [vllm]  Qwen3.6-27B  monitored
+   ○ http://spark01:8001  [sglang]  Gemma-4-26B
+ spark-2
+   ○ http://spark02:30000  [sglang]  DeepSeek-V4-Flash
+ spark-3  ssh failed: ssh: connect to host spark03 port 22: Connection timed out
+ spark-4  no inference found (worker)
+ ↑↓ select · enter monitor · esc close
+```
+
+Pick an endpoint with `enter` and confirm with `y`. The node's tile switches to
+it immediately and the node's `vllm_url` is saved to the configuration file
+(`engine` too, if the node declares one; comments and other keys are kept,
+and the file keeps its permissions). If the file cannot be written, the switch
+still applies for this session and the notification says why
+(`applied; config not saved: …`). `n` goes back to the list, `esc` closes the
+window and stops anything still scanning. When nothing is found, the window
+says `No inference endpoints found on N nodes.`; a node whose SSH failed is
+listed on its own row and not counted.
+
+**From the shell**, the same sweep is read-only:
+
+```bash
+uv run dgx-top discover            # table
+uv run dgx-top discover --json     # for scripts
+uv run dgx-top discover --all-ports
+```
+
+How the sweep works:
+
+- One SSH call per node lists its listening TCP ports (`ss -Htln`, or
+  `/proc/net/tcp` and `/proc/net/tcp6` where `ss` is missing) and reads the
+  kernel's ephemeral port range. No root, no `-p`, nothing installed.
+- Port 22 and the ephemeral range (where Ray and NCCL park their listeners)
+  are skipped; `--all-ports` probes the ephemeral range too.
+- Each remaining port is probed **from this machine**, as the dashboard polls:
+  `/metrics` identifies the engine; a server without metrics is recognised by
+  SGLang's load API; `/v1/models` names the model. Anything else is ignored.
+- A wildcard listener is probed at the host in the node's `vllm_url` (or, if
+  that URL is `localhost`, the host `ssh -G` resolves for the node's
+  `ssh_target`). A port bound to `127.0.0.1` is reported as **local-only**: it
+  cannot be reached from here, so it is not probed.
+- The sweep runs once per `s` press or `discover` run; nothing scans in the
+  background. Under `--simulate`, the scan shows made-up endpoints and a
+  switch is never saved.
+
+Each tile still monitors one endpoint per node; when a node serves several,
+the scan lists them all and you choose which one the tile follows.
+
 ## Synthetic data
 
 Run a whole cluster offline with no SSH or engine access:
@@ -322,6 +382,7 @@ still applies.
 | `+` | Poll faster         |
 | `-` | Poll slower         |
 | `r` | Refresh immediately |
+| `s` | Scan the nodes for inference endpoints (see [Finding inference endpoints](#finding-inference-endpoints)) |
 | `t` | Open the fuzzy theme picker (see [Themes](#switching-themes-while-running)) |
 | `q` | Quit                |
 
@@ -355,7 +416,7 @@ curl --fail http://YOUR_ENGINE_HOST:8000/metrics
 
 SGLang only serves `/metrics` when it was started with `--enable-metrics`. Without it, `dgx-top` falls back to SGLang's load API (`/v1/loads`, then `/get_load`), which fills the request queues and a used-token count but no token throughput—those rows read `no tok/s · sglang`. Only the newer `/v1/loads` carries capacity and the KV percentage; on the deprecated `/get_load` those read an em dash. Its used count is exact on SGLang v0.5.11 and newer (the deprecation shim nets queued tokens out); on older releases, which omit that field, it is the in-flight total (used plus queued). The prefix-cache hit rate and TTFT/ITL come from `/metrics` alone, so they read `—` on either load route however new it is; add `--enable-metrics` to the server's launch flags to get them.
 
-Check the engine bind address, firewall rules, and `vllm_url` (the key keeps its original name for compatibility; it is the engine's base URL).
+Check the engine bind address, firewall rules, and `vllm_url` (the key keeps its original name for compatibility; it is the engine's base URL). If the engine may have started on a different port, `dgx-top discover` (or `s` in the dashboard) lists the ports each node is actually serving.
 
 ### A node appears offline
 

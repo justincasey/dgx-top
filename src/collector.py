@@ -43,22 +43,31 @@ def _short_model_name(raw: str) -> str:
     return s.split("/")[-1]
 
 
+async def _fetch_model_name(client: httpx.AsyncClient, engine_url: str) -> str:
+    """Short name of the first model ``/v1/models`` serves, or ``""``.
+
+    Total over remote input: a dead port, a non-JSON body or an empty model
+    list all read as no name (the renderer paints a dash), never a raise."""
+    try:
+        resp = await client.get(f"{engine_url}/v1/models")
+        resp.raise_for_status()
+        models = resp.json().get("data", [])
+        if models:
+            return _short_model_name(models[0].get("id") or models[0].get("model", ""))
+    except Exception:
+        pass  # model name is optional
+    return ""
+
+
 async def _init_model_names() -> None:
     """Fetch model names from all Spark units once at startup."""
     if config.SIMULATION_NODES:
         return
 
     async def fetch_one(client: httpx.AsyncClient, uid: int, vllm_url: str) -> None:
-        try:
-            resp = await client.get(f"{vllm_url}/v1/models")
-            resp.raise_for_status()
-            models = resp.json().get("data", [])
-            if models:
-                _model_names[uid] = _short_model_name(
-                    models[0].get("id") or models[0].get("model", "")
-                )
-        except Exception:
-            pass  # model name is optional
+        name = await _fetch_model_name(client, vllm_url)
+        if name:
+            _model_names[uid] = name
 
     async with httpx.AsyncClient(timeout=10) as client:
         await asyncio.gather(
@@ -1007,7 +1016,7 @@ def _load_from_get_load(data: object) -> EngineLoad | None:
     )
 
 
-async def fetch_engine_load(engine_url: str) -> EngineLoad | None:
+async def fetch_engine_load(engine_url: str, timeout: float = 5) -> EngineLoad | None:
     """Fetch serving load from an SGLang server's load API.
 
     ``/v1/loads`` first (the supported route), then ``/get_load`` (deprecated,
@@ -1017,7 +1026,7 @@ async def fetch_engine_load(engine_url: str) -> EngineLoad | None:
     """
     for path, parse in (("/v1/loads", _load_from_v1), ("/get_load", _load_from_get_load)):
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.get(f"{engine_url}{path}")
                 resp.raise_for_status()
                 data = resp.json()
@@ -1746,16 +1755,50 @@ def _update_thrash_rates(host: str, data: dict, now: float) -> dict:
     return result
 
 
+_endpoint_epoch: dict[int, int] = {}
+"""Per-unit endpoint generation, bumped by ``set_unit_endpoint``. A poll that
+started before a switch carries the old engine's counters; ``poll_cluster``
+compares generations so such a result never seeds the new rate baseline."""
+
+
+async def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> None:
+    """Point one unit at a different engine endpoint while the app runs.
+
+    The settings change is ``config.set_node_endpoint``'s; this side drops
+    every counter baseline the unit holds (generation, prompt and prefix-cache
+    totals of the old engine would turn the first delta against the new one
+    into a fabricated rate) and replaces the startup-cached model name."""
+    config.set_node_endpoint(unit_id, url, engine)
+    _prev_tokens.pop(unit_id, None)
+    _prev_prompt_tokens.pop(unit_id, None)
+    _prev_prefix.pop(unit_id, None)
+    _model_names.pop(unit_id, None)
+    epoch = _endpoint_epoch.get(unit_id, 0) + 1
+    _endpoint_epoch[unit_id] = epoch
+    if config.SIMULATION_NODES:
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        name = await _fetch_model_name(client, str(SPARK_UNITS[unit_id]["vllm_url"]))
+    # A second switch while this fetch was in flight owns the name now.
+    if name and _endpoint_epoch.get(unit_id) == epoch:
+        _model_names[unit_id] = name
+
+
 async def poll_cluster() -> ClusterStats:
     """Poll N Spark units in parallel."""
     if config.SIMULATION_NODES:
         return simulate_cluster(config.SIMULATION_NODES)
     unit_ids = sorted(SPARK_UNITS.keys())
+    epochs = {uid: _endpoint_epoch.get(uid, 0) for uid in unit_ids}
     tasks = [poll_unit(uid) for uid in unit_ids]
     results = await asyncio.gather(*tasks)
 
     now = time.monotonic()
     for unit_id, s in zip(unit_ids, results):
+        if _endpoint_epoch.get(unit_id, 0) != epochs[unit_id]:
+            # Polled the endpoint this unit no longer monitors: its counters
+            # must not become the new endpoint's baseline.
+            continue
         _update_throughput(unit_id, s, now)
         _update_prompt_throughput(unit_id, s, now)
         _update_prefix_hit_rate(unit_id, s)
