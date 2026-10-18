@@ -6,7 +6,7 @@ import contextlib
 import re
 from pathlib import Path
 
-from config import configure
+from config import configure, load_config
 from stats import ClusterStats, SparkUnitStats, TopologyInfo
 
 # ─── fixtures ────────────────────────────────────────────────────────
@@ -2292,3 +2292,187 @@ def test_spark_duo_boundary_inputs():
         rows = _spark_duo_lines(list(data), "#8A7CFF", w, pal)
         assert len(rows) == 2, (data, w)
         assert all(t.cell_len == w for t in rows), (data, w)
+
+
+# ─── endpoint scan modal (s) ─────────────────────────────────────────
+
+
+def _scan_stub(monkeypatch, scans):
+    """Replace the sweep with canned results (no SSH/HTTP) and the model-name
+    refetch with a constant. Returns the per-press sweep call counter."""
+    import collector
+    import discovery
+
+    calls = []
+
+    async def fake_sweep(nodes, all_ports=False):
+        calls.append(len(nodes))
+        for scan in scans:
+            yield scan
+
+    async def fake_model(_client, _url):
+        return "Gemma-4-26B"
+
+    monkeypatch.setattr(discovery, "sweep", fake_sweep)
+    monkeypatch.setattr(collector, "_fetch_model_name", fake_model)
+    return calls
+
+
+def _two_endpoint_scans():
+    from discovery import Endpoint, NodeScan
+
+    head = NodeScan(1, "head", False)
+    head.endpoints = [
+        Endpoint("http://192.0.2.10:8000", 8000, "vllm", "Qwen3.6-27B", "monitored"),
+        Endpoint("http://192.0.2.10:8001", 8001, "sglang", "Gemma-4-26B", "new"),
+        Endpoint("http://192.0.2.10:30000", 30000, "sglang", "", "new"),
+    ]
+    worker = NodeScan(2, "worker", True, error="ssh: connect to host worker: timed out")
+    return [head, worker]
+
+
+def _scan_text(app):
+    from textual.widgets import OptionList, Static
+
+    screen = app.screen
+    rows = [
+        (str(option.prompt), option.disabled, option.id)
+        for option in screen.query_one("#scan-list", OptionList).options
+    ]
+    hint = str(screen.query_one("#scan-hint", Static).content)
+    return rows, hint
+
+
+async def test_scan_pick_and_confirm_switches_the_tile_and_saves(tmp_path: Path, monkeypatch):
+    import app as app_module
+    import config
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    configure(path)
+    _stub(monkeypatch)
+    calls = _scan_stub(monkeypatch, _two_endpoint_scans())
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        await pilot.press("s")  # never stacks a second scan
+        await pilot.pause()
+        assert isinstance(app.screen, app_module.ScanScreen)
+        assert calls == [2]
+
+        rows, hint = _scan_text(app)
+        by_id = {oid: (text, disabled) for text, disabled, oid in rows if oid}
+        # Every endpoint of the node is listed; only the new ones are pickable.
+        assert set(by_id) == {"1:8000", "1:8001", "1:30000"}
+        assert by_id["1:8000"][1] is True and "monitored" in by_id["1:8000"][0]
+        assert by_id["1:8001"][1] is False and by_id["1:30000"][1] is False
+        assert "—" in by_id["1:30000"][0]  # unknown model is a dash
+        assert any("worker" in text and "ssh failed" in text for text, _, _ in rows)
+
+        await pilot.press("enter")  # first pickable endpoint is highlighted
+        await pilot.pause()
+        _, hint = _scan_text(app)
+        assert "Monitor head at http://192.0.2.10:8001" in hint and "[y/n]" in hint
+
+        await pilot.press("n")
+        await pilot.pause()
+        _, hint = _scan_text(app)
+        assert "Monitor" not in hint
+
+        await pilot.press("enter")
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert not isinstance(app.screen, app_module.ScanScreen)
+        assert config.SPARK_UNITS[1]["vllm_url"] == "http://192.0.2.10:8001"
+        assert app.settings.nodes[0].vllm_url == "http://192.0.2.10:8001"
+        assert load_config(path).nodes[0].vllm_url == "http://192.0.2.10:8001"
+        assert load_config(path).nodes[1].vllm_url == "http://192.0.2.11:8000"
+        messages = [n.message for n in app._notifications]
+        assert any("saved to" in m for m in messages)
+
+
+async def test_scan_with_nothing_found_says_so_and_lists_ssh_failures(tmp_path: Path, monkeypatch):
+    import app as app_module
+    from discovery import NodeScan
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    configure(path)
+    _stub(monkeypatch)
+    _scan_stub(
+        monkeypatch,
+        [NodeScan(1, "head", False), NodeScan(2, "worker", True, error="ssh: timed out")],
+    )
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        await pilot.pause()
+
+        rows, hint = _scan_text(app)
+        # One node was scanned; the SSH failure is its own row, not "nothing".
+        assert "No inference endpoints found on 1 node." in hint
+        assert any("head" in text and "no inference found" in text for text, _, _ in rows)
+        assert any("worker" in text and "ssh failed: ssh: timed out" in text for text, _, _ in rows)
+        assert not [oid for _, _, oid in rows if oid]
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, app_module.ScanScreen)
+
+
+async def test_scan_save_failure_keeps_the_switch_and_says_why(tmp_path: Path, monkeypatch):
+    import app as app_module
+    import config
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    configure(path)
+    # The file changed after it was loaded: node 1 is no longer "head".
+    path.write_text(path.read_text().replace('label = "head"', 'label = "renamed"'))
+    before = path.read_bytes()
+    _stub(monkeypatch)
+    _scan_stub(monkeypatch, _two_endpoint_scans())
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert config.SPARK_UNITS[1]["vllm_url"] == "http://192.0.2.10:8001"
+        assert path.read_bytes() == before
+        messages = [n.message for n in app._notifications]
+        assert any("applied; config not saved:" in m for m in messages)
+
+
+async def test_simulated_scan_switch_is_not_saved(tmp_path: Path, monkeypatch):
+    import app as app_module
+    import config
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    before = path.read_bytes()
+    configure(path, simulate=2)
+    try:
+        app = app_module.DGXTop()
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.press("s")
+            for _ in range(10):  # the simulated sweep staggers its nodes
+                await pilot.pause(0.1)
+            await pilot.press("enter")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert config.SPARK_UNITS[1]["vllm_url"] == "http://sim-1:8001"
+            messages = [n.message for n in app._notifications]
+            assert any("applied; simulation: not saved" in m for m in messages)
+        assert path.read_bytes() == before
+    finally:
+        configure(path)

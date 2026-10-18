@@ -38,6 +38,15 @@ def _parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--force", action="store_true", help="replace an existing file")
     subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and engine access")
     subparsers.add_parser("themes", help="list available color themes")
+    discover_parser = subparsers.add_parser(
+        "discover", help="list inference endpoints listening on the configured nodes (read-only)"
+    )
+    discover_parser.add_argument("--json", action="store_true", help="print JSON instead")
+    discover_parser.add_argument(
+        "--all-ports",
+        action="store_true",
+        help="also probe ports in the nodes' ephemeral range",
+    )
     return parser
 
 
@@ -72,6 +81,22 @@ def _list_themes() -> int:
     return 0
 
 
+async def _collect_scans(nodes, all_ports: bool) -> list:
+    from discovery import sweep
+
+    return [scan async for scan in sweep(nodes, all_ports=all_ports)]
+
+
+def _discover(json_output: bool, all_ports: bool) -> int:
+    """One read-only sweep: print what listens where, change nothing."""
+    from config import get_settings
+    from discovery import format_table, to_json
+
+    scans = asyncio.run(_collect_scans(get_settings().nodes, all_ports))
+    print(to_json(scans) if json_output else format_table(scans))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "init":
@@ -92,6 +117,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
+
+    if args.command == "discover":
+        return _discover(args.json, args.all_ports)
 
     from app import run
 

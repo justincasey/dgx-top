@@ -4,6 +4,7 @@ import collections
 import logging
 import math
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -12,10 +13,13 @@ from textual.app import App, Binding
 from textual.containers import Vertical
 from textual.drivers.linux_driver import LinuxDriver
 from textual.reactive import reactive
-from textual.widgets import Static
+from textual.screen import ModalScreen
+from textual.widgets import OptionList, Static
+from textual.widgets.option_list import Option
 
-from collector import _init_model_names, poll_cluster
-from config import default_config_path, get_settings
+import discovery
+from collector import _init_model_names, poll_cluster, set_unit_endpoint
+from config import ConfigError, config_path, default_config_path, get_settings, save_node_endpoint
 from input_driver import ResilientLinuxDriver
 from stats import ClusterStats, SparkUnitStats
 from themes import CUSTOM_THEMES, SERIES_HUES, Palette, blend_toward, build_palette, series_hue
@@ -1985,6 +1989,180 @@ def _tier_for(
     return "floor"
 
 
+class ScanScreen(ModalScreen[None]):
+    """One-shot sweep of the configured nodes for inference endpoints (``s``).
+
+    The sweep runs once in a worker owned by this screen — closing the
+    window cancels whatever is still scanning; nothing re-scans on a timer.
+    Each node's rows appear as that node finishes while the dashboard keeps
+    polling underneath. A ``new`` endpoint can be picked (``enter``) and
+    confirmed (``y``) to become the node's monitored endpoint."""
+
+    DEFAULT_CSS = """
+    ScanScreen { align: center middle; }
+    #scan-box {
+        width: 100; max-width: 95%; height: auto; max-height: 90%;
+        border: round $accent; background: $surface; padding: 0 1;
+    }
+    #scan-title { height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #scan-list { height: auto; max-height: 24; border: none; background: $surface; }
+    #scan-hint { height: auto; }
+    """
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("y", "confirm", "Yes", show=False),
+        Binding("n", "decline", "No", show=False),
+    ]
+
+    def __init__(self, nodes) -> None:
+        super().__init__()
+        # Not ``_nodes``: that is Textual's child NodeList on every DOM node.
+        self._scan_nodes = tuple(nodes)
+        self._scans: dict[int, discovery.NodeScan] = {}
+        self._choices: dict[str, tuple[int, discovery.Endpoint]] = {}
+        self._pending: tuple[int, discovery.Endpoint] | None = None
+        self._applying = False
+        self._done = False
+        self._started = time.monotonic()
+        self._elapsed = 0.0
+
+    def compose(self):
+        with Vertical(id="scan-box"):
+            yield Static(id="scan-title")
+            yield OptionList(id="scan-list")
+            yield Static(id="scan-hint")
+
+    def on_mount(self) -> None:
+        self._render_rows()
+        self.query_one("#scan-list", OptionList).focus()
+        self.run_worker(self._sweep(), group="scan", exclusive=True)
+
+    async def _sweep(self) -> None:
+        async for scan in discovery.sweep(self._scan_nodes):
+            self._scans[scan.uid] = scan
+            self._render_rows()
+        self._done = True
+        self._elapsed = time.monotonic() - self._started
+        self._render_rows()
+
+    def _endpoint_row(self, pal: Palette, ep: discovery.Endpoint) -> Text:
+        monitored = ep.status == "monitored"
+        row = Text("  ● " if monitored else "  ○ ", style=pal.ok if monitored else pal.cyan)
+        # URL, engine and model inherit the option's colour: the highlight bar
+        # is drawn in the theme's accent, so an accent-coloured span on it
+        # would vanish exactly on the row being picked.
+        row.append(ep.url)
+        row.append(f"  [{ep.engine}]")
+        row.append(f"  {ep.model or '—'}")
+        if monitored:
+            row.append("  monitored", style=pal.dim)
+        return row
+
+    def _render_rows(self) -> None:
+        pal = _palette_for(self.app)
+        option_list = self.query_one("#scan-list", OptionList)
+        held = option_list.highlighted_option
+        keep = held.id if held is not None else None
+        options: list[Option] = []
+        self._choices.clear()
+        for uid, node in enumerate(self._scan_nodes, 1):
+            scan = self._scans.get(uid)
+            head = Text(node.label, style=f"bold {pal.fg}")
+            if scan is None:
+                head.append("  scanning…", style=pal.dim)
+            elif scan.error is not None:
+                head.append(f"  ssh failed: {scan.error}", style=pal.warn)
+            elif not scan.endpoints and not scan.local_only:
+                head.append("  no inference found", style=pal.dim)
+                if scan.worker:
+                    head.append(" (worker)", style=pal.dim)
+            options.append(Option(head, disabled=True))
+            if scan is None or scan.error is not None:
+                continue
+            for ep in scan.endpoints:
+                option_id = f"{uid}:{ep.port}"
+                monitored = ep.status == "monitored"
+                options.append(
+                    Option(self._endpoint_row(pal, ep), id=option_id, disabled=monitored)
+                )
+                if not monitored:
+                    self._choices[option_id] = (uid, ep)
+            if scan.local_only:
+                ports = " ".join(f":{port}" for port in scan.local_only)
+                options.append(
+                    Option(
+                        Text(f"  local-only (not reachable from here) {ports}", style=pal.dim),
+                        disabled=True,
+                    )
+                )
+        option_list.set_options(options)
+        target = keep if keep in self._choices else next(iter(self._choices), None)
+        if target is not None:
+            option_list.highlighted = option_list.get_option_index(target)
+
+        n = len(self._scan_nodes)
+        title = Text("SCAN", style=f"bold {pal.accent}")
+        if self._done:
+            title.append(
+                f" · {n} node{'s' if n != 1 else ''} · {self._elapsed:.1f}s", style=pal.dim
+            )
+        else:
+            title.append(f" · {len(self._scans)}/{n} nodes · scanning…", style=pal.dim)
+        self.query_one("#scan-title", Static).update(title)
+        self._render_hint()
+
+    def _render_hint(self) -> None:
+        pal = _palette_for(self.app)
+        hint = Text()
+        if self._pending is not None:
+            uid, ep = self._pending
+            label = self._scan_nodes[uid - 1].label
+            path = config_path()
+            saving = f"Saves to {path}" if path is not None else "Simulation: not saved"
+            hint.append(
+                f"Monitor {label} at {ep.url} ({ep.engine} · {ep.model or '—'})? ",
+                style=f"bold {pal.fg}",
+            )
+            hint.append(f"{saving}  ", style=pal.dim)
+            hint.append("[y/n]", style=f"bold {pal.cyan}")
+        else:
+            empty = discovery.nothing_found_message(list(self._scans.values()))
+            if self._done and empty is not None:
+                hint.append(empty, style=pal.fg)
+                hint.append("  · esc close", style=pal.dim)
+            elif self._choices:
+                hint.append("↑↓ select · enter monitor · esc close", style=pal.dim)
+            elif self._done:
+                hint.append("Every endpoint found is already monitored · esc close", style=pal.dim)
+            else:
+                hint.append("esc close", style=pal.dim)
+        self.query_one("#scan-hint", Static).update(hint)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        choice = self._choices.get(event.option.id or "")
+        if choice is not None and not self._applying:
+            self._pending = choice
+            self._render_hint()
+
+    def action_confirm(self) -> None:
+        if self._pending is None or self._applying:
+            return
+        self._applying = True
+        uid, endpoint = self._pending
+        # The app owns the switch: it must finish even though this screen
+        # (and every worker it owns) goes away right now.
+        self.app.run_worker(self.app.apply_endpoint(uid, endpoint), group="scan-apply")
+        self.dismiss()
+
+    def action_decline(self) -> None:
+        if self._pending is not None and not self._applying:
+            self._pending = None
+            self._render_hint()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
 class DGXTop(App):
     """DGX Spark Cluster Inference Monitor — tiling desktop."""
 
@@ -1994,6 +2172,9 @@ class DGXTop(App):
         background: $background;
         overflow-y: hidden;
     }
+    /* `Screen` above also matches the scan modal; keep the dashboard
+       visible (dimmed) behind it while it keeps polling. */
+    ScanScreen { background: $background 60%; }
 
     #waybar { height: 1; padding: 0; text-wrap: nowrap; text-overflow: clip; }
 
@@ -2033,6 +2214,7 @@ class DGXTop(App):
         Binding("t", "change_theme", "Theme"),
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("s", "scan", "Scan"),
     ]
 
     cluster: reactive[ClusterStats | None] = reactive(None)
@@ -2045,6 +2227,7 @@ class DGXTop(App):
         self.theme = self.settings.theme
         self.poll_speeds = sorted({1, 2, 5, 10, self.settings.poll_interval})
         self._polling = False
+        self._repoll = False
         self._poll_speed_idx = self.poll_speeds.index(self.settings.poll_interval)
         self._poll_timer = None
         self.history: dict[str, collections.deque] = {}
@@ -2214,6 +2397,17 @@ class DGXTop(App):
         finally:
             self._polling = False
         self._update_ui()
+        if self._repoll:
+            self._repoll = False
+            self.run_worker(self._poll())
+
+    def _request_poll(self) -> None:
+        """Poll now; if a poll is in flight, poll again the moment it lands
+        (``_poll`` drops overlapping calls, which would lose this request)."""
+        if self._polling:
+            self._repoll = True
+        else:
+            self.run_worker(self._poll())
 
     def _update_ui(self):
         stats = self.cluster
@@ -2423,6 +2617,34 @@ class DGXTop(App):
 
     def action_refresh(self):
         self.run_worker(self._poll())
+
+    def action_scan(self):
+        """Open the one-shot endpoint scan (never stacks a second one)."""
+        if not isinstance(self.screen, ScanScreen):
+            self.push_screen(ScanScreen(self.settings.nodes))
+
+    async def apply_endpoint(self, unit_id: int, endpoint: discovery.Endpoint) -> None:
+        """Monitor ``endpoint`` on node ``unit_id`` (1-based) from now on and
+        save it to the configuration file. The switch stands even when the
+        save fails; the notification says which of the two happened."""
+        label = self.settings.nodes[unit_id - 1].label
+        await set_unit_endpoint(unit_id, endpoint.url, endpoint.engine)
+        self.settings = get_settings()
+        path = config_path()
+        severity = "information"
+        if path is None:
+            message = f"{label} → {endpoint.url} applied; simulation: not saved"
+        else:
+            try:
+                save_node_endpoint(path, unit_id, label, endpoint.url, endpoint.engine)
+            except ConfigError as exc:
+                message = f"{label} → {endpoint.url} applied; config not saved: {exc}"
+                severity = "warning"
+            else:
+                message = f"{label} → {endpoint.url} saved to {path}"
+        log.info("scan: %s", message)
+        self.notify(message, severity=severity)
+        self._request_poll()
 
 
 def run(config_path: str | Path | None = None) -> None:
