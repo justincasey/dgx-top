@@ -186,6 +186,17 @@ def test_unknown_ephemeral_range_filters_nothing_but_ssh():
     assert 41234 in kept and 22 not in kept
 
 
+def test_ephemeral_range_is_read_past_unparseable_lines():
+    """A junk line before the range (kernel noise, a wrapper banner) must not
+    hide a valid range that follows it."""
+    listeners, port_range = parse_listen_output(
+        SS_OUTPUT.replace("32768\t60999", "cannot read range\n32768 60999")
+    )
+
+    assert port_range == (32768, 60999)
+    assert 41234 not in {lst.port for lst in candidates(listeners, port_range)}
+
+
 # ─── AC4: classification ─────────────────────────────────────────────
 
 

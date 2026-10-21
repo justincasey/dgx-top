@@ -341,13 +341,19 @@ uv run dgx-top discover --json     # for scripts
 uv run dgx-top discover --all-ports
 ```
 
+`discover` is read-only. It exits 0 whenever the sweep ran — finding no
+endpoint is still a clean sweep — and exits 1 only when no node could be
+listed at all (every SSH failed), so a script can tell an empty result from a
+broken one. The table and JSON still print in that case.
+
 How the sweep works:
 
 - One SSH call per node lists its listening TCP ports (`ss -Htln`, or
   `/proc/net/tcp` and `/proc/net/tcp6` where `ss` is missing) and reads the
   kernel's ephemeral port range. No root, no `-p`, nothing installed.
 - Port 22 and the ephemeral range (where Ray and NCCL park their listeners)
-  are skipped; `--all-ports` probes the ephemeral range too.
+  are skipped. `--all-ports` probes the ephemeral range too; that flag is
+  CLI-only, the `s` scan always skips it.
 - Each remaining port is probed **from this machine**, as the dashboard polls:
   `/metrics` identifies the engine; a server without metrics is recognised by
   SGLang's load API; `/v1/models` names the model. Anything else is ignored.
@@ -360,7 +366,11 @@ How the sweep works:
   switch is never saved.
 
 Each tile still monitors one endpoint per node; when a node serves several,
-the scan lists them all and you choose which one the tile follows.
+the scan lists them all and you choose which one the tile follows. The
+`monitored` tag is a literal host-and-port match against the node's
+`vllm_url`: a node whose config names a different host than the address the
+engine binds (an IP where the config says a hostname, say) lists its own live
+endpoint as `new`; confirming it simply writes the equivalent URL.
 
 ## Synthetic data
 
