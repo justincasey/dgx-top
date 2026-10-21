@@ -167,7 +167,6 @@ def _parse_range(lines: list[str]) -> Optional[tuple[int, int]]:
             low, high = int(parts[0]), int(parts[1])
             if 0 < low <= high < 65536:
                 return low, high
-        return None
     return None
 
 

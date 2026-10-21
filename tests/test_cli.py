@@ -104,9 +104,31 @@ def test_discover_table_passes_all_ports_to_the_sweep(tmp_path: Path, capsys, mo
 
     monkeypatch.setattr(discovery, "sweep", fake_sweep)
 
-    assert main(["--config", str(path), "discover", "--all-ports"]) == 0
+    # Every node failed SSH: no sweep happened, so the command fails.
+    assert main(["--config", str(path), "discover", "--all-ports"]) == 1
 
     out = capsys.readouterr().out
     assert seen == [True]
     assert out.count("ssh-failed") == 2
     assert out.rstrip().endswith("No nodes could be scanned.")
+
+
+def test_discover_succeeds_when_at_least_one_node_was_listed(tmp_path, capsys, monkeypatch):
+    """A clean sweep with no endpoint — or one SSH failure among successes —
+    is exit 0; only a sweep where no node could be listed fails."""
+    import discovery
+    from discovery import NodeScan
+
+    path = tmp_path / "config.toml"
+    assert main(["--config", str(path), "init"]) == 0
+    capsys.readouterr()
+
+    async def fake_sweep(nodes, all_ports=False):
+        yield NodeScan(1, nodes[0].label, nodes[0].worker)
+        yield NodeScan(2, nodes[1].label, nodes[1].worker, error="ssh: timed out")
+
+    monkeypatch.setattr(discovery, "sweep", fake_sweep)
+
+    assert main(["--config", str(path), "discover"]) == 0
+    out = capsys.readouterr().out
+    assert "No inference endpoints found on 1 node." in out

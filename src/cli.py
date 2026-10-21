@@ -39,7 +39,9 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and engine access")
     subparsers.add_parser("themes", help="list available color themes")
     discover_parser = subparsers.add_parser(
-        "discover", help="list inference endpoints listening on the configured nodes (read-only)"
+        "discover",
+        help="list inference endpoints listening on the configured nodes "
+        "(read-only; exits 1 when no node could be scanned)",
     )
     discover_parser.add_argument("--json", action="store_true", help="print JSON instead")
     discover_parser.add_argument(
@@ -88,13 +90,17 @@ async def _collect_scans(nodes, all_ports: bool) -> list:
 
 
 def _discover(json_output: bool, all_ports: bool) -> int:
-    """One read-only sweep: print what listens where, change nothing."""
+    """One read-only sweep: print what listens where, change nothing.
+
+    Exit 0 means the sweep ran — finding no endpoint is still a clean sweep.
+    Exit 1 means no node could be listed at all (every SSH failed), so a
+    script can tell a broken sweep from an empty one."""
     from config import get_settings
     from discovery import format_table, to_json
 
     scans = asyncio.run(_collect_scans(get_settings().nodes, all_ports))
     print(to_json(scans) if json_output else format_table(scans))
-    return 0
+    return 0 if any(scan.error is None for scan in scans) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
