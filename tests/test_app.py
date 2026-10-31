@@ -2476,3 +2476,150 @@ async def test_simulated_scan_switch_is_not_saved(tmp_path: Path, monkeypatch):
         assert path.read_bytes() == before
     finally:
         configure(path)
+
+
+async def test_last_apply_owns_the_live_endpoint_the_settings_and_the_file(
+    tmp_path: Path, monkeypatch
+):
+    """AC1: a second apply on the same node lands while the first one's
+    model-name fetch is still waiting. Live unit, ``app.settings`` and the
+    config file all end on the second endpoint, and the first one's late
+    name is not kept."""
+    import asyncio
+
+    import app as app_module
+    import collector
+    import config
+    from discovery import Endpoint
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    configure(path)
+    _stub(monkeypatch)
+    monkeypatch.setattr(collector, "_model_names", {})
+    monkeypatch.setattr(collector, "_endpoint_epoch", {})
+    first_answers = asyncio.Event()
+
+    async def fetch(_client, url):
+        if url.endswith(":8001"):
+            await first_answers.wait()
+        return "Model-" + url.rsplit(":", 1)[1]
+
+    monkeypatch.setattr(collector, "_fetch_model_name", fetch)
+    first = Endpoint("http://192.0.2.10:8001", 8001, "sglang", "Model-8001", "new")
+    second = Endpoint("http://192.0.2.10:8002", 8002, "vllm", "Model-8002", "new")
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        app.run_worker(app.apply_endpoint(1, first), group="scan-apply")
+        await pilot.pause()
+        # Still waiting on its model name, the first apply is already recorded.
+        assert app.settings.nodes[0].vllm_url == first.url
+        assert load_config(path).nodes[0].vllm_url == first.url
+
+        app.run_worker(app.apply_endpoint(1, second), group="scan-apply")
+        await pilot.pause()
+        first_answers.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert config.SPARK_UNITS[1]["vllm_url"] == second.url
+        assert app.settings.nodes[0].vllm_url == second.url
+        assert load_config(path).nodes[0].vllm_url == second.url
+        assert collector._model_names[1] == "Model-8002"
+
+
+async def test_closing_the_scan_mid_sweep_cancels_it(tmp_path: Path, monkeypatch):
+    """AC11: esc while a node is still scanning closes the window and stops
+    the sweep — nothing keeps probing behind a dismissed screen."""
+    import asyncio
+
+    import app as app_module
+    import discovery
+    from discovery import NodeScan
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    configure(path)
+    _stub(monkeypatch)
+    never = asyncio.Event()
+    seen: list[str] = []
+
+    async def fake_sweep(nodes, all_ports=False):
+        yield NodeScan(1, "head", False)
+        try:
+            await never.wait()  # the worker node is still being scanned
+        except asyncio.CancelledError:
+            seen.append("cancelled")
+            raise
+        yield NodeScan(2, "worker", True)
+
+    monkeypatch.setattr(discovery, "sweep", fake_sweep)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        rows, _ = _scan_text(app)
+        assert any("worker" in text and "scanning" in text for text, _, _ in rows)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert not isinstance(app.screen, app_module.ScanScreen)
+        assert seen == ["cancelled"]
+
+
+async def test_confirms_on_two_nodes_both_keep_their_model_names(tmp_path: Path, monkeypatch):
+    """F1 boundary: an apply on node 2 never cancels node 1's pending
+    model-name fetch (the scan-apply worker group is not exclusive)."""
+    import asyncio
+
+    import collector
+    import discovery
+    from discovery import Endpoint, NodeScan
+
+    path = tmp_path / "c.toml"
+    _config(path)
+    configure(path)
+    _stub(monkeypatch)
+    monkeypatch.setattr(collector, "_model_names", {})
+    monkeypatch.setattr(collector, "_endpoint_epoch", {})
+    head_answers = asyncio.Event()
+
+    async def fetch(_client, url):
+        if url == "http://192.0.2.10:8001":
+            await head_answers.wait()
+            return "HeadModel"
+        return "WorkerModel" if url == "http://192.0.2.11:8001" else ""
+
+    monkeypatch.setattr(collector, "_fetch_model_name", fetch)
+    head = NodeScan(1, "head", False)
+    head.endpoints = [Endpoint("http://192.0.2.10:8001", 8001, "sglang", "HeadModel", "new")]
+    worker = NodeScan(2, "worker", True)
+    worker.endpoints = [Endpoint("http://192.0.2.11:8001", 8001, "vllm", "WorkerModel", "new")]
+    rounds = iter([[head], [worker]])
+
+    async def fake_sweep(nodes, all_ports=False):
+        for scan in next(rounds):
+            yield scan
+
+    monkeypatch.setattr(discovery, "sweep", fake_sweep)
+    import app as app_module
+
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        for _ in range(2):  # scan, pick the node's new endpoint, confirm
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.press("y")
+            await pilot.pause()
+        head_answers.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert collector._model_names == {1: "HeadModel", 2: "WorkerModel"}
+        assert [n.vllm_url for n in load_config(path).nodes] == [
+            "http://192.0.2.10:8001",
+            "http://192.0.2.11:8001",
+        ]

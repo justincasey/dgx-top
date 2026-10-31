@@ -326,12 +326,13 @@ dashboard keeps polling behind it:
 Pick an endpoint with `enter` and confirm with `y`. The node's tile switches to
 it immediately and the node's `vllm_url` is saved to the configuration file
 (`engine` too, if the node declares one; comments and other keys are kept,
-and the file keeps its permissions). If the file cannot be written, the switch
-still applies for this session and the notification says why
-(`applied; config not saved: …`). `n` goes back to the list, `esc` closes the
-window and stops anything still scanning. When nothing is found, the window
-says `No inference endpoints found on N nodes.`; a node whose SSH failed is
-listed on its own row and not counted.
+and the file keeps its permissions). If the file cannot be written — or
+cannot be edited without moving its sections, as when `[[nodes]]` entries are
+split by another table — the switch still applies for this session and the
+notification says why (`applied; config not saved: …`). `n` goes back to the
+list, `esc` closes the window and stops anything still scanning. When nothing
+is found, the window says `No inference endpoints found on N nodes.`; a node
+whose SSH failed is listed on its own row and not counted.
 
 **From the shell**, the same sweep is read-only:
 
@@ -359,8 +360,8 @@ How the sweep works:
   SGLang's load API; `/v1/models` names the model. Anything else is ignored.
 - A wildcard listener is probed at the host in the node's `vllm_url` (or, if
   that URL is `localhost`, the host `ssh -G` resolves for the node's
-  `ssh_target`). A port bound to `127.0.0.1` is reported as **local-only**: it
-  cannot be reached from here, so it is not probed.
+  `ssh_target`). A port bound only to loopback (`127.0.0.1`, `::1`) cannot be
+  reached from here; it is skipped and not listed.
 - The sweep runs once per `s` press or `discover` run; nothing scans in the
   background. Under `--simulate`, the scan shows made-up endpoints and a
   switch is never saved.

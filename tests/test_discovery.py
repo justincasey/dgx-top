@@ -261,8 +261,8 @@ async def test_scan_tags_monitored_and_new_and_never_probes_loopback(monkeypatch
     # A specific bind is probed at its own address.
     assert by_port[30000].url == "http://198.51.100.21:30000"
     assert by_port[30000].status == "new"
-    assert sorted(scan.local_only) == [53, 8001, 8002, 8003]
-    assert not [url for url in requested if ":8001/" in url or ":8002/" in url]
+    loopback = (":53/", ":8001/", ":8002/", ":8003/")
+    assert not [url for url in requested if any(port in url for port in loopback)]
     assert not [url for url in requested if ":22/" in url or ":41234/" in url]
 
 
@@ -303,6 +303,220 @@ async def test_ipv6_specific_bind_is_bracketed(monkeypatch):
     assert [ep.url for ep in scan.endpoints] == ["http://[fd00::5]:8000"]
 
 
+# ─── review follow-ups: totality, bounds, one client, mapped binds ───
+
+
+def _patch_client(monkeypatch, handler) -> list[object]:
+    """Every ``httpx.AsyncClient`` built (discovery's and the collector's —
+    one module) answers through ``handler(url)``, which may wait or raise.
+    Returns the list of clients constructed."""
+    built: list[object] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            built.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url: str):
+            return await handler(url)
+
+    monkeypatch.setattr(discovery.httpx, "AsyncClient", FakeClient)
+    return built
+
+
+def _ss(*ports: int) -> str:
+    return f"{SS_MARK}\n" + "".join(f"LISTEN 0 4096 0.0.0.0:{p} 0.0.0.0:*\n" for p in ports)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["6099\u00b2", "9" * 5000],  # '²' passes isdigit(); int() refuses > 4300 digits
+)
+def test_unparseable_digits_in_ports_or_range_are_skipped_not_raised(bad):
+    """AC4: a port or range token int() cannot take degrades its line."""
+    text = (
+        f"{RANGE_MARK}\n32768 {bad}\n{SS_MARK}\n"
+        f"LISTEN 0 4096 0.0.0.0:{bad} 0.0.0.0:*\n"
+        "LISTEN 0 4096 0.0.0.0:8000 0.0.0.0:*\n"
+    )
+    listeners, port_range = parse_listen_output(text)
+
+    assert [lst.port for lst in listeners] == [8000]
+    assert port_range is None
+
+
+def test_malformed_proc_rows_are_skipped_and_valid_rows_kept():
+    """AC10: non-hex, odd-length and port-less addresses degrade one row."""
+    text = (
+        f"{PROC_MARK}\n"
+        "   0: ZZ00007F:1F40 00000000:0000 0A 0\n"
+        "   1: 0100007:1F41 00000000:0000 0A 0\n"
+        "   2: 0100007F 00000000:0000 0A 0\n"
+        "   3: 0100007F:XYZ 00000000:0000 0A 0\n"
+        "   4: 156433C6:7530 00000000:0000 0A 0\n"
+    )
+    listeners, _ = parse_listen_output(text)
+
+    assert _by_port(listeners) == {30000: ("198.51.100.21", "host")}
+
+
+def test_ipv4_mapped_binds_are_their_ipv4_socket():
+    """AC7 (parse): ::ffff:a.b.c.d is a.b.c.d, in both listing sources."""
+    proc = (
+        f"{PROC_MARK}\n"
+        "   0: 0000000000000000FFFF00007900A8C0:1F40 00000000000000000000000000000000:0000 0A 0\n"
+        "   1: 0000000000000000FFFF000000000000:1F41 00000000000000000000000000000000:0000 0A 0\n"
+        "   2: 0000000000000000FFFF00000100007F:1F42 00000000000000000000000000000000:0000 0A 0\n"
+    )
+    assert _by_port(parse_listen_output(proc)[0]) == {
+        8000: ("192.168.0.121", "host"),
+        8001: ("0.0.0.0", "any"),
+        8002: ("127.0.0.1", "loopback"),
+    }
+    ss = f"{SS_MARK}\nLISTEN 0 4096 [::ffff:192.168.0.121]:8000 *:*\n"
+    assert _by_port(parse_listen_output(ss)[0]) == {8000: ("192.168.0.121", "host")}
+
+
+async def test_mapped_bind_of_the_configured_endpoint_reads_as_monitored(monkeypatch):
+    """AC7 (scan): probed, tagged and offered at the dotted address."""
+    node = NodeConfig("spark-1", "spark@spark01", "http://192.168.0.121:8000")
+    _patch_ssh(monkeypatch, f"{SS_MARK}\nLISTEN 0 4096 [::ffff:192.168.0.121]:8000 *:*\n")
+    _patch_http(monkeypatch, {"http://192.168.0.121:8000/metrics": VLLM_METRICS})
+
+    scan = await discovery.scan_node(1, node)
+
+    assert [(ep.url, ep.status) for ep in scan.endpoints] == [
+        ("http://192.168.0.121:8000", "monitored")
+    ]
+
+
+async def test_a_port_that_never_finishes_answering_is_abandoned_at_the_deadline(monkeypatch):
+    """AC5: per-phase httpx timeouts do not bound an endless body; the
+    per-port deadline does, and the node's other endpoints still report —
+    including when the hang comes after a positive /metrics."""
+    import asyncio
+
+    monkeypatch.setattr(discovery, "PROBE_DEADLINE", 0.5)
+    _patch_ssh(monkeypatch, _ss(8000, 8100, 8200))
+    never = asyncio.Event()
+
+    async def handler(url: str):
+        if url in ("http://spark01:8100/metrics", "http://spark01:8200/v1/models"):
+            await never.wait()
+        if url in ("http://spark01:8000/metrics", "http://spark01:8200/metrics"):
+            return _Resp(VLLM_METRICS)
+        if url == "http://spark01:8000/v1/models":
+            return _Resp(_models("Qwen3.6-27B"))
+        return _Resp(RuntimeError(f"404 {url}"))
+
+    _patch_client(monkeypatch, handler)
+
+    scan = await asyncio.wait_for(discovery.scan_node(1, NODE), timeout=5)
+
+    assert [(ep.port, ep.model) for ep in scan.endpoints] == [(8000, "Qwen3.6-27B")]
+
+
+@pytest.mark.parametrize("error", [discovery.httpx.ConnectError, discovery.httpx.ConnectTimeout])
+async def test_a_port_that_refuses_the_connection_is_probed_once(monkeypatch, error):
+    """AC5: a failed connect on /metrics ends the port's probe — the load
+    routes and /v1/models live at the same unreachable address."""
+    _patch_ssh(monkeypatch, _ss(8000))
+    requested: list[str] = []
+
+    async def handler(url: str):
+        requested.append(url)
+        raise error("connection refused")
+
+    _patch_client(monkeypatch, handler)
+
+    scan = await discovery.scan_node(1, NODE)
+
+    assert scan.endpoints == []
+    assert requested == ["http://spark01:8000/metrics"]
+
+
+async def test_one_http_client_per_node_however_many_foreign_ports(monkeypatch):
+    """AC6: non-engine ports fall through to the load API over the node's
+    shared client, never a client built per port or per route."""
+    _patch_ssh(monkeypatch, _ss(3000, 8265, 9090))
+    requested: list[str] = []
+
+    async def handler(url: str):
+        requested.append(url)
+        if url.endswith("/metrics"):
+            return _Resp(RAY_METRICS)
+        return _Resp(RuntimeError(f"404 {url}"))
+
+    built = _patch_client(monkeypatch, handler)
+
+    scan = await discovery.scan_node(1, NODE)
+
+    assert scan.endpoints == []
+    assert "http://spark01:8265/get_load" in requested  # the fallback did run
+    assert len(built) == 1
+
+
+async def test_real_sweep_reports_every_node_despite_one_ssh_failure(monkeypatch):
+    """AC9: one node's SSH failure is that node's result; the other node
+    still reports (the non-simulated sweep path)."""
+    monkeypatch.setattr(config, "SIMULATION_NODES", None)
+
+    async def fake_ssh(target: str, cmd: str) -> str:
+        if target == "spark@bad":
+            raise RuntimeError("ssh: connect to host bad port 22: timed out")
+        return f"{SS_MARK}\nLISTEN 0 4096 127.0.0.1:8000 0.0.0.0:*\n"
+
+    monkeypatch.setattr(collector, "_ssh_run", fake_ssh)
+    nodes = [
+        NodeConfig("good", "spark@good", "http://good:8000"),
+        NodeConfig("bad", "spark@bad", "http://bad:8000"),
+    ]
+
+    scans = {scan.uid: scan async for scan in discovery.sweep(nodes)}
+
+    assert set(scans) == {1, 2}
+    assert scans[1].error is None and scans[1].endpoints == []
+    assert scans[2].error == "ssh: connect to host bad port 22: timed out"
+
+
+async def test_closing_the_sweep_cancels_the_node_scans_still_running(monkeypatch):
+    """AC9: a closed sweep (the scan window's esc) leaves no node scan behind."""
+    import asyncio
+
+    monkeypatch.setattr(config, "SIMULATION_NODES", None)
+    blocked = asyncio.Event()
+    cancelled: list[str] = []
+
+    async def fake_ssh(target: str, cmd: str) -> str:
+        if target == "spark@slow":
+            try:
+                await blocked.wait()
+            except asyncio.CancelledError:
+                cancelled.append(target)
+                raise
+        return f"{SS_MARK}\n"
+
+    monkeypatch.setattr(collector, "_ssh_run", fake_ssh)
+    nodes = [
+        NodeConfig("fast", "spark@fast", "http://fast:8000"),
+        NodeConfig("slow", "spark@slow", "http://slow:8000"),
+    ]
+
+    sweep = discovery.sweep(nodes)
+    first = await sweep.__anext__()
+    await sweep.aclose()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert first.uid == 1
+    assert cancelled == ["spark@slow"]
+
+
 # ─── AC12: simulation ────────────────────────────────────────────────
 
 
@@ -324,7 +538,7 @@ async def test_simulated_sweep_makes_no_ssh_or_http_call(monkeypatch):
 
 def test_nothing_found_counts_only_nodes_that_were_scanned():
     empty = NodeScan(1, "a", False)
-    worker = NodeScan(2, "b", True, local_only=[8100])
+    worker = NodeScan(2, "b", True)
     failed = NodeScan(3, "c", False, error="ssh: timed out")
 
     assert (
@@ -335,6 +549,30 @@ def test_nothing_found_counts_only_nodes_that_were_scanned():
     assert discovery.nothing_found_message([failed]) == "No nodes could be scanned."
     found = NodeScan(4, "d", False, endpoints=[Endpoint("http://d:1", 1, "vllm", "", "new")])
     assert discovery.nothing_found_message([empty, found]) is None
+
+
+async def test_a_host_with_only_system_loopback_services_reads_as_nothing_found(monkeypatch):
+    """Every stock Ubuntu/DGX OS node has loopback listeners that are not
+    engines (systemd-resolved :53, CUPS :631, DCGM :5555, X11 forwarding
+    :6010). They are neither probed nor listed; the node reads as empty."""
+    _patch_ssh(
+        monkeypatch,
+        f"{RANGE_MARK}\n32768 60999\n{SS_MARK}\n"
+        "LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n"
+        "LISTEN 0 4096 127.0.0.1:631 0.0.0.0:*\n"
+        "LISTEN 0 4096 [::1]:631 [::]:*\n"
+        "LISTEN 0 4096 127.0.0.1:5555 0.0.0.0:*\n"
+        "LISTEN 0 128 127.0.0.1:6010 0.0.0.0:*\n"
+        "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n",
+    )
+    requested = _patch_http(monkeypatch, {})
+
+    scan = await discovery.scan_node(1, NODE)
+    table = discovery.format_table([scan]).splitlines()
+
+    assert requested == []
+    assert table[1].split() == ["spark-1", "-", "-", "-", "none"]
+    assert table[-1] == "No inference endpoints found on 1 node."
 
 
 @pytest.mark.parametrize("scans", [[], [NodeScan(1, "a", False)]])

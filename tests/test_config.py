@@ -314,6 +314,39 @@ def test_save_refuses_a_node_whose_label_changed_and_leaves_bytes(tmp_path: Path
     assert [p.name for p in tmp_path.iterdir()] == ["config.toml"]
 
 
+def test_save_refuses_a_file_tomlkit_would_reformat_and_leaves_bytes(tmp_path: Path):
+    """AC8: [[nodes]] split by another table does not round-trip through
+    tomlkit (it would move [app] and its comments); refuse, never rewrite."""
+    from config import save_node_endpoint
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "# first node\n"
+        "[[nodes]]\n"
+        'label = "head"\n'
+        'ssh_target = "spark@head"\n'
+        'vllm_url = "http://head:8000"\n'
+        "\n"
+        "# app section\n"
+        "[app]\n"
+        "poll_interval = 5\n"
+        "\n"
+        "# second node\n"
+        "[[nodes]]\n"
+        'label = "worker"\n'
+        'ssh_target = "spark@worker"\n'
+        'vllm_url = "http://worker:8000"\n'
+    )
+    assert [n.label for n in load_config(path).nodes] == ["head", "worker"]  # a valid file
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigError, match=r"cannot be edited in place.*nodes\[1\] by hand"):
+        save_node_endpoint(path, 1, "head", "http://head:8001", None)
+
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["config.toml"]
+
+
 def test_save_never_replaces_the_file_with_an_invalid_result(tmp_path: Path):
     from config import save_node_endpoint
 
