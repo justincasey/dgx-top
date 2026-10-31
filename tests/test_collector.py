@@ -2338,7 +2338,7 @@ async def test_switch_never_turns_the_counter_jump_into_a_rate(tmp_path, monkeyp
     before = await collector.poll_cluster()
     assert before.units[0].throughput_tok_s > 0
 
-    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
+    collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
     after = await collector.poll_cluster()  # new engine: +4M tokens vs old
     assert after.units[0].throughput_tok_s == 0.0
 
@@ -2346,17 +2346,23 @@ async def test_switch_never_turns_the_counter_jump_into_a_rate(tmp_path, monkeyp
     assert 0 < later.units[0].throughput_tok_s
 
 
-async def test_poll_in_flight_across_a_switch_does_not_seed_the_new_baseline(tmp_path, monkeypatch):
+async def test_poll_straddling_a_switch_returns_the_new_endpoint(tmp_path, monkeypatch):
+    """AC3: the unit's result is polled after the switch — never the old
+    engine's numbers — and it, not the old counters, seeds the new baseline."""
     import asyncio
 
     _switch_config(tmp_path)
     _isolate_rate_state(monkeypatch)
+    started = asyncio.Event()
     release = asyncio.Event()
-    totals = iter([1_000_000.0, 1_000_100.0, 5_000_000.0])
+    totals = iter([1_000_000.0, 1_000_100.0, 5_000_000.0, 5_000_050.0])
+    polled_urls: list[str] = []
 
     async def fake_poll_unit(uid):
+        polled_urls.append(collector.SPARK_UNITS[uid]["vllm_url"])
         value = next(totals)
         if value == 1_000_100.0:
+            started.set()
             await release.wait()  # this poll straddles the switch
         return _hosted(value)
 
@@ -2364,14 +2370,108 @@ async def test_poll_in_flight_across_a_switch_does_not_seed_the_new_baseline(tmp
     await collector.poll_cluster()
 
     in_flight = asyncio.create_task(collector.poll_cluster())
-    await asyncio.sleep(0)
-    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
+    await started.wait()  # the old endpoint's poll is in flight
+    collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
     release.set()
+    straddling = await in_flight
+
+    assert polled_urls == [
+        "http://192.0.2.10:8000",
+        "http://192.0.2.10:8000",
+        "http://192.0.2.10:8001",
+    ]
+    assert straddling.units[0].generation_tokens_total == 5_000_000.0
+    assert straddling.units[0].throughput_tok_s == 0.0
+    assert collector._prev_tokens[1][1] == 5_000_000.0  # baseline is the new engine's
+    later = await collector.poll_cluster()
+    assert 0 < later.units[0].throughput_tok_s  # rated on the new engine's 50 tokens
+
+
+def _two_unit_config(tmp_path):
+    import config
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[nodes]]\nlabel = "head"\nssh_target = "head"\nvllm_url = "http://192.0.2.10:8000"\n'
+        '[[nodes]]\nlabel = "worker"\nssh_target = "worker"\nvllm_url = "http://192.0.2.11:8000"\n'
+    )
+    config.configure(path)
+
+
+async def test_switches_landing_mid_poll_are_re_polled_until_stable(tmp_path, monkeypatch):
+    """F8 boundaries: a second switch during the re-poll is polled too; the
+    unswitched unit keeps its single poll."""
+    import asyncio
+
+    _two_unit_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    gates = {
+        ":8000": (asyncio.Event(), asyncio.Event()),
+        ":8001": (asyncio.Event(), asyncio.Event()),
+    }
+    calls: list[tuple[int, str]] = []
+
+    async def fake_poll_unit(uid):
+        url = collector.SPARK_UNITS[uid]["vllm_url"]
+        calls.append((uid, url))
+        if uid == 1 and url[-5:] in gates:
+            started, release = gates[url[-5:]]
+            started.set()
+            await release.wait()
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    in_flight = asyncio.create_task(collector.poll_cluster())
+    for current, target in ((":8000", ":8001"), (":8001", ":8002")):
+        started, release = gates[current]
+        await started.wait()
+        collector.set_unit_endpoint(1, f"http://192.0.2.10{target}", None)
+        release.set()
     await in_flight
 
-    assert 1 not in collector._prev_tokens  # old counters never became the baseline
-    first_new = await collector.poll_cluster()
-    assert first_new.units[0].throughput_tok_s == 0.0
+    assert calls == [
+        (1, "http://192.0.2.10:8000"),
+        (2, "http://192.0.2.11:8000"),
+        (1, "http://192.0.2.10:8001"),
+        (1, "http://192.0.2.10:8002"),
+    ]
+
+
+async def test_a_mid_poll_switch_never_skews_the_other_units_rates(tmp_path, monkeypatch):
+    """Re-polling a switched unit takes time; an unswitched unit's sample is
+    stamped when it landed, so its rate stays its own (100 tok/s here)."""
+    import asyncio
+    import types
+
+    _two_unit_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(collector, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    started, release = asyncio.Event(), asyncio.Event()
+    armed = [False]
+
+    async def fake_poll_unit(uid):
+        url = collector.SPARK_UNITS[uid]["vllm_url"]
+        if uid == 2:
+            return _hosted(1000.0 + 100.0 * clock[0])  # a steady 100 tok/s
+        if armed[0] and url.endswith(":8000"):
+            started.set()
+            await release.wait()
+        if url.endswith(":8001"):
+            clock[0] += 5.0  # the re-poll costs five seconds
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    await collector.poll_cluster()  # t=0: baselines
+    clock[0] = 10.0
+    armed[0] = True
+    in_flight = asyncio.create_task(collector.poll_cluster())
+    await started.wait()
+    collector.set_unit_endpoint(1, "http://192.0.2.10:8001", None)
+    release.set()
+    stats = await in_flight
+
+    assert abs(stats.units[1].throughput_tok_s - 100.0) < 1e-9
 
 
 async def test_switch_updates_settings_and_model_name_with_the_engine_rule(tmp_path, monkeypatch):
@@ -2381,7 +2481,9 @@ async def test_switch_updates_settings_and_model_name_with_the_engine_rule(tmp_p
     _isolate_rate_state(monkeypatch)
     collector._model_names[1] = "OldModel"
 
-    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001/", "sglang")
+    epoch = collector.set_unit_endpoint(1, "http://192.0.2.10:8001/", "sglang")
+    assert 1 not in collector._model_names  # the old engine's name is gone at once
+    assert await collector.refresh_unit_model_name(1, epoch) is True
 
     node = config.get_settings().nodes[0]
     assert node.vllm_url == "http://192.0.2.10:8001"
@@ -2391,6 +2493,62 @@ async def test_switch_updates_settings_and_model_name_with_the_engine_rule(tmp_p
     assert collector._model_names[1] == "NewModel"
 
     _switch_config(tmp_path, 'engine = "vllm"\n')
-    await collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
+    collector.set_unit_endpoint(1, "http://192.0.2.10:8001", "sglang")
     assert config.get_settings().nodes[0].engine == "sglang"
     assert config.SPARK_UNITS[1]["engine"] == "sglang"
+
+
+async def test_late_startup_model_name_never_overwrites_a_switch(tmp_path, monkeypatch):
+    """AC2: the startup fetch of the old URL answers after the switch stored
+    the new endpoint's name; the switch's name stands."""
+    import asyncio
+
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    old_answers = asyncio.Event()
+
+    async def fetch(_client, url):
+        if url == "http://192.0.2.10:8000":
+            await old_answers.wait()
+            return "OldModel"
+        return "NewModel"
+
+    monkeypatch.setattr(collector, "_fetch_model_name", fetch)
+    startup = asyncio.create_task(collector._init_model_names())
+    await asyncio.sleep(0.01)  # the startup fetch is in flight
+
+    epoch = collector.set_unit_endpoint(1, "http://192.0.2.10:8001", None)
+    assert await collector.refresh_unit_model_name(1, epoch) is True
+    old_answers.set()
+    await startup
+
+    assert collector._model_names[1] == "NewModel"
+
+
+async def test_older_switch_name_fetch_never_overwrites_a_newer_switch(tmp_path, monkeypatch):
+    """Two switches on one unit; the first one's fetch answers last."""
+    import asyncio
+
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    first_answers = asyncio.Event()
+
+    async def fetch(_client, url):
+        if url.endswith(":8001"):
+            await first_answers.wait()
+            return "FirstModel"
+        return "SecondModel"
+
+    monkeypatch.setattr(collector, "_fetch_model_name", fetch)
+    first = asyncio.create_task(
+        collector.refresh_unit_model_name(
+            1, collector.set_unit_endpoint(1, "http://192.0.2.10:8001", None)
+        )
+    )
+    await asyncio.sleep(0.01)
+    second = collector.set_unit_endpoint(1, "http://192.0.2.10:8002", None)
+    assert await collector.refresh_unit_model_name(1, second) is True
+    first_answers.set()
+    assert await first is False
+
+    assert collector._model_names[1] == "SecondModel"

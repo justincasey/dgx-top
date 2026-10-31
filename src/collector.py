@@ -59,19 +59,24 @@ async def _fetch_model_name(client: httpx.AsyncClient, engine_url: str) -> str:
     return ""
 
 
+async def _store_model_name(client: httpx.AsyncClient, unit_id: int, epoch: int) -> bool:
+    """Fetch the unit's model name and keep it only while ``epoch`` is still
+    the unit's endpoint generation: a switch that lands during the fetch owns
+    the name now. True when a name was stored."""
+    name = await _fetch_model_name(client, str(SPARK_UNITS[unit_id]["vllm_url"]))
+    if name and _endpoint_epoch.get(unit_id, 0) == epoch:
+        _model_names[unit_id] = name
+        return True
+    return False
+
+
 async def _init_model_names() -> None:
     """Fetch model names from all Spark units once at startup."""
     if config.SIMULATION_NODES:
         return
-
-    async def fetch_one(client: httpx.AsyncClient, uid: int, vllm_url: str) -> None:
-        name = await _fetch_model_name(client, vllm_url)
-        if name:
-            _model_names[uid] = name
-
     async with httpx.AsyncClient(timeout=10) as client:
         await asyncio.gather(
-            *(fetch_one(client, uid, str(cfg["vllm_url"])) for uid, cfg in SPARK_UNITS.items())
+            *(_store_model_name(client, uid, _endpoint_epoch.get(uid, 0)) for uid in SPARK_UNITS)
         )
 
 
@@ -1016,7 +1021,7 @@ def _load_from_get_load(data: object) -> EngineLoad | None:
     )
 
 
-async def fetch_engine_load(engine_url: str, timeout: float = 5) -> EngineLoad | None:
+async def fetch_engine_load(engine_url: str) -> EngineLoad | None:
     """Fetch serving load from an SGLang server's load API.
 
     ``/v1/loads`` first (the supported route), then ``/get_load`` (deprecated,
@@ -1024,15 +1029,23 @@ async def fetch_engine_load(engine_url: str, timeout: float = 5) -> EngineLoad |
     neither — a dead port or a non-SGLang server. Every failure mode is
     swallowed: the probe is an optional fallback, never a poll-killing path.
     """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            return await fetch_engine_load_with(client, engine_url)
+    except Exception:
+        return None
+
+
+async def fetch_engine_load_with(client: httpx.AsyncClient, engine_url: str) -> EngineLoad | None:
+    """``fetch_engine_load`` over the caller's client (discovery probes every
+    port of a node through one). Total in the same way."""
     for path, parse in (("/v1/loads", _load_from_v1), ("/get_load", _load_from_get_load)):
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(f"{engine_url}{path}")
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await client.get(f"{engine_url}{path}")
+            resp.raise_for_status()
             # Inside the try on purpose: the probe must not be able to raise
             # past poll_unit, whose awaited call sits outside its own try.
-            load = parse(data)
+            load = parse(resp.json())
         except Exception:
             continue
         if load is not None:
@@ -1756,18 +1769,22 @@ def _update_thrash_rates(host: str, data: dict, now: float) -> dict:
 
 
 _endpoint_epoch: dict[int, int] = {}
-"""Per-unit endpoint generation, bumped by ``set_unit_endpoint``. A poll that
-started before a switch carries the old engine's counters; ``poll_cluster``
-compares generations so such a result never seeds the new rate baseline."""
+"""Per-unit endpoint generation, bumped by ``set_unit_endpoint``. Work that
+started before a switch describes the old endpoint: ``poll_cluster`` re-polls
+a unit whose generation moved during its gather, and a model-name fetch keeps
+its result only when the generation it started under is still current."""
 
 
-async def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> None:
+def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> int:
     """Point one unit at a different engine endpoint while the app runs.
 
     The settings change is ``config.set_node_endpoint``'s; this side drops
     every counter baseline the unit holds (generation, prompt and prefix-cache
     totals of the old engine would turn the first delta against the new one
-    into a fabricated rate) and replaces the startup-cached model name."""
+    into a fabricated rate) and the cached model name. Synchronous on purpose:
+    a caller that records the switch (the config write-back) can do so before
+    its next await, so two switches never interleave. Returns the unit's new
+    endpoint generation for ``refresh_unit_model_name``."""
     config.set_node_endpoint(unit_id, url, engine)
     _prev_tokens.pop(unit_id, None)
     _prev_prompt_tokens.pop(unit_id, None)
@@ -1775,13 +1792,16 @@ async def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> None:
     _model_names.pop(unit_id, None)
     epoch = _endpoint_epoch.get(unit_id, 0) + 1
     _endpoint_epoch[unit_id] = epoch
+    return epoch
+
+
+async def refresh_unit_model_name(unit_id: int, epoch: int) -> bool:
+    """Fetch the model name of the endpoint switched to at ``epoch``. True
+    when it was stored (never under ``--simulate``, nor after a newer switch)."""
     if config.SIMULATION_NODES:
-        return
+        return False
     async with httpx.AsyncClient(timeout=10) as client:
-        name = await _fetch_model_name(client, str(SPARK_UNITS[unit_id]["vllm_url"]))
-    # A second switch while this fetch was in flight owns the name now.
-    if name and _endpoint_epoch.get(unit_id) == epoch:
-        _model_names[unit_id] = name
+        return await _store_model_name(client, unit_id, epoch)
 
 
 async def poll_cluster() -> ClusterStats:
@@ -1791,14 +1811,26 @@ async def poll_cluster() -> ClusterStats:
     unit_ids = sorted(SPARK_UNITS.keys())
     epochs = {uid: _endpoint_epoch.get(uid, 0) for uid in unit_ids}
     tasks = [poll_unit(uid) for uid in unit_ids]
-    results = await asyncio.gather(*tasks)
+    results = list(await asyncio.gather(*tasks))
+    # Each sample is stamped when its gather finished: a re-poll below takes
+    # time, and stamping the untouched units later would shrink their rates.
+    stamps = [time.monotonic()] * len(unit_ids)
+    # A unit switched while it was being polled returned the endpoint it no
+    # longer monitors. Poll it again (until no switch lands mid-poll), so its
+    # tile, its history samples and its new rate baseline all describe the
+    # endpoint it monitors now.
+    while stale := [
+        i for i, uid in enumerate(unit_ids) if _endpoint_epoch.get(uid, 0) != epochs[uid]
+    ]:
+        for i in stale:
+            epochs[unit_ids[i]] = _endpoint_epoch.get(unit_ids[i], 0)
+        fresh = await asyncio.gather(*(poll_unit(unit_ids[i]) for i in stale))
+        landed = time.monotonic()
+        for i, s in zip(stale, fresh):
+            results[i] = s
+            stamps[i] = landed
 
-    now = time.monotonic()
-    for unit_id, s in zip(unit_ids, results):
-        if _endpoint_epoch.get(unit_id, 0) != epochs[unit_id]:
-            # Polled the endpoint this unit no longer monitors: its counters
-            # must not become the new endpoint's baseline.
-            continue
+    for unit_id, s, now in zip(unit_ids, results, stamps):
         _update_throughput(unit_id, s, now)
         _update_prompt_throughput(unit_id, s, now)
         _update_prefix_hit_rate(unit_id, s)

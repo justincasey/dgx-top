@@ -18,7 +18,7 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 import discovery
-from collector import _init_model_names, poll_cluster, set_unit_endpoint
+from collector import _init_model_names, poll_cluster, refresh_unit_model_name, set_unit_endpoint
 from config import ConfigError, config_path, default_config_path, get_settings, save_node_endpoint
 from input_driver import ResilientLinuxDriver
 from stats import ClusterStats, SparkUnitStats
@@ -2072,7 +2072,7 @@ class ScanScreen(ModalScreen[None]):
                 head.append("  scanning…", style=pal.dim)
             elif scan.error is not None:
                 head.append(f"  ssh failed: {scan.error}", style=pal.warn)
-            elif not scan.endpoints and not scan.local_only:
+            elif not scan.endpoints:
                 head.append("  no inference found", style=pal.dim)
                 if scan.worker:
                     head.append(" (worker)", style=pal.dim)
@@ -2087,14 +2087,6 @@ class ScanScreen(ModalScreen[None]):
                 )
                 if not monitored:
                     self._choices[option_id] = (uid, ep)
-            if scan.local_only:
-                ports = " ".join(f":{port}" for port in scan.local_only)
-                options.append(
-                    Option(
-                        Text(f"  local-only (not reachable from here) {ports}", style=pal.dim),
-                        disabled=True,
-                    )
-                )
         option_list.set_options(options)
         target = keep if keep in self._choices else next(iter(self._choices), None)
         if target is not None:
@@ -2626,9 +2618,14 @@ class DGXTop(App):
     async def apply_endpoint(self, unit_id: int, endpoint: discovery.Endpoint) -> None:
         """Monitor ``endpoint`` on node ``unit_id`` (1-based) from now on and
         save it to the configuration file. The switch stands even when the
-        save fails; the notification says which of the two happened."""
+        save fails; the notification says which of the two happened.
+
+        The switch, the settings refresh and the save run with no await
+        between them, so of two applies on one node the one that runs last
+        owns the live endpoint, ``self.settings`` and the file together; only
+        the model-name fetch waits, afterwards."""
         label = self.settings.nodes[unit_id - 1].label
-        await set_unit_endpoint(unit_id, endpoint.url, endpoint.engine)
+        epoch = set_unit_endpoint(unit_id, endpoint.url, endpoint.engine)
         self.settings = get_settings()
         path = config_path()
         severity = "information"
@@ -2645,6 +2642,8 @@ class DGXTop(App):
         log.info("scan: %s", message)
         self.notify(message, severity=severity)
         self._request_poll()
+        if await refresh_unit_model_name(unit_id, epoch):
+            self._request_poll()  # paint the tile's model name now, not a poll later
 
 
 def run(config_path: str | Path | None = None) -> None:

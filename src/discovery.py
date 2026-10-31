@@ -39,6 +39,10 @@ missing ``tcp6`` table never reads as an SSH failure."""
 
 SKIP_PORTS = frozenset({22})
 PROBE_TIMEOUT = 2.0
+PROBE_DEADLINE = 3 * PROBE_TIMEOUT
+"""Whole-port budget. httpx's timeouts bound each connect and each read, not
+a response: a listener trickling an endless body would otherwise hold the
+node's scan, and the sweep, open forever."""
 PROBE_CONCURRENCY = 16
 
 # Scope precedence when several sockets share a port: a wildcard bind is
@@ -68,16 +72,18 @@ class NodeScan:
     label: str
     worker: bool
     endpoints: list[Endpoint] = field(default_factory=list)
-    local_only: list[int] = field(default_factory=list)
     error: Optional[str] = None  # set ⇔ the node could not be listed (ssh-failed)
 
 
 # ─── parsing (total over remote text) ────────────────────────────────
 
 
-def _scope(address: str) -> Optional[str]:
+def _classify(address: str) -> Optional[tuple[str, str]]:
+    """``(address, scope)`` for a bind address, None when it is not one. An
+    IPv4-mapped address (``::ffff:a.b.c.d``) is the IPv4 socket it maps, so
+    it is reported — and probed, tagged and saved — as ``a.b.c.d``."""
     if address in ("", "*", "0.0.0.0", "::"):
-        return "any"
+        return address, "any"
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
@@ -86,18 +92,28 @@ def _scope(address: str) -> Optional[str]:
     if mapped is not None:
         ip = mapped
     if ip.is_unspecified:
-        return "any"
-    return "loopback" if ip.is_loopback else "host"
+        return str(ip), "any"
+    return str(ip), "loopback" if ip.is_loopback else "host"
+
+
+def _port_number(text: str) -> Optional[int]:
+    """``text`` as a port-sized decimal (at most five ASCII digits), else
+    None. ``isdigit()`` alone admits ``'²'``, which ``int()`` rejects, and
+    ``int()`` refuses strings over 4300 digits."""
+    if text.isascii() and text.isdigit() and len(text) <= 5:
+        return int(text)
+    return None
 
 
 def _split_local(local: str) -> Optional[tuple[str, int]]:
     """``0.0.0.0:8000`` / ``[::]:8000`` / ``*:8000`` / ``127.0.0.53%lo:53`` /
     ``[fe80::1]%eth0:8006`` (ss prints a device zone outside the brackets)."""
     address, sep, port = local.rpartition(":")
-    if not sep or not port.isdigit():
+    number = _port_number(port)
+    if not sep or number is None:
         return None
     address = address.split("%", 1)[0].strip("[]")
-    return address, int(port)
+    return address, number
 
 
 def _parse_ss(lines: Iterable[str]) -> list[Listener]:
@@ -110,9 +126,9 @@ def _parse_ss(lines: Iterable[str]) -> list[Listener]:
         if split is None:
             continue
         address, port = split
-        scope = _scope(address)
-        if scope is not None and 0 < port < 65536:
-            found.append(Listener(address, port, scope))
+        bind = _classify(address)
+        if bind is not None and 0 < port < 65536:
+            found.append(Listener(bind[0], port, bind[1]))
     return found
 
 
@@ -144,9 +160,9 @@ def _parse_proc(lines: Iterable[str]) -> list[Listener]:
             continue
         if address is None or not 0 < port < 65536:
             continue
-        scope = _scope(address)
-        if scope is not None:
-            found.append(Listener(address, port, scope))
+        bind = _classify(address)
+        if bind is not None:
+            found.append(Listener(bind[0], port, bind[1]))
     return found
 
 
@@ -162,9 +178,9 @@ def _dedupe(listeners: Iterable[Listener]) -> list[Listener]:
 
 def _parse_range(lines: list[str]) -> Optional[tuple[int, int]]:
     for line in lines:
-        parts = line.split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            low, high = int(parts[0]), int(parts[1])
+        bounds = [_port_number(p) for p in line.split()]
+        if len(bounds) == 2 and None not in bounds:
+            low, high = bounds
             if 0 < low <= high < 65536:
                 return low, high
     return None
@@ -256,17 +272,20 @@ async def probe(client: httpx.AsyncClient, base_url: str) -> Optional[tuple[str,
     """``(engine, model)`` when ``base_url`` serves an inference engine.
 
     ``/metrics`` sample evidence first, then SGLang's load API (a server
-    started without ``--enable-metrics``), then ``/v1/models`` for the name.
-    Never raises: a foreign or dead port is simply not an engine."""
+    started without ``--enable-metrics``), then ``/v1/models`` for the name,
+    all over the caller's client. Never raises: a foreign or dead port is
+    simply not an engine."""
     engine: Optional[str] = None
     try:
         resp = await client.get(f"{base_url}/metrics")
         resp.raise_for_status()
         engine = collector.metrics_engine(resp.text)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return None  # nothing accepts at this address: the load routes cannot answer either
     except Exception:
         engine = None
     if engine is None:
-        load = await collector.fetch_engine_load(base_url, timeout=PROBE_TIMEOUT)
+        load = await collector.fetch_engine_load_with(client, base_url)
         if load is None:
             return None
         engine = "sglang"
@@ -293,7 +312,9 @@ async def scan_node(uid: int, node: NodeConfig, all_ports: bool = False) -> Node
         return scan
     listeners, port_range = parse_listen_output(output)
     probe_set = candidates(listeners, port_range, all_ports)
-    scan.local_only = [lst.port for lst in probe_set if lst.scope == "loopback"]
+    # A loopback-only bind cannot be reached from this machine, and most of
+    # them are system services (resolved :53, CUPS, DCGM, X11 forwarding),
+    # not engines: they are skipped, not reported.
     remote = [lst for lst in probe_set if lst.scope != "loopback"]
     if not remote:
         return scan
@@ -305,7 +326,10 @@ async def scan_node(uid: int, node: NodeConfig, all_ports: bool = False) -> Node
         host = node_addr if listener.scope == "any" else listener.address
         url = _url(scheme, host, listener.port)
         async with limit:
-            found = await probe(client, url)
+            try:
+                found = await asyncio.wait_for(probe(client, url), PROBE_DEADLINE)
+            except asyncio.TimeoutError:  # 3.10: not yet the builtin TimeoutError
+                found = None
         if found is None:
             return None
         engine, model = found
@@ -331,9 +355,7 @@ def simulated_scan(uid: int, node: NodeConfig) -> NodeScan:
         Endpoint(_url("http", host, port), port, engine, model, _status(node, host, port))
         for port, engine, model in served
     ]
-    if uid == 1:
-        scan.local_only = [8100]
-    elif uid == 3:
+    if uid == 3:
         scan.error = f"ssh: connect to host {host} port 22: Connection timed out"
     return scan
 
@@ -380,9 +402,7 @@ def format_table(scans: Sequence[NodeScan]) -> str:
             continue
         for ep in scan.endpoints:
             rows.append((scan.label, str(ep.port), ep.engine, ep.model or "—", ep.status, ep.url))
-        for port in scan.local_only:
-            rows.append((scan.label, str(port), "?", "—", "local-only", "loopback bind"))
-        if not scan.endpoints and not scan.local_only:
+        if not scan.endpoints:
             note = "worker" if scan.worker else ""
             rows.append((scan.label, "-", "-", "-", "none", note))
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]

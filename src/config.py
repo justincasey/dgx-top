@@ -304,8 +304,10 @@ def save_node_endpoint(
     """Write one node's new endpoint into the configuration file.
 
     Edits the ``unit_id``-th (1-based) ``[[nodes]]`` entry in place with
-    tomlkit, so comments and every other key survive. ``engine`` is written
-    only when the entry already declares one; ``worker`` is never touched.
+    tomlkit, so comments and every other key survive; a file tomlkit cannot
+    reproduce byte for byte (``[[nodes]]`` split by another table) is refused
+    instead. ``engine`` is written only when the entry already declares one;
+    ``worker`` is never touched.
     The entry's label must equal ``label`` — a file edited since it was
     loaded is refused rather than written to the wrong node. The edited text
     must load through ``load_config`` before it replaces the original, which
@@ -324,6 +326,14 @@ def save_node_endpoint(
         doc = tomlkit.parse(original)
     except Exception as exc:
         raise ConfigError(f"invalid TOML in {target}: {exc}") from exc
+    if doc.as_string() != original:
+        # tomlkit regroups an array of tables split by another table
+        # ([[nodes]] … [app] … [[nodes]]); writing it back would move whole
+        # sections and re-attach their comments. Refuse rather than reformat.
+        raise ConfigError(
+            f"{target} cannot be edited in place (tables or comments would move, "
+            f"e.g. [[nodes]] entries split by another table); set nodes[{unit_id}] by hand"
+        )
     nodes = doc.get("nodes")
     if not isinstance(nodes, list) or not 1 <= unit_id <= len(nodes):
         raise ConfigError(f"{target} has no nodes[{unit_id}] entry")
