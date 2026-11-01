@@ -175,6 +175,20 @@ def test_quiet_validation(tmp_path: Path):
     assert load_config(_write(tmp_path)).quiet is False
 
 
+def test_clock_ceiling_validation(tmp_path: Path):
+    # Default is the 2200 MHz ceiling the `c` menu applies.
+    assert load_config(_write(tmp_path)).clock_ceiling_mhz == 2200
+
+    path = tmp_path / "ceiling.toml"
+    path.write_text(_with_app_line("clock_ceiling_mhz = 2400"))
+    assert load_config(path).clock_ceiling_mhz == 2400
+
+    for bad in ('"2200"', "true", "99", "1499", "2401", "10000", "2200.0"):
+        path.write_text(_with_app_line(f"clock_ceiling_mhz = {bad}"))
+        with pytest.raises(ConfigError, match="clock_ceiling_mhz"):
+            load_config(path)
+
+
 def _with_node_line(extra: str, tmp_path: Path) -> Path:
     return _write(tmp_path, VALID_CONFIG.replace("worker = false", f"worker = false\n{extra}"))
 

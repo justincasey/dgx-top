@@ -11,6 +11,7 @@ import httpx
 
 import config
 from config import NVIDIA_SMI_CMD, SPARK_UNITS
+from simulation import set_clock_lock as simulate_clock_lock
 from simulation import simulate_cluster
 from stats import (
     ClusterStats,
@@ -653,6 +654,48 @@ def _parse_nvidia_smi(output: str) -> Tuple[float, float, float, float, float, f
     return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 
+# GPU clock lock. The driver applies `nvidia-smi -lgc` but offers no way to read
+# it back (no nvidia-smi query field, no NVML getter, no throttle-reason bit),
+# so dgx-top records each lock it applies in a per-user marker and treats the
+# marker as a lock only while it matches the current boot (locks die with a
+# reboot) and the SM clock has never been seen above its ceiling.
+CLOCK_LOCK_FILE = '"$HOME/.cache/dgx-top/gpu-clock-lock"'  # remote shell expression
+_BOOT_ID = "/proc/sys/kernel/random/boot_id"
+# Clocks quantize below the cap (2190 MHz observed under a 2200 ceiling); a
+# clock above ceiling + slack proves the lock is gone (manual -rgc, driver reload).
+CLOCK_LOCK_SLACK_MHZ = 15.0
+_CLOCK_FIELD = re.compile(r"[0-9]{1,5}")
+# ssh_target -> the marker a clock reading contradicted. Sticky: an idle GPU
+# never reaches its ceiling, so a disproved marker must not come back when the
+# load stops. Each apply writes a new marker (it carries the apply time).
+_contradicted_locks: Dict[str, str] = {}
+
+
+def _parse_clock_lock(output: str) -> tuple[float, str]:
+    """``(ceiling MHz, marker)`` from the ``---CLOCK_LOCK---`` section, or
+    ``(0.0, "")`` when there is no valid lock for the current boot.
+
+    The section carries ``boot <current boot id>`` and, when a marker exists,
+    ``lock <min>,<max> <boot id at apply> <apply time>``; the marker string
+    identifies one apply. Total over remote text."""
+    boot = ""
+    lock: list[str] | None = None
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "boot":
+            boot = parts[1]
+        elif len(parts) == 4 and parts[0] == "lock":
+            lock = parts[1:]
+    if not boot or lock is None or lock[1] != boot:
+        return 0.0, ""
+    lo, sep, hi = lock[0].partition(",")
+    if not sep or not _CLOCK_FIELD.fullmatch(lo) or not _CLOCK_FIELD.fullmatch(hi):
+        return 0.0, ""
+    if int(hi) <= 0 or int(lo) > int(hi):
+        return 0.0, ""
+    return float(hi), " ".join(lock)
+
+
 _prev_cpu_ticks: Dict[str, Tuple[int, ...]] = {}
 
 
@@ -792,6 +835,57 @@ async def _ssh_run(target: str, cmd: str) -> str:
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode().strip() or f"ssh exited {proc.returncode}")
     return stdout.decode()
+
+
+def clock_lock_command(max_mhz: int) -> str:
+    """Remote command locking the GPU clocks to ``0,max_mhz`` and, only once
+    that succeeded, recording the lock (boot id + apply time) in the marker.
+    nvidia-smi prints some failures on stdout, so both streams are captured
+    and forwarded to stderr, which ``_ssh_run`` reports."""
+    return (
+        f"out=$(sudo -n nvidia-smi -lgc 0,{int(max_mhz)} 2>&1) || "
+        '{ echo "$out" >&2; exit 1; } ; '
+        'mkdir -p "$HOME/.cache/dgx-top" && '
+        f'printf "0,{int(max_mhz)} %s %s\\n" "$(cat {_BOOT_ID})" "$(date +%s)" '
+        f"> {CLOCK_LOCK_FILE}"
+    )
+
+
+def clock_reset_command() -> str:
+    """Remote command resetting the GPU clocks, then removing the marker."""
+    return (
+        "out=$(sudo -n nvidia-smi -rgc 2>&1) || "
+        '{ echo "$out" >&2; exit 1; } ; '
+        f"rm -f {CLOCK_LOCK_FILE}"
+    )
+
+
+def _error_line(exc: BaseException) -> str:
+    """First non-empty line of an exception's text, else its type name."""
+    for line in str(exc).splitlines():
+        if line.strip():
+            return line.strip()
+    return type(exc).__name__
+
+
+async def set_clock_lock(max_mhz: int | None) -> list[tuple[str, str | None]]:
+    """Lock every configured node's GPU clocks to ``0,max_mhz`` (or reset them
+    when ``max_mhz`` is None), concurrently. Returns ``(label, None)`` per
+    node that succeeded and ``(label, reason)`` per node that failed; one
+    node failing never stops the others, and nothing raises."""
+    units = sorted(SPARK_UNITS.items())
+    if config.SIMULATION_NODES:
+        simulate_clock_lock(max_mhz or 0)
+        return [(str(cfg["label"]), None) for _, cfg in units]
+    cmd = clock_lock_command(max_mhz) if max_mhz else clock_reset_command()
+    results = await asyncio.gather(
+        *(_ssh_run(str(cfg["ssh_target"]), cmd) for _, cfg in units),
+        return_exceptions=True,
+    )
+    return [
+        (str(cfg["label"]), _error_line(r) if isinstance(r, BaseException) else None)
+        for (_, cfg), r in zip(units, results)
+    ]
 
 
 async def _fetch_metrics(engine_url: str) -> str:
@@ -1085,6 +1179,11 @@ def _parse_telemetry_output(stdout: str) -> dict:
                 result[prev_section] = "\n".join(prev_sections)
             prev_section = "thrash_output"
             prev_sections = []
+        elif line == "---CLOCK_LOCK---":
+            if prev_section is not None:
+                result[prev_section] = "\n".join(prev_sections)
+            prev_section = "clock_lock"
+            prev_sections = []
         elif line == "---TOPOLOGY---":
             if prev_section is not None:
                 result[prev_section] = "\n".join(prev_sections)
@@ -1319,6 +1418,7 @@ async def _fetch_telemetry(ssh_target: str) -> dict:
       cpu_stat      — raw /proc/stat lines (parsed by _parse_cpu_cores)
       cpu_temp      — thermal zone temperatures in millidegrees
       thrash_output — 4-line output from memory counters
+      clock_lock    — boot id + dgx-top's lock marker (parsed by _parse_clock_lock)
     Each key is omitted if that section failed.
     """
     cmd = (
@@ -1360,6 +1460,12 @@ async def _fetch_telemetry(ssh_target: str) -> dict:
         'echo "roce:$b:$port:$(cat "$p/counters/port_rcv_data" 2>/dev/null || echo 0):$(cat "$p/counters/port_xmit_data" 2>/dev/null || echo 0):$(cat "$p/rate" 2>/dev/null || echo 0)"; '
         "done; "
         "done; "
+        # SECTION: GPU clock lock marker (read-only; written by the `c` menu).
+        # Kept before TOPOLOGY: the last pipeline decides the SSH exit status.
+        'echo "---CLOCK_LOCK---" ; '
+        f'echo "boot $(cat {_BOOT_ID} 2>/dev/null)" ; '
+        f"f={CLOCK_LOCK_FILE}; "
+        'if [ -r "$f" ]; then echo "lock $(cat "$f")"; fi ; '
         # SECTION: Topology (RoCE/InfiniBand state from sysfs)
         'echo "---TOPOLOGY---" ; '
         "for d in /sys/class/infiniband/*; do "
@@ -1481,6 +1587,17 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
             errors.append(f"GPU: {e}")
     else:
         errors.append("GPU: no data")
+
+    # A recorded clock lock, unless an SM clock reading has disproved that marker.
+    if "clock_lock" in telemetry:
+        try:
+            ceiling, marker = _parse_clock_lock(telemetry["clock_lock"])
+            if ceiling > 0 and s.gpu_clock_mhz > ceiling + CLOCK_LOCK_SLACK_MHZ:
+                _contradicted_locks[ssh_target] = marker
+            elif ceiling > 0 and _contradicted_locks.get(ssh_target) != marker:
+                s.gpu_clock_lock_mhz = ceiling
+        except Exception:
+            pass  # lock stays unknown (0)
 
     # Parse CPU per-core utilization
     if "cpu_stat" in telemetry:

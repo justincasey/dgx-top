@@ -2623,3 +2623,436 @@ async def test_confirms_on_two_nodes_both_keep_their_model_names(tmp_path: Path,
             "http://192.0.2.10:8001",
             "http://192.0.2.11:8001",
         ]
+
+
+# ─── GPU clock lock: waybar chip, card marker, `c` menu ──────────────
+
+
+def _locked(unit: SparkUnitStats, mhz: float) -> SparkUnitStats:
+    unit.gpu_clock_lock_mhz = mhz
+    unit.gpu_clock_mhz = min(unit.gpu_clock_mhz, mhz - 10)
+    return unit
+
+
+async def test_waybar_clock_lock_chip_states(tmp_path: Path, monkeypatch):
+    from app import DGXTop, Waybar
+    from themes import build_palette
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    cases = [
+        ([_unit("head"), _unit("worker", worker=True)], None, None),
+        (
+            [_locked(_unit("head"), 2200), _locked(_unit("worker", worker=True), 2200)],
+            "≤2200 ",
+            "cyan",
+        ),
+        ([_locked(_unit("head"), 2200), _unit("worker", worker=True)], "≤2200 1/2 ", "warn"),
+        (
+            [_locked(_unit("head"), 2400), _locked(_unit("worker", worker=True), 2200)],
+            "≤2200 ",
+            "warn",
+        ),
+        # An offline node neither counts as locked nor as unlocked.
+        (
+            [_locked(_unit("head"), 2200), _unit("worker", worker=True, online=False)],
+            "≤2200 ",
+            "cyan",
+        ),
+    ]
+    for units, chip, role in cases:
+        _stub(monkeypatch, units=units)
+        app = DGXTop()
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.pause()
+            wb = app.query_one("#waybar", Waybar).render()
+            if chip is None:
+                assert "≤" not in wb.plain
+                continue
+            assert f" {chip}" in wb.plain, wb.plain
+            assert "≤2200 1/2" not in wb.plain or chip.endswith("1/2 ")
+            pal = build_palette(app.current_theme)
+            want = pal.cyan if role == "cyan" else pal.warn
+            idx = wb.plain.index("≤")
+            assert any(want.lower() in s.lower() for s in _style_at(wb, idx)), (chip, role)
+
+
+async def test_waybar_clock_lock_chip_sheds_value_first_and_goes_after_gen(
+    tmp_path: Path, monkeypatch
+):
+    from app import DGXTop, Waybar
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch, units=[_locked(_unit("head"), 2200), _locked(_unit("worker", True), 2200)])
+    app = DGXTop()
+    seen = set()
+    async with app.run_test(size=(60, 20)) as pilot:
+        wb = app.query_one("#waybar", Waybar)
+        for width in range(44, 7, -1):
+            await _resize(pilot, width, 20)
+            plain = wb.render().plain
+            full, short = "≤2200" in plain, "≤" in plain
+            kv, gen = "KV 32%" in plain, "tok/s" in plain
+            assert "● 2/2" in plain, (width, plain)  # the online chip is never dropped
+            if not kv:
+                assert not full, (width, plain)  # the value is shed before KV drops
+            if gen:
+                assert short, (width, plain)  # the chip goes only after gen
+            seen.add((full, short, kv, gen))
+    # Every rung of the ladder was observed on the way down.
+    assert {
+        (True, True, True, True),
+        (False, True, True, True),
+        (False, True, False, True),
+        (False, True, False, False),
+        (False, False, False, False),
+    } <= seen
+
+
+def test_lock_segs_prefer_the_value_then_the_marker():
+    from types import SimpleNamespace
+
+    from app import _lock_segs
+
+    pal = SimpleNamespace(dim="dim", cyan="cyan")
+    s = _locked(_unit("head"), 2200)
+    plain = lambda segs: "".join(t.plain for t in segs)  # noqa: E731
+    assert plain(_lock_segs(s, pal, 20, 28)) == " · ≤2200"  # exactly fits
+    assert plain(_lock_segs(s, pal, 20, 27)) == " ≤"
+    assert plain(_lock_segs(s, pal, 20, 22)) == " ≤"
+    assert _lock_segs(s, pal, 20, 21) == []
+    assert _lock_segs(_unit("head"), pal, 0, 200) == []  # nothing recorded, nothing shown
+
+
+async def test_node_card_gpu_row_shows_the_lock_and_leaves_unlocked_rows_alone(
+    tmp_path: Path, monkeypatch
+):
+    from app import DGXTop, NodeBox
+
+    def gpu_line(app, idx):
+        node = app.query_one(f"#node-{idx}", NodeBox).render().plain
+        return next(ln for ln in node.split("\n") if "gpu" in ln).strip("│ ")
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    head = _unit("head")
+    head.gpu_clock_mhz = 2190.0
+    _stub(monkeypatch, units=[head, _unit("worker", worker=True)])
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        before = [gpu_line(app, 0), gpu_line(app, 1)]
+
+    head = _locked(_unit("head"), 2200)
+    head.gpu_clock_mhz = 2190.0
+    _stub(monkeypatch, units=[head, _unit("worker", worker=True)])
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        after = [gpu_line(app, 0), gpu_line(app, 1)]
+
+    assert "≤" not in before[0]
+    assert after[0] == before[0] + " · ≤2200"
+    assert after[1] == before[1]  # the unlocked node's row is untouched
+
+
+def _clock_config(path: Path, ceiling: int | None = None) -> None:
+    _config(path)
+    if ceiling is not None:
+        text = path.read_text().replace("[app]\n", f"[app]\nclock_ceiling_mhz = {ceiling}\n", 1)
+        path.write_text(text)
+
+
+def _clock_stub(monkeypatch, result=None, error: Exception | None = None, gate=None) -> list:
+    """Fake ``set_clock_lock`` recording each call; ``gate`` (an Event) holds
+    the apply in flight until set. Also stubs the startup model-name fetch,
+    whose real HTTP timeout would outlive the notifications under test."""
+    import app as app_module
+
+    calls: list = []
+
+    async def fake_set_clock_lock(max_mhz):
+        calls.append(max_mhz)
+        if gate is not None:
+            await gate.wait()
+        if error is not None:
+            raise error
+        return result if result is not None else [("head", None), ("worker", None)]
+
+    async def no_model_names():
+        return None
+
+    monkeypatch.setattr(app_module, "set_clock_lock", fake_set_clock_lock)
+    monkeypatch.setattr(app_module, "_init_model_names", no_model_names)
+    return calls
+
+
+def _clock_text(app):
+    from textual.widgets import OptionList, Static
+
+    screen = app.screen
+    rows = [
+        (str(option.prompt), option.disabled, option.id)
+        for option in screen.query_one("#clock-list", OptionList).options
+    ]
+    return rows, str(screen.query_one("#clock-hint", Static).content)
+
+
+async def test_clock_menu_locks_the_cluster_after_confirm(tmp_path: Path, monkeypatch):
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml", ceiling=2100)
+    configure(tmp_path / "c.toml")
+    polls = []
+
+    async def fake_poll():
+        polls.append(1)
+        return _cluster([_locked(_unit("head"), 2100), _unit("worker", worker=True)])
+
+    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
+    calls = _clock_stub(monkeypatch)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        await pilot.press("c")  # never stacks a second menu
+        await pilot.press("s")  # nor a scan on top of it
+        await pilot.pause()
+        assert isinstance(app.screen, app_module.ClockScreen)
+        assert len(app.screen_stack) == 2
+
+        rows, hint = _clock_text(app)
+        nodes = [text for text, disabled, oid in rows if oid is None]
+        assert all(disabled for _, disabled, oid in rows if oid is None)
+        assert "head" in nodes[0] and "locked ≤2100" in nodes[0]
+        assert "worker" in nodes[1] and "no lock recorded" in nodes[1]
+        actions = {oid: text for text, _, oid in rows if oid}
+        assert actions == {
+            "lock": "Lock GPU clocks to 0,2100 MHz on 2 nodes",
+            "reset": "Reset GPU clocks on 2 nodes",
+        }
+        assert "Run" not in hint
+
+        await pilot.press("enter")  # the lock action is highlighted first
+        await pilot.pause()
+        _, hint = _clock_text(app)
+        assert "Run sudo -n nvidia-smi -lgc 0,2100 on 2 nodes?" in hint and "[y/n]" in hint
+
+        await pilot.press("n")
+        await pilot.pause()
+        assert "Run" not in _clock_text(app)[1]
+        assert calls == []
+
+        polled = len(polls)
+        await pilot.press("enter")
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert not isinstance(app.screen, app_module.ClockScreen)
+        assert calls == [2100]
+        notes = [(n.message, n.severity) for n in app._notifications]
+        assert ("GPU clocks locked to 0,2100 MHz on 2 nodes", "information") in notes
+        assert len(polls) > polled  # repolled so the tiles show the result
+
+
+async def test_clock_menu_reset_names_each_failed_node(tmp_path: Path, monkeypatch):
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml")
+    configure(tmp_path / "c.toml")
+    _stub(monkeypatch)
+    calls = _clock_stub(
+        monkeypatch, result=[("head", None), ("worker", "sudo: a password is required")]
+    )
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("c")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "Run sudo -n nvidia-smi -rgc on 2 nodes?" in _clock_text(app)[1]
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert calls == [None]
+        notes = [(n.message, n.severity) for n in app._notifications]
+        assert (
+            "GPU clocks reset on 1/2 nodes; worker: sudo: a password is required",
+            "warning",
+        ) in notes
+
+
+async def test_clock_menu_escape_runs_nothing_and_a_failing_apply_keeps_the_app(
+    tmp_path: Path, monkeypatch
+):
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml")
+    configure(tmp_path / "c.toml")
+    _stub(monkeypatch)
+    calls = _clock_stub(monkeypatch, error=RuntimeError("boom"))
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("c")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, app_module.ClockScreen)
+        assert calls == []
+
+        await pilot.press("c")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert app.is_running
+        assert calls == [2200]
+        notes = [(n.message, n.severity) for n in app._notifications]
+        assert (
+            "GPU clocks locked to 0,2200 MHz on 0/2 nodes; head: boom; worker: boom",
+            "warning",
+        ) in notes
+
+
+async def test_clock_menu_refuses_a_second_apply_while_one_is_running(tmp_path: Path, monkeypatch):
+    import asyncio
+
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml")
+    configure(tmp_path / "c.toml")
+    _stub(monkeypatch)
+    gate = asyncio.Event()
+    calls = _clock_stub(monkeypatch, gate=gate)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.press("c")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.press("y")
+        await pilot.pause()
+        assert calls == [2200]  # the lock is in flight on the nodes
+
+        # Interleaved remote steps could leave a marker that disagrees with
+        # the GPU, so no second lock/reset may start until the first lands.
+        await pilot.press("c")
+        await pilot.pause()
+        assert not isinstance(app.screen, app_module.ClockScreen)
+        notes = [(n.message, n.severity) for n in app._notifications]
+        assert ("GPU clock change still running", "warning") in notes
+        app.start_clock_apply(None)
+        await pilot.pause()
+        assert calls == [2200]
+
+        gate.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        assert isinstance(app.screen, app_module.ClockScreen)
+
+
+async def test_lock_outranks_the_sm_clock_when_only_one_fits(tmp_path: Path, monkeypatch):
+    import app as app_module
+    from app import DGXTop, NodeBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#node-0", NodeBox)
+        pal = app_module._palette_for(app)
+        # 37 cells → a 33-cell interior: "gpu 73% · 64°C · 430W" (21) has room
+        # for the clock (+9) or the lock (+8), not both (+17).
+        unlocked = box._interior_rows(_unit("head"), pal, 37, "roomy")[0].plain
+        locked = box._interior_rows(_locked(_unit("head"), 2200), pal, 37, "roomy")[0].plain
+    assert unlocked == "gpu 73% · 64°C · 430W · 2.4GHz"
+    assert locked == "gpu 73% · 64°C · 430W · ≤2200"
+
+
+async def test_clock_menu_steps_the_ceiling_and_applies_the_chosen_value(
+    tmp_path: Path, monkeypatch
+):
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml")  # configured ceiling: 2200
+    configure(tmp_path / "c.toml")
+    # The menu opens on the lowest lock recorded on an online node, not the config.
+    _stub(
+        monkeypatch,
+        units=[_locked(_unit("head"), 2400), _locked(_unit("worker", worker=True), 2100)],
+    )
+    calls = _clock_stub(monkeypatch)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+
+        def lock_option():
+            return next(text for text, _, oid in _clock_text(app)[0] if oid == "lock")
+
+        assert lock_option() == "Lock GPU clocks to 0,2100 MHz on 2 nodes"
+        assert "←→ ceiling ±100 MHz" in _clock_text(app)[1]
+
+        await pilot.press("right", "right", "plus")
+        await pilot.pause()
+        assert lock_option() == "Lock GPU clocks to 0,2400 MHz on 2 nodes"
+        await pilot.press("minus", "left")
+        await pilot.pause()
+        assert lock_option() == "Lock GPU clocks to 0,2200 MHz on 2 nodes"
+        assert app.poll_speeds[app._poll_speed_idx] == 5  # `+`/`-` left polling alone
+
+        # Changing the value drops a confirmation that named the old one.
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "-lgc 0,2200" in _clock_text(app)[1]
+        await pilot.press("right")
+        await pilot.pause()
+        assert "Run" not in _clock_text(app)[1]
+        await pilot.press("y")
+        await pilot.pause()
+        assert calls == []
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "Run sudo -n nvidia-smi -lgc 0,2300 on 2 nodes?" in _clock_text(app)[1]
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    assert calls == [2300]
+    notes = [n.message for n in app._notifications]
+    assert "GPU clocks locked to 0,2300 MHz on 2 nodes" in notes
+
+
+async def test_clock_menu_ceiling_stops_at_the_config_bounds(tmp_path: Path, monkeypatch):
+    import app as app_module
+    from config import CLOCK_CEILING_MAX, CLOCK_CEILING_MIN
+
+    for ceiling, key, edge in (
+        (CLOCK_CEILING_MIN + 50, "left", CLOCK_CEILING_MIN),
+        (CLOCK_CEILING_MAX - 50, "right", CLOCK_CEILING_MAX),
+    ):
+        _clock_config(tmp_path / "c.toml", ceiling=ceiling)
+        configure(tmp_path / "c.toml")
+        _stub(monkeypatch)
+        _clock_stub(monkeypatch)
+        app = app_module.DGXTop()
+        async with app.run_test(size=(132, 40)) as pilot:
+            await pilot.press("c")
+            await pilot.pause()
+            await pilot.press(key, key, key)
+            await pilot.pause()
+            options = {oid: text for text, _, oid in _clock_text(app)[0] if oid}
+            assert options["lock"] == f"Lock GPU clocks to 0,{edge} MHz on 2 nodes"

@@ -12,6 +12,7 @@ Include a concise description, affected version or commit, reproduction steps, a
 - It invokes the local OpenSSH client with non-interactive authentication.
 - SSH host-key verification remains enabled.
 - It executes a fixed read-only telemetry command on configured nodes.
+- Only on an explicit, confirmed `c` clock-menu action does it change a node: `sudo -n nvidia-smi -lgc 0,<ceiling>` or `sudo -n nvidia-smi -rgc` (non-interactive sudo; it never prompts for or handles a password), plus one marker file under the SSH user's `~/.cache/dgx-top/`. The only value interpolated into that command is the integer ceiling, clamped to 1500–2400 MHz (the validated configuration value, stepped in the menu).
 - It performs unauthenticated HTTP GET requests to configured engine endpoints: `/metrics` (vLLM, SGLang and TensorFold), SGLang's `/v1/loads` and `/get_load` load API when metrics are unavailable, and `/v1/models` for served model names.
 - It does not store telemetry, credentials, endpoint responses, or history on disk.
 - Configuration contains connection targets only and should never contain secret material.
