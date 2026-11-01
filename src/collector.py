@@ -844,7 +844,7 @@ def clock_lock_command(max_mhz: int) -> str:
     and forwarded to stderr, which ``_ssh_run`` reports."""
     return (
         f"out=$(sudo -n nvidia-smi -lgc 0,{int(max_mhz)} 2>&1) || "
-        '{ echo "$out" >&2; exit 1; } ; '
+        "{ printf '%s\\n' \"$out\" >&2; exit 1; } ; "
         'mkdir -p "$HOME/.cache/dgx-top" && '
         f'printf "0,{int(max_mhz)} %s %s\\n" "$(cat {_BOOT_ID})" "$(date +%s)" '
         f"> {CLOCK_LOCK_FILE}"
@@ -855,7 +855,7 @@ def clock_reset_command() -> str:
     """Remote command resetting the GPU clocks, then removing the marker."""
     return (
         "out=$(sudo -n nvidia-smi -rgc 2>&1) || "
-        '{ echo "$out" >&2; exit 1; } ; '
+        "{ printf '%s\\n' \"$out\" >&2; exit 1; } ; "
         f"rm -f {CLOCK_LOCK_FILE}"
     )
 
