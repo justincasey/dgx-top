@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -802,7 +803,15 @@ def _parse_memory_thrash_output(output: str) -> dict:
     return result
 
 
-_SSH_CTRL = "/tmp/dgx-top-ssh-%C"
+# One control-socket set per dgx-top process. A shared, fixed path makes this
+# run inherit masters left by earlier runs; a master whose node rebooted under
+# it never notices (no liveness probes) and keeps a socket that accepts
+# connections but never answers, so EVERY call first burns the mux hello
+# timeout (ConnectTimeout, 5 s) before ssh falls back to a fresh connection —
+# a 5.4 s poll instead of 0.2 s, for as long as the stale master lives.
+_SSH_CTRL = f"/tmp/dgx-top-ssh-{os.getpid()}-%C"
+
+SSH_TIMEOUT = 10
 
 
 def _ssh_base_args(target: str) -> list[str]:
@@ -819,6 +828,12 @@ def _ssh_base_args(target: str) -> list[str]:
         f"ControlPath={_SSH_CTRL}",
         "-o",
         "ControlPersist=300",
+        # Probe the far end: a master that outlives a node reboot must die
+        # (~15 s) instead of pinning a half-open session for the whole run.
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=3",
         target,
     ]
 
@@ -831,7 +846,14 @@ async def _ssh_run(target: str, cmd: str) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SSH_TIMEOUT)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # An abandoned client keeps its mux session (and so the master) alive;
+        # kill and reap it before the timeout/cancellation propagates.
+        proc.kill()
+        await proc.wait()
+        raise
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode().strip() or f"ssh exited {proc.returncode}")
     return stdout.decode()

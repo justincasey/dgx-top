@@ -2,6 +2,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -2013,6 +2014,39 @@ class RoceParseTests(unittest.TestCase):
             "h", {("mlx5_0", "2"): (90_000_000_400, 80_000_000_400, 25e9)}, 11.0
         )
         self.assertEqual((rx, tx), (100.0, 100.0))
+
+
+class SSHRunTests(unittest.IsolatedAsyncioTestCase):
+    """The transport must not inherit wedged multiplexing, nor leak clients."""
+
+    def test_control_socket_is_scoped_to_this_process(self):
+        """A socket inherited from an earlier run can be wedged behind a node
+        that rebooted under it; every call then burns ConnectTimeout in the
+        mux hello before falling back to a fresh connection."""
+        args = collector._ssh_base_args("host")
+        self.assertIn(f"ControlPath=/tmp/dgx-top-ssh-{os.getpid()}-%C", args)
+
+    def test_master_liveness_is_probed(self):
+        """Without ServerAlive* a master outliving a node reboot never exits."""
+        args = collector._ssh_base_args("host")
+        self.assertIn("ServerAliveInterval=5", args)
+        self.assertIn("ServerAliveCountMax=3", args)
+
+    async def test_timeout_kills_and_reaps_the_child(self):
+        """A cancelled communicate leaves ssh running, holding its mux session
+        (and the master) open; the timeout must kill and reap it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "pid"
+            cmd = f"echo $$ > {pid_file} && exec sleep 30"
+            with (
+                patch.object(collector, "SSH_TIMEOUT", 0.25),
+                patch.object(collector, "_ssh_base_args", lambda target: ["/bin/sh", "-c"]),
+            ):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await collector._ssh_run("host", cmd)
+            pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
 
 class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
