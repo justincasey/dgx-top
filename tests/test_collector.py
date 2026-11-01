@@ -1,7 +1,12 @@
 import asyncio
+import os
+import subprocess
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 import collector
 from stats import ClusterStats, SparkUnitStats
@@ -2552,3 +2557,251 @@ async def test_older_switch_name_fetch_never_overwrites_a_newer_switch(tmp_path,
     assert await first is False
 
     assert collector._model_names[1] == "SecondModel"
+
+
+# ─── GPU clock lock (detect, apply, reset) ───────────────────────────
+
+BOOT = "5f1d0c6e-0d0e-4c1e-9f3a-2b8d7c6e5a41"
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    [
+        (f"boot {BOOT}\nlock 0,2200 {BOOT} 1761950000\n", 2200.0),
+        (f"lock 0,2400 {BOOT} 7\nboot {BOOT}", 2400.0),  # line order does not matter
+        (f"boot {BOOT}\n", 0.0),  # no marker: nothing recorded
+        (f"boot {BOOT}\nlock 0,2200 another-boot 7\n", 0.0),  # recorded before a reboot
+        (f"lock 0,2200 {BOOT} 7\n", 0.0),  # current boot id unreadable
+        (f"boot \nlock 0,2200 {BOOT} 7\n", 0.0),
+        (f"boot {BOOT}\nlock 0,abc {BOOT} 7\n", 0.0),
+        (f"boot {BOOT}\nlock -1,2200 {BOOT} 7\n", 0.0),
+        (f"boot {BOOT}\nlock 0,0 {BOOT} 7\n", 0.0),
+        (f"boot {BOOT}\nlock 3000,2200 {BOOT} 7\n", 0.0),  # min above max
+        (f"boot {BOOT}\nlock 2200 {BOOT} 7\n", 0.0),  # no min,max pair
+        (f"boot {BOOT}\nlock 0,2200 7\n", 0.0),  # no boot id in the marker
+        (f"boot {BOOT}\nlock 0,2200 {BOOT}\n", 0.0),  # no apply time
+        (f"boot {BOOT}\nlock 0,\u00b2\u00b200 {BOOT} 7\n", 0.0),  # non-ASCII digits
+        (f"boot {BOOT}\nlock 0,999999 {BOOT} 7\n", 0.0),
+        ("", 0.0),
+    ],
+)
+def test_parse_clock_lock_accepts_only_a_current_well_formed_marker(section, expected):
+    ceiling, marker = collector._parse_clock_lock(section)
+    assert ceiling == expected
+    assert bool(marker) == (expected > 0)
+
+
+def test_parse_clock_lock_marker_identifies_one_apply():
+    _, first = collector._parse_clock_lock(f"boot {BOOT}\nlock 0,2200 {BOOT} 100\n")
+    _, again = collector._parse_clock_lock(f"boot {BOOT}\nlock 0,2200 {BOOT} 100\n")
+    _, later = collector._parse_clock_lock(f"boot {BOOT}\nlock 0,2200 {BOOT} 160\n")
+    assert first == again != later
+
+
+def _gpu_line(clock_mhz: float) -> str:
+    return f"73, 10, 1000, 120000, 45.5, 64, {clock_mhz:.0f}, 0x0000000000000000"
+
+
+async def _poll_with_telemetry(telemetry: dict) -> SparkUnitStats:
+    units = {
+        1: {
+            "label": "spark-1",
+            "ssh_target": "tester@spark.test",
+            "vllm_url": "http://spark.test:8000",
+            "worker": False,
+        }
+    }
+    with patch.object(collector, "SPARK_UNITS", units):
+        with patch.object(collector, "_fetch_metrics", AsyncMock(side_effect=OSError("down"))):
+            with patch.object(collector, "fetch_engine_load", AsyncMock(return_value=None)):
+                with patch.object(collector, "_fetch_telemetry", AsyncMock(return_value=telemetry)):
+                    return await collector.poll_unit(1)
+
+
+async def test_poll_unit_publishes_a_recorded_lock_unless_the_clock_contradicts_it(monkeypatch):
+    monkeypatch.setattr(collector, "_contradicted_locks", {})
+    marker = f"boot {BOOT}\nlock 0,2200 {BOOT} 100"
+    # Held under the cap (2190 observed live under a 2200 lock) and at the slack edge.
+    for clock in (2190, 208, 2215):
+        s = await _poll_with_telemetry({"gpu_output": _gpu_line(clock), "clock_lock": marker})
+        assert s.gpu_clock_lock_mhz == 2200.0, clock
+    # Above ceiling + slack: the lock is gone (manual -rgc, driver reload) ...
+    s = await _poll_with_telemetry({"gpu_output": _gpu_line(2216), "clock_lock": marker})
+    assert s.gpu_clock_lock_mhz == 0.0
+    assert s.online
+    # ... and stays gone when the GPU idles again under that same marker.
+    s = await _poll_with_telemetry({"gpu_output": _gpu_line(208), "clock_lock": marker})
+    assert s.gpu_clock_lock_mhz == 0.0
+    # A new apply writes a new marker, which is believed again.
+    fresh = f"boot {BOOT}\nlock 0,2200 {BOOT} 160"
+    s = await _poll_with_telemetry({"gpu_output": _gpu_line(208), "clock_lock": fresh})
+    assert s.gpu_clock_lock_mhz == 2200.0
+
+
+async def test_poll_unit_lock_section_never_changes_availability(monkeypatch):
+    monkeypatch.setattr(collector, "_contradicted_locks", {})
+    for telemetry in (
+        {"gpu_output": _gpu_line(2190)},  # section missing
+        {"gpu_output": _gpu_line(2190), "clock_lock": "garbage\n\x00\nlock"},
+    ):
+        s = await _poll_with_telemetry(telemetry)
+        assert s.gpu_clock_lock_mhz == 0.0
+        assert s.online and s.gpu_clock_mhz == 2190.0
+    # A lock section alone does not make an unreachable GPU look online.
+    s = await _poll_with_telemetry({"clock_lock": f"boot {BOOT}\nlock 0,2200 {BOOT} 100"})
+    assert not s.online
+
+
+async def test_telemetry_reads_the_lock_marker_read_only_in_its_own_section():
+    captured: dict = {}
+
+    async def fake_ssh_run(target, cmd):
+        captured["cmd"] = cmd
+        return (
+            "---ROCE---\nroce:mlx5_0:1:10:20:200 Gb/sec\n"
+            f"---CLOCK_LOCK---\nboot {BOOT}\nlock 0,2200 {BOOT} 100\n"
+            "---TOPOLOGY---\nib:mlx5_0:1:4: ACTIVE:InfiniBand\n"
+        )
+
+    with patch.object(collector, "_ssh_run", side_effect=fake_ssh_run):
+        telemetry = await collector._fetch_telemetry("host")
+
+    cmd = captured["cmd"]
+    assert cmd.count("---CLOCK_LOCK---") == 1
+    assert "sudo" not in cmd and "-lgc" not in cmd
+    # TOPOLOGY stays last: its final pipeline decides the SSH exit status.
+    assert cmd.index("---CLOCK_LOCK---") < cmd.index("---TOPOLOGY---")
+    assert telemetry["roce_output"] == "roce:mlx5_0:1:10:20:200 Gb/sec"
+    assert telemetry["topology_output"] == "ib:mlx5_0:1:4: ACTIVE:InfiniBand"
+    assert collector._parse_clock_lock(telemetry["clock_lock"])[0] == 2200.0
+    assert subprocess.run(["sh", "-n", "-c", cmd]).returncode == 0
+
+
+def _fake_sudo_env(tmp_path, fail: bool) -> dict:
+    """PATH with a fake `sudo` that prints like nvidia-smi (or refuses like
+    `sudo -n` without NOPASSWD), and HOME pointing at ``tmp_path``."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    sudo = bin_dir / "sudo"
+    sudo.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$HOME/sudo.log"\n'
+        + (
+            'echo "sudo: a password is required" >&2; exit 1\n'
+            if fail
+            else 'echo "GPU clocks set for GPU 0000000F:01:00.0"\n'
+        )
+    )
+    sudo.chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(tmp_path)}
+
+
+def test_lock_command_records_the_marker_only_after_nvidia_smi_succeeds(tmp_path):
+    marker = tmp_path / ".cache" / "dgx-top" / "gpu-clock-lock"
+
+    run = subprocess.run(
+        ["sh", "-c", collector.clock_lock_command(2200)],
+        env=_fake_sudo_env(tmp_path, fail=True),
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode != 0
+    assert "a password is required" in run.stderr
+    assert not marker.exists()
+
+    run = subprocess.run(
+        ["sh", "-c", collector.clock_lock_command(2200)],
+        env=_fake_sudo_env(tmp_path, fail=False),
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    content = marker.read_text()
+    assert content.startswith("0,2200 ") and content.split()[-1].isdigit()  # apply time
+    boot_id = Path("/proc/sys/kernel/random/boot_id")
+    if boot_id.exists():  # Linux: the marker the poll reads back is a current lock
+        section = f"boot {boot_id.read_text().strip()}\nlock {content}"
+        assert collector._parse_clock_lock(section)[0] == 2200.0
+    assert (tmp_path / "sudo.log").read_text().splitlines()[-1] == "-n nvidia-smi -lgc 0,2200"
+
+
+def test_reset_command_removes_the_marker_only_after_nvidia_smi_succeeds(tmp_path):
+    marker = tmp_path / ".cache" / "dgx-top" / "gpu-clock-lock"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(f"0,2200 {BOOT} 100\n")
+
+    run = subprocess.run(
+        ["sh", "-c", collector.clock_reset_command()],
+        env=_fake_sudo_env(tmp_path, fail=True),
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode != 0 and "a password is required" in run.stderr
+    assert marker.exists()
+
+    run = subprocess.run(
+        ["sh", "-c", collector.clock_reset_command()],
+        env=_fake_sudo_env(tmp_path, fail=False),
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    assert not marker.exists()
+    assert (tmp_path / "sudo.log").read_text().splitlines()[-1] == "-n nvidia-smi -rgc"
+
+
+async def test_set_clock_lock_reports_each_node_and_never_stops_at_a_failure(monkeypatch):
+    units = {
+        1: {"label": "spark-1", "ssh_target": "head", "vllm_url": "http://h:8000"},
+        2: {"label": "spark-2", "ssh_target": "worker", "vllm_url": "http://w:8000"},
+        3: {"label": "spark-3", "ssh_target": "worker-2", "vllm_url": "http://w2:8000"},
+    }
+    calls: list[tuple[str, str]] = []
+
+    async def fake_ssh_run(target, cmd):
+        calls.append((target, cmd))
+        if target == "worker":
+            raise RuntimeError("\nsudo: a password is required\nsudo: 1 incorrect attempt")
+        if target == "worker-2":
+            raise asyncio.TimeoutError()
+        return ""
+
+    monkeypatch.setattr(collector.config, "SIMULATION_NODES", None)
+    with patch.object(collector, "SPARK_UNITS", units):
+        with patch.object(collector, "_ssh_run", side_effect=fake_ssh_run):
+            locked = await collector.set_clock_lock(2300)
+            calls_lock = list(calls)
+            calls.clear()
+            reset = await collector.set_clock_lock(None)
+
+    assert locked == [
+        ("spark-1", None),
+        ("spark-2", "sudo: a password is required"),
+        ("spark-3", "TimeoutError"),
+    ]
+    assert sorted(t for t, _ in calls_lock) == ["head", "worker", "worker-2"]
+    assert all(cmd == collector.clock_lock_command(2300) for _, cmd in calls_lock)
+    assert [label for label, err in reset if err is None] == ["spark-1"]
+    assert all(cmd == collector.clock_reset_command() for _, cmd in calls)
+
+
+async def test_set_clock_lock_under_simulation_locks_the_simulated_cluster(monkeypatch):
+    import simulation
+
+    units = {1: {"label": "spark-1", "ssh_target": "sim-1", "vllm_url": "http://sim-1:8000"}}
+    ssh = AsyncMock()
+    monkeypatch.setattr(collector.config, "SIMULATION_NODES", 3)
+    try:
+        with patch.object(collector, "SPARK_UNITS", units):
+            with patch.object(collector, "_ssh_run", ssh):
+                assert await collector.set_clock_lock(2200) == [("spark-1", None)]
+                for _ in range(5):
+                    for u in simulation.simulate_cluster(3).units:
+                        assert u.gpu_clock_lock_mhz == 2200.0
+                        assert 0 < u.gpu_clock_mhz <= 2200.0
+                assert await collector.set_clock_lock(None) == [("spark-1", None)]
+                units_after = simulation.simulate_cluster(3).units
+        assert all(u.gpu_clock_lock_mhz == 0.0 for u in units_after)
+        ssh.assert_not_called()
+    finally:
+        simulation.set_clock_lock(0)

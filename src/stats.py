@@ -77,6 +77,10 @@ class SparkUnitStats:
     cpu_cores_util: list[float] = field(default_factory=list)
     # Current GPU SM clock (MHz) from nvidia-smi clocks.current.sm; 0 = unavailable.
     gpu_clock_mhz: float = 0.0
+    # GPU clock ceiling (MHz) dgx-top locked on this node: its marker matches
+    # the current boot and the SM clock has not exceeded it. The driver cannot
+    # read a lock back, so 0 means "no lock recorded", not "unlocked".
+    gpu_clock_lock_mhz: float = 0.0
     # Aggregate RoCE/InfiniBand RX/TX throughput across active ports (bytes/s).
     roce_rx_bps: float = 0.0
     roce_tx_bps: float = 0.0

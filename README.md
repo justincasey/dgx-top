@@ -17,7 +17,8 @@
 - The engine serving each model (`vllm` / `sglang` / `tensorfold` badge), detected from its own metrics
 - Time-to-first-token p50–p95, with the tail taking warn past 2s and an `!!`
   alarm past 8s
-- GPU utilization, temperature, SM clock, memory, and power draw
+- GPU utilization, temperature, SM clock, memory, and power draw, plus the
+  clock ceiling dgx-top locked on each node (`≤2200`)
 - CPU utilization, temperature, and per-core activity
 - Memory-pressure and thrashing risk from Linux PSI, swap, reclaim, and fault counters
 - InfiniBand/RoCE link state and throughput (RX/TX rates and wire utilization) derived from sysfs without requiring `ibstat`
@@ -59,7 +60,7 @@ and KV percentage read like vLLM's. It states no block pool, no token
 capacity, no prefix-cache hit rate and no inter-token latency, so those rows
 paint `—` rather than a zero nobody measured.
 
-`dgx-top` never needs an SSH password, private key contents, sudo credentials, or an API token in its configuration.
+`dgx-top` never needs an SSH password, private key contents, sudo credentials, or an API token in its configuration. Monitoring is read-only; the one action that changes a node — locking or resetting the GPU clock ceiling from the `c` menu — runs `sudo -n nvidia-smi` and so needs passwordless sudo for `nvidia-smi` on the nodes (see [GPU clock ceiling](#gpu-clock-ceiling)).
 
 ## Quick start
 
@@ -152,6 +153,7 @@ worker = true
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
 | `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
+| `clock_ceiling_mhz` | Default GPU clock ceiling in MHz for the `c` menu, applied as `nvidia-smi -lgc 0,<ceiling>`, from 1500 to 2400 (default 2200); the menu opens on the recorded lock instead when the nodes have one |
 
 The SSH target and engine URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
 
@@ -373,6 +375,56 @@ the scan lists them all and you choose which one the tile follows. The
 engine binds (an IP where the config says a hostname, say) lists its own live
 endpoint as `new`; confirming it simply writes the equivalent URL.
 
+## GPU clock ceiling
+
+Press `c` for the clocks menu. It lists each node's recorded lock and offers
+two actions for the whole cluster:
+
+```text
+ CLOCKS · ceiling 0,2200 MHz · 4 nodes
+ spark-1  locked ≤2200  2.2GHz now
+ spark-2  no lock recorded  2.5GHz now
+ spark-3  offline
+ spark-4  locked ≤2200  208MHz now
+ Lock GPU clocks to 0,2200 MHz on 4 nodes
+ Reset GPU clocks on 4 nodes
+ ↑↓ select · ←→ ceiling ±100 MHz · enter apply · esc close
+```
+
+`enter` asks `Run sudo -n nvidia-smi -lgc 0,2200 on 4 nodes? [y/n]` (or
+`-rgc` for reset); `y` runs it on every node at once, then one notification
+reports the result — `GPU clocks locked to 0,2200 MHz on 4 nodes`, or which
+nodes failed and why (`spark-2: sudo: a password is required`). While a lock or
+reset is still running, `c` says so instead of opening a second one.
+
+`←`/`→` (or `-`/`+`) move the ceiling down or up 100 MHz at a time, between
+1500 and 2400 MHz; the title and the lock action follow, and `enter` → `y`
+applies the value shown. Changing it after `enter` drops that confirmation,
+so `y` never applies a value you didn't see. The menu opens on the lock dgx-top
+recorded on the nodes (the lowest one, if they differ), else on
+`clock_ceiling_mhz` (default 2200). The adjusted value is not written to the
+configuration; the next time you open the menu it starts from whatever lock is
+recorded on the nodes.
+
+Once locked, the header shows `≤2200` (with `3/4` in warn when not every
+online node is locked, and the lowest ceiling if they differ), and each node
+card's GPU row ends `· ≤2200`, or just `≤` when the card is too narrow for the
+value. The header chip shrinks to `≤` before any other header stat drops.
+
+How detection works, and its limit: the NVIDIA driver has no way to read a
+`-lgc` lock back — no `nvidia-smi` query field, no NVML call. So when a lock
+succeeds, dgx-top writes a marker to `~/.cache/dgx-top/gpu-clock-lock` on the
+node (the ceiling, the boot id and the time). Each poll reads it in the same
+SSH call as the other telemetry. The marker counts as a lock only for the
+boot it was written in, since locks reset on reboot. It also stops counting,
+for good, the first time the GPU is seen clocking above the ceiling (+15 MHz),
+which is what happens after a manual `nvidia-smi -rgc` or a driver reload.
+**A lock applied by hand (`sudo nvidia-smi -lgc …`) is not detected**: the
+node shows `no lock recorded` until you apply it from the menu. The lock and
+reset run `sudo -n`, which never prompts. A node without passwordless sudo for
+`nvidia-smi` reports the sudo error and is left unchanged. Under
+`--simulate`, the menu locks the simulated cluster and no SSH is used.
+
 ## Synthetic data
 
 Run a whole cluster offline with no SSH or engine access:
@@ -394,6 +446,7 @@ still applies.
 | `-` | Poll slower         |
 | `r` | Refresh immediately |
 | `s` | Scan the nodes for inference endpoints (see [Finding inference endpoints](#finding-inference-endpoints)) |
+| `c` | Lock or reset the GPU clock ceiling on every node (see [GPU clock ceiling](#gpu-clock-ceiling)) |
 | `t` | Open the fuzzy theme picker (see [Themes](#switching-themes-while-running)) |
 | `q` | Quit                |
 

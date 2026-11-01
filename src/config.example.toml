@@ -17,6 +17,12 @@ chart = "oscilloscope"
 # Quiet mode: calm the whole UI — identity hues render neutral and colour
 # appears only on caution/critical. Composes with any meter treatment.
 quiet = false
+# Default GPU clock ceiling (MHz) for the `c` clocks menu, which applies it as
+# `sudo -n nvidia-smi -lgc 0,<ceiling>` on every node (needs passwordless sudo
+# for nvidia-smi on the nodes; nothing else in dgx-top uses sudo). The menu
+# opens on the lock already recorded on the nodes, if any, and ←/→ move it in
+# 100 MHz steps before applying.
+clock_ceiling_mhz = 2200
 
 # ssh_target accepts either user@host or an alias from ~/.ssh/config.
 # vllm_url is the inference-engine base URL, accessed directly from the machine

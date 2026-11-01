@@ -57,6 +57,11 @@ braille-fill line chart."""
 MAX_NODES = 12
 """Largest cluster dgx-top displays (one or more Sparks)."""
 
+CLOCK_CEILING_MIN = 1500
+CLOCK_CEILING_MAX = 2400
+"""Bounds (MHz) of ``app.clock_ceiling_mhz`` and of the `c` menu's ceiling: the
+menu only locks a ceiling from 1500 to 2400 MHz."""
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -67,6 +72,8 @@ class Settings:
     meter_treatment: str = "gradient"
     chart: str = "oscilloscope"
     quiet: bool = False
+    # GPU clock ceiling (MHz) the `c` menu applies: nvidia-smi -lgc 0,<ceiling>.
+    clock_ceiling_mhz: int = 2200
 
 
 def _parse_theme(app: dict, override: str | None) -> str:
@@ -149,9 +156,9 @@ def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
     )
 
 
-def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, bool]:
+def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, bool, int]:
     """Validate the ``[app]`` block and return (poll_interval, history_length,
-    theme, meter_treatment, chart, quiet)."""
+    theme, meter_treatment, chart, quiet, clock_ceiling_mhz)."""
     app = raw.get("app", {})
     if not isinstance(app, dict):
         raise ConfigError("[app] must be a TOML table")
@@ -172,6 +179,13 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, b
     quiet = app.get("quiet", False)
     if not isinstance(quiet, bool):
         raise ConfigError("app.quiet must be true or false")
+    ceiling = app.get("clock_ceiling_mhz", 2200)
+    # bools fall outside the range too
+    if not isinstance(ceiling, int) or not CLOCK_CEILING_MIN <= ceiling <= CLOCK_CEILING_MAX:
+        raise ConfigError(
+            f"app.clock_ceiling_mhz must be an integer from {CLOCK_CEILING_MIN} "
+            f"to {CLOCK_CEILING_MAX}"
+        )
     return (
         poll_interval,
         history_length,
@@ -179,6 +193,7 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, b
         meter_treatment,
         chart,
         quiet,
+        ceiling,
     )
 
 

@@ -18,8 +18,22 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 import discovery
-from collector import _init_model_names, poll_cluster, refresh_unit_model_name, set_unit_endpoint
-from config import ConfigError, config_path, default_config_path, get_settings, save_node_endpoint
+from collector import (
+    _init_model_names,
+    poll_cluster,
+    refresh_unit_model_name,
+    set_clock_lock,
+    set_unit_endpoint,
+)
+from config import (
+    CLOCK_CEILING_MAX,
+    CLOCK_CEILING_MIN,
+    ConfigError,
+    config_path,
+    default_config_path,
+    get_settings,
+    save_node_endpoint,
+)
 from input_driver import ResilientLinuxDriver
 from stats import ClusterStats, SparkUnitStats
 from themes import CUSTOM_THEMES, SERIES_HUES, Palette, blend_toward, build_palette, series_hue
@@ -718,17 +732,27 @@ class Waybar(Static):
             style=f"bold {pal.ok}" if online == total else f"bold {pal.warn}",
         )
         badge = Text(" ! ", style=f"bold {pal.bg} on {pal.warn}") if risky else Text("")
+        lock_full, lock_short = _lock_chips(c, pal)
+        lock = lock_full
         # The online chip is the last thing kept; KV drops before gen, and the
         # centred title drops before any stat — so the base serving stats (gen,
-        # KV, online) always survive the compressed/table layouts.
+        # KV, online) always survive the compressed/table layouts. A clock-lock
+        # chip first sheds its value, and goes only after gen.
         stats = [gen, kv, chip]
         avail = width - badge.cell_len
-        for idx in (1, 0):  # drop KV before gen; the chip is never dropped
-            if sum(s.cell_len for s in stats) <= avail:
+        steps = (["shrink"] if lock_full else []) + ["kv", "gen"] + (["lock"] if lock_full else [])
+        for step in steps:
+            if sum(s.cell_len for s in stats) + (lock.cell_len if lock else 0) <= avail:
                 break
-            if idx < len(stats):
-                stats.pop(idx)
-        right = Text.assemble(*stats)
+            if step == "shrink":
+                lock = lock_short
+            elif step == "kv":
+                stats.remove(kv)
+            elif step == "gen":
+                stats.remove(gen)
+            else:
+                lock = None
+        right = Text.assemble(*([lock] if lock else []), *stats)
         title = f"{topo} · {model}"
         midw = width - badge.cell_len - right.cell_len
         if midw >= 4:
@@ -739,6 +763,47 @@ class Waybar(Static):
         else:
             out = Text.assemble(badge, right)
         return _fit(out, width)
+
+
+CLOCK_STEP_MHZ = 100
+"""One ``←``/``→`` press in the clocks menu moves the ceiling this far."""
+
+
+def _lock_label(mhz: float) -> str:
+    """A GPU clock ceiling as the waybar/card show it: ``≤2200``."""
+    return f"≤{mhz:.0f}"
+
+
+def _lock_chips(c: ClusterStats, pal: Palette) -> tuple[Text | None, Text | None]:
+    """(full, short) waybar clock-lock chips, or (None, None) when no online
+    node has a recorded lock. Full: ``≤2200`` when every online node is
+    locked at one ceiling, else the lowest ceiling plus ``locked/online`` in
+    warn. Short: ``≤`` alone."""
+    online = [u for u in c.units if u.online]
+    locks = [u.gpu_clock_lock_mhz for u in online if u.gpu_clock_lock_mhz > 0]
+    if not locks:
+        return None, None
+    partial = len(locks) < len(online)
+    uniform = len(set(locks)) == 1 and not partial
+    style = f"bold {pal.cyan}" if uniform else f"bold {pal.warn}"
+    text = f" {_lock_label(min(locks))}"
+    if partial:
+        text += f" {len(locks)}/{len(online)}"
+    return Text(text + " ", style=style), Text(" ≤ ", style=style)
+
+
+def _lock_segs(s: SparkUnitStats, pal: Palette, used: int, iw: int) -> list[Text]:
+    """Clock-lock segments for a node's GPU row after ``used`` cells of an
+    ``iw``-cell interior: `` · ≤2200`` when it fits, `` ≤`` when only the
+    marker fits, nothing when neither fits or no lock is recorded."""
+    if s.gpu_clock_lock_mhz <= 0:
+        return []
+    full = _lock_label(s.gpu_clock_lock_mhz)
+    if used + 3 + len(full) <= iw:
+        return [Text(" · ", style=pal.dim), Text(full, style=pal.cyan)]
+    if used + 2 <= iw:
+        return [Text(" ≤", style=pal.cyan)]
+    return []
 
 
 # ─── Shared metric formatting (ported from the AEON row grammar) ──────
@@ -1639,6 +1704,7 @@ class NodeBox(Static):
                     Text(" · ", style=pal.dim),
                     Text(f"{s.temp_c:.0f}°", style=_temp_style(s.temp_c, pal)),
                 ]
+            segs += _lock_segs(s, pal, sum(t.cell_len for t in segs), max(1, width - 4))
             rows.append(Text.assemble(*segs))
         else:
             rows.append(Text.assemble(Text("g ", style=pal.dim), dash))
@@ -1691,16 +1757,18 @@ class NodeBox(Static):
             ]
             if s.power_w > 0:
                 segs += [Text(" · ", style=pal.dim), Text(f"{s.power_w:.0f}W", style=pal.accent)]
-            # Add the SM clock only when it fits beside the headline stats;
-            # at narrow tile widths power/temperature outrank the clock.
+            # A recorded clock lock outranks the SM clock: its room is reserved
+            # first, then the clock is added only when it still fits beside the
+            # headline stats (at narrow widths power/temperature outrank it).
+            lock = _lock_segs(s, pal, sum(t.cell_len for t in segs), iw)
             if s.gpu_clock_mhz > 0:
-                base_len = sum(t.cell_len for t in segs)
+                base_len = sum(t.cell_len for t in segs + lock)
                 if base_len + 3 + len(_fmt_freq(s.gpu_clock_mhz)) <= iw:
                     segs += [
                         Text(" · ", style=pal.dim),
                         Text(_fmt_freq(s.gpu_clock_mhz), style=pal.accent),
                     ]
-            rows.append(Text.assemble(*segs))
+            rows.append(Text.assemble(*segs, *lock))
             rows.append(
                 _meter_line(_treatment(self), s.gpu_util_pct, mw, pal, pal.blue, self._gpu_history)
             )
@@ -2155,6 +2223,162 @@ class ScanScreen(ModalScreen[None]):
         self.dismiss()
 
 
+class ClockScreen(ModalScreen[None]):
+    """GPU clock ceiling menu (``c``): lock every configured node's GPU clocks
+    to ``0,<ceiling>`` or reset them, after a ``y`` confirmation. ``←``/``→``
+    (or ``-``/``+``) move the ceiling in ``CLOCK_STEP_MHZ`` steps first.
+
+    Node rows show each node's recorded lock from the latest poll (the
+    driver cannot read a lock back, so a lock applied outside dgx-top reads
+    as "no lock recorded"). Like the scan, the apply is handed to an app
+    worker so it finishes after this window closes."""
+
+    DEFAULT_CSS = """
+    ClockScreen { align: center middle; }
+    #clock-box {
+        width: 72; max-width: 95%; height: auto; max-height: 90%;
+        border: round $accent; background: $surface; padding: 0 1;
+    }
+    #clock-title { height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #clock-list { height: auto; max-height: 20; border: none; background: $surface; }
+    #clock-hint { height: auto; }
+    """
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("y", "confirm", "Yes", show=False),
+        Binding("n", "decline", "No", show=False),
+        # Screen bindings outrank the app's `+`/`-` (poll speed) while open.
+        Binding("right,plus", "ceiling(1)", "Ceiling up", show=False),
+        Binding("left,minus", "ceiling(-1)", "Ceiling down", show=False),
+    ]
+
+    def __init__(self, ceiling_mhz: int) -> None:
+        super().__init__()
+        # Prefixed: plain `_nodes`-style names shadow Textual DOM internals.
+        self._clock_ceiling = ceiling_mhz
+        self._clock_pending: str | None = None  # "lock" | "reset"
+        self._clock_applying = False
+        self._clock_seen: ClusterStats | None = None
+
+    def compose(self):
+        with Vertical(id="clock-box"):
+            yield Static(id="clock-title")
+            yield OptionList(id="clock-list")
+            yield Static(id="clock-hint")
+
+    def on_mount(self) -> None:
+        self._render_rows()
+        self.query_one("#clock-list", OptionList).focus()
+        # Node rows follow the dashboard's polls (it keeps polling underneath).
+        self.set_interval(1.0, self._refresh_rows)
+
+    def _refresh_rows(self) -> None:
+        if self.app.cluster is not self._clock_seen:
+            self._render_rows()
+
+    def _noun(self) -> str:
+        n = len(self.app.settings.nodes)
+        return f"{n} node{'s' if n != 1 else ''}"
+
+    def _node_row(self, pal: Palette, label: str, unit: SparkUnitStats | None) -> Text:
+        row = Text(label, style=f"bold {pal.fg}")
+        if unit is None:
+            row.append("  waiting for a poll", style=pal.dim)
+        elif not unit.online:
+            row.append("  offline", style=pal.warn)
+        else:
+            if unit.gpu_clock_lock_mhz > 0:
+                row.append(f"  locked {_lock_label(unit.gpu_clock_lock_mhz)}", style=pal.cyan)
+            else:
+                row.append("  no lock recorded", style=pal.dim)
+            if unit.gpu_clock_mhz > 0:
+                row.append(f"  {_fmt_freq(unit.gpu_clock_mhz)} now", style=pal.dim)
+        return row
+
+    def _render_rows(self) -> None:
+        pal = _palette_for(self.app)
+        cluster = self._clock_seen = self.app.cluster
+        units = cluster.units if cluster is not None else []
+        nodes = self.app.settings.nodes
+        pad = max((len(node.label) for node in nodes), default=0)
+        option_list = self.query_one("#clock-list", OptionList)
+        held = option_list.highlighted_option
+        keep = held.id if held is not None and held.id in ("lock", "reset") else "lock"
+        options = [
+            Option(
+                self._node_row(pal, node.label.ljust(pad), units[i] if i < len(units) else None),
+                disabled=True,
+            )
+            for i, node in enumerate(nodes)
+        ]
+        # Action rows carry no styled spans: the highlight bar is accent-coloured.
+        options.append(
+            Option(f"Lock GPU clocks to 0,{self._clock_ceiling} MHz on {self._noun()}", id="lock")
+        )
+        options.append(Option(f"Reset GPU clocks on {self._noun()}", id="reset"))
+        option_list.set_options(options)
+        option_list.highlighted = option_list.get_option_index(keep)
+        title = Text("CLOCKS", style=f"bold {pal.accent}")
+        title.append(f" · ceiling 0,{self._clock_ceiling} MHz · {self._noun()}", style=pal.dim)
+        self.query_one("#clock-title", Static).update(title)
+        self._render_hint()
+
+    def _render_hint(self) -> None:
+        pal = _palette_for(self.app)
+        hint = Text()
+        if self._clock_pending is not None:
+            flag = f"-lgc 0,{self._clock_ceiling}" if self._clock_pending == "lock" else "-rgc"
+            hint.append(
+                f"Run sudo -n nvidia-smi {flag} on {self._noun()}? ", style=f"bold {pal.fg}"
+            )
+            if config_path() is None:
+                hint.append("Simulation: no SSH  ", style=pal.dim)
+            hint.append("[y/n]", style=f"bold {pal.cyan}")
+        else:
+            hint.append(
+                f"↑↓ select · ←→ ceiling ±{CLOCK_STEP_MHZ} MHz · enter apply · esc close",
+                style=pal.dim,
+            )
+        self.query_one("#clock-hint", Static).update(hint)
+
+    def action_ceiling(self, steps: int) -> None:
+        """Move the ceiling ``steps`` × ``CLOCK_STEP_MHZ`` within the config
+        bounds. A pending confirmation is dropped: it named the old value."""
+        if self._clock_applying:
+            return
+        ceiling = min(
+            CLOCK_CEILING_MAX, max(CLOCK_CEILING_MIN, self._clock_ceiling + steps * CLOCK_STEP_MHZ)
+        )
+        if ceiling == self._clock_ceiling:
+            self.app.bell()
+            return
+        self._clock_ceiling = ceiling
+        self._clock_pending = None
+        self._render_rows()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id in ("lock", "reset") and not self._clock_applying:
+            self._clock_pending = event.option.id
+            self._render_hint()
+
+    def action_confirm(self) -> None:
+        if self._clock_pending is None or self._clock_applying:
+            return
+        self._clock_applying = True
+        max_mhz = self._clock_ceiling if self._clock_pending == "lock" else None
+        # The app owns the apply: it must finish after this screen goes away.
+        self.app.start_clock_apply(max_mhz)
+        self.dismiss()
+
+    def action_decline(self) -> None:
+        if self._clock_pending is not None and not self._clock_applying:
+            self._clock_pending = None
+            self._render_hint()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
 class DGXTop(App):
     """DGX Spark Cluster Inference Monitor — tiling desktop."""
 
@@ -2164,9 +2388,9 @@ class DGXTop(App):
         background: $background;
         overflow-y: hidden;
     }
-    /* `Screen` above also matches the scan modal; keep the dashboard
-       visible (dimmed) behind it while it keeps polling. */
-    ScanScreen { background: $background 60%; }
+    /* `Screen` above also matches the app's modals; keep the dashboard
+       visible (dimmed) behind them while it keeps polling. */
+    ScanScreen, ClockScreen { background: $background 60%; }
 
     #waybar { height: 1; padding: 0; text-wrap: nowrap; text-overflow: clip; }
 
@@ -2207,6 +2431,7 @@ class DGXTop(App):
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "scan", "Scan"),
+        Binding("c", "clocks", "Clocks"),
     ]
 
     cluster: reactive[ClusterStats | None] = reactive(None)
@@ -2239,6 +2464,7 @@ class DGXTop(App):
         self._pad = 0
         self._sw = 0
         self._nw = 0
+        self._clock_busy = False  # a clock lock/reset is running on the nodes
 
     def get_driver_class(self):
         """Use resilient input unless Textual selected an explicit driver."""
@@ -2611,9 +2837,63 @@ class DGXTop(App):
         self.run_worker(self._poll())
 
     def action_scan(self):
-        """Open the one-shot endpoint scan (never stacks a second one)."""
-        if not isinstance(self.screen, ScanScreen):
+        """Open the one-shot endpoint scan (never stacks on an app modal)."""
+        if not isinstance(self.screen, (ScanScreen, ClockScreen)):
             self.push_screen(ScanScreen(self.settings.nodes))
+
+    def action_clocks(self):
+        """Open the GPU clock ceiling menu (never stacks on an app modal, and
+        never while an earlier lock/reset is still running on the nodes)."""
+        if isinstance(self.screen, (ScanScreen, ClockScreen)):
+            return
+        if self._clock_busy:
+            self.notify("GPU clock change still running", severity="warning")
+            return
+        self.push_screen(ClockScreen(self._clock_start_ceiling()))
+
+    def _clock_start_ceiling(self) -> int:
+        """The ceiling the clocks menu opens on: the lowest lock recorded on an
+        online node (what the waybar shows), else ``clock_ceiling_mhz``."""
+        units = self.cluster.units if self.cluster is not None else []
+        locks = [u.gpu_clock_lock_mhz for u in units if u.online and u.gpu_clock_lock_mhz > 0]
+        if not locks:
+            return self.settings.clock_ceiling_mhz
+        return min(CLOCK_CEILING_MAX, max(CLOCK_CEILING_MIN, int(min(locks))))
+
+    def start_clock_apply(self, max_mhz: int | None) -> None:
+        """Run ``apply_clock_lock`` in an app worker, one at a time: two
+        overlapping applies interleave their remote steps per node and can
+        leave a marker that disagrees with the GPU."""
+        if self._clock_busy:
+            return
+        self._clock_busy = True
+        self.run_worker(self.apply_clock_lock(max_mhz), group="clock-apply")
+
+    async def apply_clock_lock(self, max_mhz: int | None) -> None:
+        """Lock every node's GPU clocks to ``0,max_mhz`` (reset when None),
+        notify the per-node outcome and repoll. Runs in an app worker, so no
+        exception may escape (a failed worker exits the app)."""
+        try:
+            results = await set_clock_lock(max_mhz)
+        except Exception as exc:  # set_clock_lock is total; keep the app alive regardless
+            reason = str(exc).strip() or type(exc).__name__
+            results = [(node.label, reason) for node in self.settings.nodes]
+        finally:
+            self._clock_busy = False
+        failed = [(label, err) for label, err in results if err is not None]
+        n = len(results)
+        what = f"locked to 0,{max_mhz} MHz" if max_mhz else "reset"
+        if not failed:
+            sim = " (simulation)" if config_path() is None else ""
+            message = f"GPU clocks {what} on {n} node{'s' if n != 1 else ''}{sim}"
+            severity = "information"
+        else:
+            reasons = "; ".join(f"{label}: {err}" for label, err in failed)
+            message = f"GPU clocks {what} on {n - len(failed)}/{n} nodes; {reasons}"
+            severity = "warning"
+        log.info("clocks: %s", message)
+        self.notify(message, severity=severity)
+        self._request_poll()
 
     async def apply_endpoint(self, unit_id: int, endpoint: discovery.Endpoint) -> None:
         """Monitor ``endpoint`` on node ``unit_id`` (1-based) from now on and

@@ -105,6 +105,9 @@ class Simulator:
         ]
         s.cpu_temp_c = self._bounded(45.0 + base_cpu * 0.18 + self._drift[i] * 3.0, 38.0, 88.0)
         s.gpu_clock_mhz = self._bounded(2100.0 + gpu * 3.5 + self._drift[i] * 80.0, 900.0, 2900.0)
+        if _clock_lock_mhz > 0:
+            s.gpu_clock_lock_mhz = _clock_lock_mhz
+            s.gpu_clock_mhz = min(s.gpu_clock_mhz, _clock_lock_mhz)
         s.roce_rx_bps = self._roce_rate(i) * 1e6
         s.roce_tx_bps = self._roce_rate(i) * 0.4e6
         s.roce_capacity_bps = _ROCE_CAPACITY_BPS
@@ -147,6 +150,13 @@ class Simulator:
 
 
 _simulator: Simulator | None = None
+_clock_lock_mhz = 0.0  # cluster-wide simulated lock (`c` menu); 0 = none
+
+
+def set_clock_lock(max_mhz: float) -> None:
+    """Lock (``max_mhz`` > 0) or reset (0) every simulated node's GPU clock."""
+    global _clock_lock_mhz
+    _clock_lock_mhz = float(max_mhz)
 
 
 def simulate_cluster(n: int) -> ClusterStats:
