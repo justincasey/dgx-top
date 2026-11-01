@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import subprocess
 import time
 import unittest
@@ -2677,6 +2678,15 @@ async def test_telemetry_reads_the_lock_marker_read_only_in_its_own_section():
     assert subprocess.run(["sh", "-n", "-c", cmd]).returncode == 0
 
 
+# The remote login shell is unknown: Ubuntu's `sh` is dash, macOS's is bash.
+# dash's `echo` treats a leading `-n` as a flag and expands backslash escapes
+# (`\c` truncates), so the commands must behave the same under each.
+SHELLS = [sh for sh in ("sh", "dash", "bash") if shutil.which(sh)]
+# A refusal carrying a backslash escape: forwarded through `echo` under dash,
+# it would arrive cut short at the `\c`.
+REFUSAL = "sudo: a password is required \\c (sudo -n)"
+
+
 def _fake_sudo_env(tmp_path, fail: bool) -> dict:
     """PATH with a fake `sudo` that prints like nvidia-smi (or refuses like
     `sudo -n` without NOPASSWD), and HOME pointing at ``tmp_path``."""
@@ -2685,32 +2695,34 @@ def _fake_sudo_env(tmp_path, fail: bool) -> dict:
     sudo = bin_dir / "sudo"
     sudo.write_text(
         "#!/bin/sh\n"
-        'echo "$@" >> "$HOME/sudo.log"\n'
+        # printf, not echo: dash's echo eats a leading `-n` (the first argument).
+        'printf \'%s\\n\' "$*" >> "$HOME/sudo.log"\n'
         + (
-            'echo "sudo: a password is required" >&2; exit 1\n'
+            f"printf '%s\\n' '{REFUSAL}' >&2; exit 1\n"
             if fail
-            else 'echo "GPU clocks set for GPU 0000000F:01:00.0"\n'
+            else "printf '%s\\n' 'GPU clocks set for GPU 0000000F:01:00.0'\n"
         )
     )
     sudo.chmod(0o755)
     return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(tmp_path)}
 
 
-def test_lock_command_records_the_marker_only_after_nvidia_smi_succeeds(tmp_path):
+@pytest.mark.parametrize("shell", SHELLS)
+def test_lock_command_records_the_marker_only_after_nvidia_smi_succeeds(tmp_path, shell):
     marker = tmp_path / ".cache" / "dgx-top" / "gpu-clock-lock"
 
     run = subprocess.run(
-        ["sh", "-c", collector.clock_lock_command(2200)],
+        [shell, "-c", collector.clock_lock_command(2200)],
         env=_fake_sudo_env(tmp_path, fail=True),
         capture_output=True,
         text=True,
     )
     assert run.returncode != 0
-    assert "a password is required" in run.stderr
+    assert REFUSAL in run.stderr  # forwarded intact
     assert not marker.exists()
 
     run = subprocess.run(
-        ["sh", "-c", collector.clock_lock_command(2200)],
+        [shell, "-c", collector.clock_lock_command(2200)],
         env=_fake_sudo_env(tmp_path, fail=False),
         capture_output=True,
         text=True,
@@ -2722,32 +2734,39 @@ def test_lock_command_records_the_marker_only_after_nvidia_smi_succeeds(tmp_path
     if boot_id.exists():  # Linux: the marker the poll reads back is a current lock
         section = f"boot {boot_id.read_text().strip()}\nlock {content}"
         assert collector._parse_clock_lock(section)[0] == 2200.0
-    assert (tmp_path / "sudo.log").read_text().splitlines()[-1] == "-n nvidia-smi -lgc 0,2200"
+    assert (tmp_path / "sudo.log").read_text().splitlines() == [
+        "-n nvidia-smi -lgc 0,2200",
+        "-n nvidia-smi -lgc 0,2200",
+    ]
 
 
-def test_reset_command_removes_the_marker_only_after_nvidia_smi_succeeds(tmp_path):
+@pytest.mark.parametrize("shell", SHELLS)
+def test_reset_command_removes_the_marker_only_after_nvidia_smi_succeeds(tmp_path, shell):
     marker = tmp_path / ".cache" / "dgx-top" / "gpu-clock-lock"
     marker.parent.mkdir(parents=True)
     marker.write_text(f"0,2200 {BOOT} 100\n")
 
     run = subprocess.run(
-        ["sh", "-c", collector.clock_reset_command()],
+        [shell, "-c", collector.clock_reset_command()],
         env=_fake_sudo_env(tmp_path, fail=True),
         capture_output=True,
         text=True,
     )
-    assert run.returncode != 0 and "a password is required" in run.stderr
+    assert run.returncode != 0 and REFUSAL in run.stderr
     assert marker.exists()
 
     run = subprocess.run(
-        ["sh", "-c", collector.clock_reset_command()],
+        [shell, "-c", collector.clock_reset_command()],
         env=_fake_sudo_env(tmp_path, fail=False),
         capture_output=True,
         text=True,
     )
     assert run.returncode == 0, run.stderr
     assert not marker.exists()
-    assert (tmp_path / "sudo.log").read_text().splitlines()[-1] == "-n nvidia-smi -rgc"
+    assert (tmp_path / "sudo.log").read_text().splitlines() == [
+        "-n nvidia-smi -rgc",
+        "-n nvidia-smi -rgc",
+    ]
 
 
 async def test_set_clock_lock_reports_each_node_and_never_stops_at_a_failure(monkeypatch):
