@@ -228,6 +228,74 @@ def test_engine_reaches_the_collector_units(tmp_path: Path):
         configure(_write(tmp_path))
 
 
+def test_node_log_key_is_optional_and_validated(tmp_path: Path):
+    # Absent: auto-detect.
+    assert load_config(_write(tmp_path)).nodes[0].log is None
+
+    for good in ("off", "docker:engine-1", "docker:a.b_c-d", "/srv/engine/logs/rank-0.log"):
+        assert load_config(_with_node_line(f'log = "{good}"', tmp_path)).nodes[0].log == good
+    assert load_config(_with_node_line('log = " OFF "', tmp_path)).nodes[0].log == "off"
+
+    # The value reaches a remote shell command: anything outside the grammar is refused.
+    for bad in (
+        '"docker:"',
+        '"docker:-x"',
+        '"docker:a b"',
+        '"docker:a;rm -rf /"',
+        '"docker:a\\nb"',
+        '"relative/rank-0.log"',
+        '"~/rank-0.log"',
+        '"/srv/a\\nb.log"',
+        '"/srv/a\\u0000b.log"',
+        '""',
+        "3",
+        "true",
+    ):
+        with pytest.raises(ConfigError, match=r"nodes\[1\]\.log"):
+            load_config(_with_node_line(f"log = {bad}", tmp_path))
+
+
+def test_phys_gib_validation(tmp_path: Path):
+    assert load_config(_write(tmp_path)).phys_gib == 128
+
+    path = tmp_path / "phys.toml"
+    for good in (16, 96, 4096):
+        path.write_text(_with_app_line(f"phys_gib = {good}"))
+        assert load_config(path).phys_gib == good
+
+    for bad in ('"128"', "true", "15", "4097", "0", "-128", "128.0"):
+        path.write_text(_with_app_line(f"phys_gib = {bad}"))
+        with pytest.raises(ConfigError, match="phys_gib"):
+            load_config(path)
+
+
+def test_log_and_phys_gib_reach_the_collector_units(tmp_path: Path):
+    import config as cfg
+    from config import configure
+
+    text = VALID_CONFIG.replace("worker = false", 'worker = false\nlog = "docker:engine-1"')
+    text = text.replace("poll_interval = 3", "poll_interval = 3\nphys_gib = 96")
+    configure(_write(tmp_path, text))
+    try:
+        assert cfg.SPARK_UNITS[1]["log"] == "docker:engine-1"
+        assert cfg.SPARK_UNITS[1]["phys_gib"] == 96
+    finally:
+        configure(_write(tmp_path))
+
+
+def test_save_node_endpoint_keeps_the_log_key(tmp_path: Path):
+    from config import save_node_endpoint
+
+    text = SCAN_CONFIG.replace("[[nodes]]", '[[nodes]]\nlog = "/srv/engine/logs/rank-0.log"', 1)
+    path = tmp_path / "config.toml"
+    path.write_text(text)
+
+    save_node_endpoint(path, 1, "head", "http://head:8001", "vllm")
+
+    assert load_config(path).nodes[0].log == "/srv/engine/logs/rank-0.log"
+    assert load_config(path).nodes[1].log is None
+
+
 def test_declared_engines_match_the_collector_profiles():
     """``config.ENGINES`` gates the declared value and
     ``collector.ENGINE_PROFILES`` parses the same engine family, so a profile

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -2858,3 +2859,314 @@ async def test_set_clock_lock_under_simulation_locks_the_simulated_cluster(monke
         ssh.assert_not_called()
     finally:
         simulation.set_clock_lock(0)
+
+
+# ─── Memory plan from the engine's startup log ───────────────────────
+
+REAL_FETCH_STACK_LOG = collector._fetch_stack_log
+GIB = 1024**3
+
+VLLM_LOG = (
+    "(Worker_TP0 pid=11) INFO 01-02 03:04:05 [gpu_model_runner.py:1] "
+    "Model loading took 70.00 GiB memory and 100.0 seconds\n"
+    "(Worker_TP0 pid=11) INFO 01-02 03:04:06 [gpu_worker.py:2] Available KV cache memory: 20.00 GiB\n"
+    "(Worker_TP0 pid=11) INFO 01-02 03:04:07 [gpu_model_runner.py:3] "
+    "Graph capturing finished in 2 secs, took 0.50 GiB\n"
+    "(APIServer pid=1) INFO 01-02 03:04:08 [api_server.py:4] Starting vLLM server\n"
+    # a later launch: smaller model, new KV pool, a negative graph delta
+    "(Worker_TP0 pid=22) INFO 01-03 03:04:05 [gpu_model_runner.py:1] "
+    "Model loading took 60.94 GiB memory and 176.2 seconds\n"
+    "(Worker_TP0 pid=22) INFO 01-03 03:04:06 [gpu_worker.py:2] Available KV cache memory: 37.46 GiB\n"
+    "(Worker_TP0 pid=22) INFO 01-03 03:04:07 [gpu_model_runner.py:3] "
+    "Graph capturing finished in 2 secs, took -0.31 GiB\n"
+)
+
+SGLANG_LOG = (
+    "[2026-01-02 03:04:05 TP0 EP0] Load weight end. elapsed=364.18 s, type=ExampleForCausalLM, "
+    "quant=fp8, avail mem=40.10 GB, mem usage=71.63 GB.\n"
+    "[2026-01-02 03:04:06 TP0 EP0] Load weight end. elapsed=61.79 s, type=ExampleForCausalLMDraft, "
+    "quant=fp8, avail mem=38.15 GB, mem usage=2.05 GB.\n"
+    "[2026-01-02 03:04:07 TP0] KV Cache is allocated. dtype: torch.float8_e4m3fn, "
+    "#tokens: 239596, K size: 1.83 GB, V size: 1.83 GB\n"
+    "[2026-01-02 03:04:08 TP0] Capture cuda graph end. Time elapsed: 12.00 s. "
+    "mem usage=0.75 GB. avail mem=30.00 GB.\n"
+)
+
+TENSORFOLD_LOG = (
+    "[tensorfold] CUDA sm_121 device 0 (Example GPU, memory shared with the host): model 81.62 GiB; "
+    "1 stream at once, the engine's own and 0 more taking 551 pages of 512 rows (13.30 GiB) as they "
+    "need them (enough for one at a 281600-token window), 48 MiB fixed each, of 26.4 GiB left "
+    "after a 6.0 GiB reserve; prompts in passes of up to 4096 rows, a 2.0 GiB prompt cache\n"
+)
+
+# A vLLM launch that pins the pool with kv_cache_memory_bytes: the profiler's
+# "Available KV cache memory" line never appears.
+VLLM_KV_BYTES_LOG = (
+    "(Worker_TP0 pid=153) INFO 11-05 04:31:22 [model_runner.py:522] "
+    "Model loading took 71.67 GiB memory and 33.966811 seconds\n"
+    "(Worker_TP0 pid=153) INFO 11-05 04:31:41 [gpu_worker.py:711] Initial free memory "
+    "111.45 GiB, reserved 10.5 GiB memory for KV Cache as specified by kv_cache_memory_bytes "
+    "config and skipped memory profiling.\n"
+    "(Worker_TP0 pid=153) INFO 11-05 04:31:51 [model_runner.py:1452] "
+    "Graph capturing finished in 9 secs, took 0.02 GiB\n"
+)
+
+
+def test_parse_stack_log_vllm_latest_launch_wins_and_negative_graph_clamps():
+    # The older launch's larger model is still in the window: weights are the
+    # largest load figure seen, KV and graphs the last one.
+    weights, kv, graphs = collector._parse_stack_log(VLLM_LOG)
+    assert weights == 70 * GIB
+    assert kv == int(37.46 * GIB)
+    assert graphs == 0
+
+
+def test_parse_stack_log_vllm_older_build_wording_and_ansi():
+    text = (
+        "\x1b[36m(Worker_TP0 pid=1)\x1b[0m INFO 01-02 03:04:05 [model_runner.py:374] "
+        "Model loading took 82.01 GiB and 323.66 seconds\n"
+        "\x1b[36m(Worker_TP0 pid=1)\x1b[0m INFO 01-02 03:04:07 [model_runner.py:9] "
+        "Graph capturing finished in 38 secs, took 1.01 GiB\n"
+    )
+    assert collector._parse_stack_log(text) == (int(82.01 * GIB), 0, int(1.01 * GIB))
+
+
+def test_parse_stack_log_sglang_ignores_drafter_and_sums_k_and_v():
+    weights, kv, graphs = collector._parse_stack_log(SGLANG_LOG)
+    assert weights == int(71.63 * GIB)
+    assert kv == int((1.83 + 1.83) * GIB)
+    assert graphs == int(0.75 * GIB)
+
+
+def test_parse_stack_log_tensorfold_has_no_graphs():
+    assert collector._parse_stack_log(TENSORFOLD_LOG) == (int(81.62 * GIB), int(13.30 * GIB), 0)
+
+
+def test_parse_stack_log_vllm_kv_cache_memory_bytes_pool():
+    assert collector._parse_stack_log(VLLM_KV_BYTES_LOG) == (
+        int(71.67 * GIB),
+        int(10.5 * GIB),
+        int(0.02 * GIB),
+    )
+
+
+def test_parse_stack_log_only_the_last_sixteen_matching_lines_count():
+    old = "(Worker_TP0 pid=1) INFO x [a.py:1] Model loading took 99.00 GiB memory and 1 seconds\n"
+    filler = "(Worker_TP0 pid=2) INFO x [a.py:2] Available KV cache memory: 5.00 GiB\n"
+    noise = "unrelated line\n" * 50
+    text = old + noise + filler * 16
+    # 16 matching lines after the old load: it fell out of the window.
+    assert collector._parse_stack_log(text) == (0, 5 * GIB, 0)
+    assert collector._parse_stack_log(old + filler * 15)[0] == 99 * GIB
+
+
+@pytest.mark.parametrize("text", ["", "no engine here\n", "Model loading took lots\n", "\x1b[0m\n"])
+def test_parse_stack_log_no_match_is_zeros(text):
+    assert collector._parse_stack_log(text) == (0, 0, 0)
+
+
+@pytest.mark.skipif(shutil.which("grep") is None, reason="grep required")
+def test_stack_log_pattern_selects_exactly_the_lines_the_parser_reads():
+    lines = [
+        line
+        for line in (VLLM_LOG + VLLM_KV_BYTES_LOG + SGLANG_LOG + TENSORFOLD_LOG).splitlines()
+        if "Starting vLLM server" not in line
+    ]
+    decoys = [
+        "Model loading took many seconds",
+        "Available KV cache memory: unknown",
+        "reserved 10.5 GiB memory for something else",
+        "KV Cache is allocated.",
+        "Load weight end. elapsed=1 s, no usage",
+        "[tensorfold] listening on :8000",
+        "(Worker_TP0 pid=1) INFO Starting to load model",
+    ]
+    out = subprocess.run(
+        ["grep", "-a", "-E", collector._STACK_LOG_PATTERN],
+        input="\n".join(decoys + lines + decoys) + "\n",
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert out == lines
+
+
+def test_stack_log_command_per_mode():
+    assert collector._stack_log_command("off", 8000) is None
+    pattern = collector._STACK_LOG_PATTERN
+
+    file_cmd = collector._stack_log_command("/srv/engine/logs/rank-0.log", 8000)
+    assert file_cmd == (
+        f"grep -a -E {shlex.quote(pattern)} /srv/engine/logs/rank-0.log | tail -n 16"
+    )
+
+    docker_cmd = collector._stack_log_command("docker:engine-1", 8000)
+    assert docker_cmd == (
+        f"docker logs engine-1 2>&1 | grep -a -E {shlex.quote(pattern)} | tail -n 16"
+    )
+
+    auto = collector._stack_log_command(None, 8000)
+    assert 'ss -H -ltnp "sport = :8000"' in auto
+    assert "readlink" in auto and "/proc/$pid/fd/1" in auto
+    assert '[ -f "$f" ]' in auto  # only a regular file is grepped
+    assert auto.endswith("; true")  # nothing found is success, not an ssh failure
+    for cmd in (file_cmd, docker_cmd, auto):
+        assert subprocess.run(["sh", "-n", "-c", cmd]).returncode == 0
+
+
+def test_stack_log_command_quotes_hostile_values():
+    hostile_docker = collector._stack_log_command("docker:x; touch /tmp/pwned #", 80)
+    hostile_file = collector._stack_log_command("/srv/a b/$(touch pwned)'.log", 80)
+    assert shlex.split(hostile_docker)[:3] == ["docker", "logs", "x; touch /tmp/pwned #"]
+    # the hostile path is one argv element of grep, never shell syntax
+    argv = shlex.split(hostile_file.split(" | ")[0])
+    assert argv[-1] == "/srv/a b/$(touch pwned)'.log"
+    assert len(argv) == 5
+
+
+@pytest.mark.skipif(shutil.which("grep") is None, reason="grep required")
+def test_stack_log_command_runs_for_a_file_and_keeps_the_last_sixteen(tmp_path):
+    log = tmp_path / "rank 0.log"
+    log.write_text(
+        "boot noise\n"
+        + "".join(
+            f"(Worker_TP0 pid=1) INFO x [a.py:1] Available KV cache memory: {i}.00 GiB\n"
+            for i in range(1, 21)
+        )
+    )
+    cmd = collector._stack_log_command(str(log), 8000)
+    out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=True).stdout
+    assert len(out.splitlines()) == 16
+    assert collector._parse_stack_log(out) == (0, 20 * GIB, 0)
+
+
+@pytest.mark.parametrize(
+    "url, port",
+    [
+        ("http://example.com:8000", 8000),
+        ("http://example.com", 80),
+        ("https://example.com", 443),
+        ("https://example.com:8443", 8443),
+        ("http://example.com:99999", 80),
+    ],
+)
+def test_endpoint_port(url, port):
+    assert collector._endpoint_port(url) == port
+
+
+async def test_fetch_stack_log_caches_results_and_failures_for_the_ttl(monkeypatch):
+    monkeypatch.setattr(collector, "_stack_log_cache", {})
+    clock = [1000.0]
+    monkeypatch.setattr(collector.time, "monotonic", lambda: clock[0])
+    ssh = AsyncMock(return_value=VLLM_LOG)
+    monkeypatch.setattr(collector, "_ssh_run", ssh)
+
+    first = await REAL_FETCH_STACK_LOG("node-a", None, 8000)
+    assert first == (70 * GIB, int(37.46 * GIB), 0)
+    clock[0] += collector.STACK_LOG_TTL - 1
+    assert await REAL_FETCH_STACK_LOG("node-a", None, 8000) == first
+    assert ssh.await_count == 1
+    # another node, port or log is its own entry
+    await REAL_FETCH_STACK_LOG("node-b", None, 8000)
+    await REAL_FETCH_STACK_LOG("node-a", None, 8001)
+    await REAL_FETCH_STACK_LOG("node-a", "/srv/engine/logs/rank-0.log", 8000)
+    assert ssh.await_count == 4
+    # expiry re-reads
+    clock[0] += 2
+    await REAL_FETCH_STACK_LOG("node-a", None, 8000)
+    assert ssh.await_count == 5
+
+    # a failure is the zero plan and is cached too: no ssh per poll
+    ssh.reset_mock(side_effect=True)
+    ssh.side_effect = RuntimeError("ssh: connection refused")
+    clock[0] += 1000
+    assert await REAL_FETCH_STACK_LOG("node-a", None, 8000) == (0, 0, 0)
+    assert await REAL_FETCH_STACK_LOG("node-a", None, 8000) == (0, 0, 0)
+    assert ssh.await_count == 1
+
+
+async def test_fetch_stack_log_off_never_opens_ssh(monkeypatch):
+    monkeypatch.setattr(collector, "_stack_log_cache", {})
+    ssh = AsyncMock(return_value=VLLM_LOG)
+    monkeypatch.setattr(collector, "_ssh_run", ssh)
+    assert await REAL_FETCH_STACK_LOG("node-a", "off", 8000) == (0, 0, 0)
+    ssh.assert_not_awaited()
+
+
+async def test_set_unit_endpoint_drops_the_units_cached_log(tmp_path, monkeypatch):
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    host = collector.SPARK_UNITS[1]["ssh_target"]
+    monkeypatch.setattr(
+        collector,
+        "_stack_log_cache",
+        {(host, None, 8000): (1.0, (1, 2, 3)), ("other-host", None, 8000): (1.0, (4, 5, 6))},
+    )
+    collector.set_unit_endpoint(1, "http://192.0.2.10:8001", None)
+    assert list(collector._stack_log_cache) == [("other-host", None, 8000)]
+
+
+def _plan_units(log=None, phys_gib=96):
+    return {
+        1: {
+            "label": "spark-1",
+            "ssh_target": "tester@spark.test",
+            "vllm_url": "http://spark.test:8000",
+            "worker": False,
+            "log": log,
+            "phys_gib": phys_gib,
+        }
+    }
+
+
+async def _poll_plan(fetch, telemetry):
+    with patch.object(collector, "SPARK_UNITS", _plan_units()):
+        with patch.object(collector, "_fetch_metrics", AsyncMock(side_effect=OSError("down"))):
+            with patch.object(collector, "fetch_engine_load", AsyncMock(return_value=None)):
+                with patch.object(collector, "_fetch_telemetry", AsyncMock(return_value=telemetry)):
+                    with patch.object(collector, "_fetch_stack_log", fetch):
+                        return await collector.poll_unit(1)
+
+
+def _thrash_output() -> str:
+    # MemTotal 100 GiB, MemAvailable 40 GiB (kB); layout as MemoryThrashParseTests
+    return (
+        "33554432 10737418 1048576 41943040 10485760 104857600\n"
+        "1200 800 450 0 5 0 0 150000 118500 200 300\n"
+        "0.05 2800000\n"
+        "0.02 1200000\n"
+    )
+
+
+async def test_poll_unit_fills_the_memory_plan_when_the_log_yields_one():
+    telemetry = {"gpu_output": _gpu_line(2190), "thrash_output": _thrash_output()}
+    probe = AsyncMock(return_value=(60 * GIB, 20 * GIB, GIB))
+    s = await _poll_plan(probe, telemetry)
+    assert s.mem_total_bytes == 100 * GIB
+    assert (s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes) == (
+        60 * GIB,
+        20 * GIB,
+        GIB,
+    )
+    assert s.mem_phys_bytes == 96 * GIB
+    probe.assert_awaited_once_with("tester@spark.test", None, 8000)
+
+
+async def test_poll_unit_without_memory_reading_leaves_the_plan_unset():
+    probe = AsyncMock(return_value=(60 * GIB, 20 * GIB, GIB))
+    s = await _poll_plan(probe, {"gpu_output": _gpu_line(2190)})
+    assert s.online
+    assert (s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes, s.mem_phys_bytes) == (
+        0,
+        0,
+        0,
+        0,
+    )
+
+
+async def test_poll_unit_survives_a_failing_log_read_through_the_real_fetch(monkeypatch):
+    monkeypatch.setattr(collector, "_stack_log_cache", {})
+    monkeypatch.setattr(collector, "_ssh_run", AsyncMock(side_effect=OSError("ssh: no route")))
+    telemetry = {"gpu_output": _gpu_line(2190), "thrash_output": _thrash_output()}
+    s = await _poll_plan(REAL_FETCH_STACK_LOG, telemetry)
+    assert s.online
+    assert (s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes) == (0, 0, 0)

@@ -28,6 +28,19 @@ def test_simulate_cluster_returns_online_hosted_finite_units():
         assert all(math.isfinite(v) for v in u.cpu_cores_util)
 
 
+def test_simulated_units_carry_a_memory_plan_below_measured_use():
+    from simulation import simulate_cluster
+    from stats import mem_stack
+
+    for _ in range(3):
+        for u in simulate_cluster(12).units:
+            assert u.mem_phys_bytes == 128 * 1024**3 > u.mem_total_bytes
+            plan = u.mem_weights_bytes + u.mem_kv_pool_bytes + u.mem_graphs_bytes
+            assert u.mem_weights_bytes > 0 and u.mem_kv_pool_bytes > 0 and u.mem_graphs_bytes > 0
+            assert plan < u.mem_used_bytes
+            assert mem_stack(u) is not None
+
+
 def test_simulate_cluster_evolves_between_polls():
     from simulation import simulate_cluster
 
