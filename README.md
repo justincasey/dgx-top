@@ -219,11 +219,17 @@ btop-style caret tab, with a right-edge meta tab flush at the corner:
 
 The caret and role are cyan for the host, orange for a worker; the SERVING
 title carries the model in magenta, and every window border is dim grey. The
-**waybar** rides the top and is the **only chrome**: a warn marker when a node
-is unreachable or hot, the centred model/topology, gen `tok/s`, KV% and the
-`● online/total` chip, each giving way (drop-to-fit) before the base serving
-stats disappear. The footer status bar is dropped at every size — the header
-carries gen, KV% and the online count even in the compressed table view.
+**waybar** rides the top and is the **only chrome**: one row with the controls
+left — single-word labels, each hotkey underlined (`s scan`, `+/- poll`,
+`r refresh`, `c clock`, `t theme`, `q quit`) — and the working stats right:
+a warn marker when a node is unreachable or hot, gen `tok/s`, KV%, the
+clock-lock chip and the `● online/total` fleet chip. The legend gives way
+first, shedding entries from its tail, then the stats drop in order (KV before
+gen, the lock chip after gen); the fleet chip is the last thing kept. The
+model still names itself in the SERVING window's title; the topology label
+(`DUAL`/`SWITCHED`) leaves with the header title and is not shown elsewhere.
+The footer status bar is dropped at every size — the header carries gen, KV%
+and the online count even in the compressed table view.
 
 The semantic palette maps every theme onto these roles:
 

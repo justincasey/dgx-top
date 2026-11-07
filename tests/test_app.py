@@ -469,12 +469,80 @@ async def test_waybar_shows_cluster_chrome(tmp_path: Path, monkeypatch):
         wb = app.query_one("#waybar", Waybar)
         text = wb.render()
         plain = text.plain
-        # workspace chips + aggregate temp/power/clock removed; only online count
+        # Controls left, in display order, with single-word labels.
+        assert plain.startswith("s scan   +/- poll   r refresh   c clock   t theme   q quit")
+        # Working stats right, fleet chip flush.
         assert "● 2/2" in plain
+        assert plain.rstrip().endswith("● 2/2")
         assert "°C" not in plain and "W" not in plain
         assert " 2 3" not in plain
-        assert "Qwen3.6-27B-Instruct" in plain
+        # The centred model/topology title is gone: the serving pane names it.
+        assert "Qwen3.6-27B-Instruct" not in plain and "DUAL" not in plain
         assert len(plain) == wb.content_size.width
+
+
+async def test_waybar_legend_sheds_before_stats(tmp_path: Path, monkeypatch):
+    from app import DGXTop, Waybar
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        wb = app.query_one("#waybar", Waybar)
+        expected = {
+            (132, 40): "s scan   +/- poll   r refresh   c clock   t theme   q quit",
+            (80, 40): "s scan   +/- poll   r refresh   c clock   t theme",
+            (60, 40): "s scan   +/- poll   r refresh",
+            (40, 16): "",  # fewer than two entries fit: the legend hides entirely
+        }
+        for (w, h), legend in expected.items():
+            await _resize(pilot, w, h)
+            text = wb.render().plain
+            assert len(text) == wb.content_size.width, (w, text)
+            # The legend never costs the stats a cell: all three survive every
+            # width, and the fleet chip stays flush right.
+            assert "2400 tok/s" in text, (w, text)
+            assert "KV 32%" in text, (w, text)
+            assert text.rstrip().endswith("● 2/2"), (w, text)
+            assert text.startswith(legend), (w, text)
+            if legend:
+                # A two-cell gap separates the legend from the stats.
+                tail = text[len(legend) :]
+                assert tail.startswith("  ") and tail.strip(), (w, text)
+
+
+async def test_waybar_legend_styles_hotkeys(tmp_path: Path, monkeypatch):
+    from app import DGXTop, Waybar
+    from themes import build_palette
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        pal = build_palette(app.current_theme)
+        text = app.query_one("#waybar", Waybar).render()
+        plain = text.plain
+        word = plain.index("scan")
+        key_style = " ".join(_style_at(text, word - 2)).lower()
+        label_style = " ".join(_style_at(text, word)).lower()
+        assert "underline" in key_style and pal.cyan.lower() in key_style, key_style
+        assert pal.dim.lower() in label_style and "underline" not in label_style, label_style
+
+
+def test_waybar_hints_are_live_single_word_bindings():
+    from app import DGXTop, Waybar
+
+    # `+`/`-` are Textual's `plus`/`minus` key names.
+    key_names = {"+": "plus", "-": "minus"}
+    bound = {b.key for b in DGXTop.BINDINGS} | {b.key.split(",")[0] for b in DGXTop.BINDINGS}
+    for key, label in Waybar.HINTS:
+        assert label.isalpha() and " " not in label, label
+        for glyph in key.split("/"):
+            assert key_names.get(glyph, glyph) in bound, key
 
 
 # ─── AC8: CPU frequency renders MHz ──────────────────────────────────
