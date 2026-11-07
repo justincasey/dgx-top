@@ -3,6 +3,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -2913,10 +2914,11 @@ VLLM_KV_BYTES_LOG = (
 
 
 def test_parse_stack_log_vllm_latest_launch_wins_and_negative_graph_clamps():
-    # The older launch's larger model is still in the window: weights are the
-    # largest load figure seen, KV and graphs the last one.
+    # The window holds two launches. The load line after launch 1's plan starts
+    # launch 2, so launch 2 wins (its negative graph delta clamps to 0) and the
+    # older, larger model must not leak into the plan.
     weights, kv, graphs = collector._parse_stack_log(VLLM_LOG)
-    assert weights == 70 * GIB
+    assert weights == int(60.94 * GIB)
     assert kv == int(37.46 * GIB)
     assert graphs == 0
 
@@ -3006,7 +3008,8 @@ def test_stack_log_command_per_mode():
 
     auto = collector._stack_log_command(None, 8000)
     assert 'ss -H -ltnp "sport = :8000"' in auto
-    assert "readlink" in auto and "/proc/$pid/fd/1" in auto
+    assert "readlink" not in auto  # the fd survives a rotated path
+    assert "f=/proc/$pid/fd/1" in auto
     assert '[ -f "$f" ]' in auto  # only a regular file is grepped
     assert auto.endswith("; true")  # nothing found is success, not an ssh failure
     for cmd in (file_cmd, docker_cmd, auto):
@@ -3021,6 +3024,45 @@ def test_stack_log_command_quotes_hostile_values():
     argv = shlex.split(hostile_file.split(" | ")[0])
     assert argv[-1] == "/srv/a b/$(touch pwned)'.log"
     assert len(argv) == 5
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reads /proc/<pid>/fd/1")
+def test_stack_log_auto_detect_reads_the_open_fd(tmp_path):
+    # The default mode resolves the listener's stdout fd. Reading the fd
+    # directly survives the path being unlinked (readlink would then return a
+    # " (deleted)" name and the old command would print nothing).
+    log = tmp_path / "engine.log"
+    log.write_text(VLLM_LOG)
+    with open(log, "ab") as out:  # append: keep the fixture, do not truncate
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=out,
+            stderr=subprocess.DEVNULL,
+        )
+    log.unlink()  # only the child's open fd still names the plan
+    try:
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        fake_ss = bindir / "ss"
+        fake_ss.write_text(
+            "#!/bin/sh\n"
+            "echo 'LISTEN 0 4096 0.0.0.0:8000 0.0.0.0:* "
+            f'users:(("python",pid={proc.pid},fd=1))\'\n'
+        )
+        fake_ss.chmod(0o755)
+        env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+        cmd = collector._stack_log_command(None, 8000)
+        out_text = subprocess.run(
+            ["sh", "-c", cmd], capture_output=True, text=True, env=env, check=True
+        ).stdout
+    finally:
+        proc.kill()
+        proc.wait()
+    assert collector._parse_stack_log(out_text) == (
+        int(60.94 * GIB),
+        int(37.46 * GIB),
+        0,
+    )
 
 
 @pytest.mark.skipif(shutil.which("grep") is None, reason="grep required")
@@ -3061,7 +3103,7 @@ async def test_fetch_stack_log_caches_results_and_failures_for_the_ttl(monkeypat
     monkeypatch.setattr(collector, "_ssh_run", ssh)
 
     first = await REAL_FETCH_STACK_LOG("node-a", None, 8000)
-    assert first == (70 * GIB, int(37.46 * GIB), 0)
+    assert first == (int(60.94 * GIB), int(37.46 * GIB), 0)
     clock[0] += collector.STACK_LOG_TTL - 1
     assert await REAL_FETCH_STACK_LOG("node-a", None, 8000) == first
     assert ssh.await_count == 1

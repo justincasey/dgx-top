@@ -916,10 +916,12 @@ def _parse_stack_log(text: str) -> tuple[int, int, int]:
     """(weights, kv, graphs) bytes from an engine's startup log; 0 = not found.
 
     Understands vLLM, SGLang and TensorFold lines in one pass (the formats do
-    not overlap). Only the last ``STACK_LOG_LINES`` matching lines count — the
-    latest launch wins. Weights are the largest single model-load figure (a
-    draft model loads smaller and is ignored); KV and graphs are the last
-    value seen, graphs clamped at 0 (a capture can report a negative delta)."""
+    not overlap). Only the last ``STACK_LOG_LINES`` matching lines count. A
+    load line after the current launch already contributed plan data starts a
+    new launch, so the window never mixes two: within a launch the weights are
+    the largest load figure (a draft model loads smaller and is ignored), and
+    KV and graphs are the last value seen, graphs clamped at 0 (a capture can
+    report a negative delta)."""
     lines = [line for line in _ANSI_RE.sub("", text).splitlines() if _STACK_LOG_RE.search(line)][
         -STACK_LOG_LINES:
     ]
@@ -943,14 +945,19 @@ def _parse_stack_log(text: str) -> tuple[int, int, int]:
             except ValueError:
                 continue
             if kind == "w":
+                if kv or graphs:
+                    # A load line after this launch's plan data starts the next
+                    # launch: keep the newest, never a mixture.
+                    weights = kv = graphs = 0.0
                 weights = max(weights, nums[0])
             elif kind == "k":
                 kv = sum(nums)
             elif kind == "g":
                 graphs = max(nums[0], 0.0)
             else:
-                weights = max(weights, nums[0])
-                kv = nums[1]
+                # TensorFold states a whole plan on one line: a later line is a
+                # later launch (and logs no graphs).
+                weights, kv, graphs = nums[0], nums[1], 0.0
             break
     return int(weights * _GIB), int(kv * _GIB), int(graphs * _GIB)
 
@@ -959,9 +966,11 @@ def _stack_log_command(log: str | None, port: int) -> str | None:
     """Remote command printing the log lines ``_parse_stack_log`` reads, or
     None when the node's log is switched off (``"off"``).
 
-    ``None`` finds the process listening on ``port`` and reads the file its
-    stdout points at, only when that is a regular file (a pipe or tty has
-    nothing to grep); every config-derived value is shell-quoted."""
+    ``None`` finds the process listening on ``port`` and reads its stdout fd
+    directly (``/proc/<pid>/fd/1``), only when that is a regular file (a pipe
+    or tty has nothing to grep; the fd also survives the path being unlinked —
+    e.g. a pruned rotated log — where ``readlink`` returns a name suffixed
+    " (deleted)"); every config-derived value is shell-quoted."""
     if log == "off":
         return None
     grep = f"grep -a -E {shlex.quote(_STACK_LOG_PATTERN)}"
@@ -970,8 +979,8 @@ def _stack_log_command(log: str | None, port: int) -> str | None:
         return (
             f'pid=$(ss -H -ltnp "sport = :{int(port)}" 2>/dev/null'
             " | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2); "
-            '[ -n "$pid" ] && f=$(readlink "/proc/$pid/fd/1" 2>/dev/null) '
-            f'&& [ -f "$f" ] && {grep} "$f" | {tail}; true'
+            '[ -n "$pid" ] && f=/proc/$pid/fd/1 && [ -f "$f" ] '
+            f'&& {grep} "$f" | {tail}; true'
         )
     if log.startswith("docker:"):
         return f"docker logs {shlex.quote(log[len('docker:') :])} 2>&1 | {grep} | {tail}"

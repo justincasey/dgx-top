@@ -123,6 +123,30 @@ def test_stack_cells_boundary_cells_use_eighth_blocks_not_a_rounded_cell():
     assert any(c in _EIGHTHS for c in bar.plain)
 
 
+def test_stack_cells_boundary_cell_glyph_and_tones():
+    from app import _stack_cells, _stack_tones
+
+    pal = _palette()
+    tone = _stack_tones(pal)
+    # At width 50 (2.56 GiB per cell) the weights/graphs boundary lands in
+    # cell 23 — 1.12 GiB weights over 1.00 GiB graphs — so the glyph is 1/2
+    # (round(1.12 / 2.12 * 8) = 4) with both tones painted.
+    bar = _stack_cells(mem_stack(_unit()), 50, pal)
+    assert bar.plain[23] == "▌"
+    assert _style_at(bar, 23) == f"{tone['weights']} on {tone['graphs']}"
+
+
+def test_stack_legend_drops_whole_items_at_the_width_budget():
+    from app import _stack_legend
+
+    pal = _palette()
+    st = mem_stack(_unit())
+    assert _stack_legend(st, 7, pal).plain == ""  # the first item needs 8
+    assert _stack_legend(st, 8, pal).plain == "■wts 60G"
+    assert _stack_legend(st, 20, pal).plain == "■wts 60G ■kv 12G"  # oth needs 25
+    assert _stack_legend(st, 40, pal).plain.endswith("■gfx 1.0G")
+
+
 def test_stack_cells_kv_pool_shows_measured_fill_and_unfilled_remainder():
     from app import _stack_cells, _stack_tones
 
@@ -190,6 +214,11 @@ async def test_node_card_replaces_mem_meter_with_stack_bar_and_legend(tmp_path: 
         assert "╱" in lines[mem + 1]  # the bar (with its reserved slice) sits under the headline
         assert "■wts" in lines[mem + 2]  # the legend row follows the bar
         assert len(lines) <= _node_tile_rows(app.density, node.size.width, True)
+        # The one invariant this feature changes: a stacked full card reserves
+        # exactly one more row than the same card without the legend.
+        assert _node_tile_rows(app.density, node.size.width, True) == (
+            _node_tile_rows(app.density, node.size.width, False) + 1
+        )
 
 
 async def test_node_card_without_a_plan_keeps_the_plain_mem_meter(tmp_path: Path, monkeypatch):
@@ -247,3 +276,42 @@ async def test_plan_arriving_late_grows_the_node_card_without_clipping(tmp_path:
         node = app.query_one("#node-0", NodeBox)
         rendered = len(node.render().plain.split("\n"))
         assert rendered <= _node_tile_rows(app.density, node.size.width, True)
+        assert _node_tile_rows(app.density, node.size.width, True) == (
+            _node_tile_rows(app.density, node.size.width, False) + 1
+        )
+
+
+async def test_stack_flip_records_one_history_sample_per_poll(tmp_path: Path, monkeypatch):
+    """The legend row arriving re-runs the tier fit; the re-entrant KPI pass
+    must not append the same poll's samples twice."""
+    from app import DGXTop
+
+    _config(tmp_path / "c.toml")
+    configure(tmp_path / "c.toml")
+    _stub(monkeypatch, [_unit("head")])
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.pause()
+        assert app._has_stack
+        assert len(app.history["mem-head"]) == 1
+
+
+async def test_floor_row_keeps_cpu_when_the_mini_bar_does_not_fit(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox
+
+    _config(tmp_path / "c.toml")
+    configure(tmp_path / "c.toml")
+    _stub(monkeypatch, [_unit("head"), _unit("worker", worker=True, plan=(58, 12, 1), used=98)])
+    app = DGXTop()
+    async with app.run_test(size=(70, 12)) as pilot:
+        await pilot.pause()
+        assert app.floor and app.node_mode == "table"
+        wide = app.query_one("#node-0", NodeBox).render().plain
+        assert " 30%" in wide and any(c in wide for c in "█▓╱▏▎▍▌▋▊▉")
+    narrow_app = DGXTop()
+    async with narrow_app.run_test(size=(50, 12)) as pilot:
+        await pilot.pause()
+        assert narrow_app.floor and narrow_app.node_mode == "table"
+        narrow = narrow_app.query_one("#node-0", NodeBox).render().plain
+        assert " 30%" in narrow  # cpu survives; the mini bar is dropped first
+        assert not any(c in narrow for c in "█▓╱▏▎▍▌▋▊▉")

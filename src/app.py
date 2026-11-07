@@ -2587,6 +2587,7 @@ class DGXTop(App):
         self._host_model: str = ""
         self._models_n = 1
         self._has_stack = False  # some node has a memory stack (adds a legend row)
+        self._in_kpis = False  # _update_kpis is re-entered by _apply_tier
         self._model_hue: dict[str, int] = {}
         self._model_hue_miss: dict[str, int] = {}
         self._last_size = (80, 24)
@@ -2774,6 +2775,17 @@ class DGXTop(App):
         self._update_kpis(stats)
 
     def _update_kpis(self, stats: ClusterStats):
+        if self._in_kpis:
+            # _apply_tier() re-enters through _update_ui(); one poll must record
+            # one history sample. The outer call repaints after the tier.
+            return
+        self._in_kpis = True
+        try:
+            self._update_kpis_body(stats)
+        finally:
+            self._in_kpis = False
+
+    def _update_kpis_body(self, stats: ClusterStats):
         units = stats.units
         skipped: list[str] = []
 
