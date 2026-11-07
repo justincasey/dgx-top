@@ -803,8 +803,23 @@ def _slope_row(series: list[tuple[str, str, list[float]]], pal: Palette) -> Text
 
 
 class Waybar(Static):
-    """One-line waybar chrome: mode marker · centred cluster title · gen · KV ·
-    online count (drop-to-fit; the base serving stats survive compression)."""
+    """One-line waybar chrome: the key legend left, the working stats right
+    (gen · KV · clock lock · online count). Both sides drop to fit: the
+    legend sheds single words from its tail before the stats shed anything,
+    so ``tok/s`` and the fleet chip survive compression."""
+
+    #: Legend order, left to right. Each entry is (key glyph, single-word
+    #: label); the labels stay one word so the full legend fits a wide bar.
+    HINTS: tuple[tuple[str, str], ...] = (
+        ("s", "scan"),
+        ("+/-", "poll"),
+        ("r", "refresh"),
+        ("c", "clock"),
+        ("t", "theme"),
+        ("q", "quit"),
+    )
+    HINT_GAP = 3  # blank cells between legend entries
+    HINT_MIN_GAP = 2  # blank cells kept between the legend and the stats
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -816,6 +831,31 @@ class Waybar(Static):
         self._interval = interval
         self.refresh()
 
+    def _fit_hints(self, budget: int, pal: Palette) -> Text:
+        """The key legend, shedding single words from its tail until it fits
+        ``budget`` cells (the stats already hold their space). A legend that
+        cannot keep two entries is noise, so it hides entirely instead."""
+        if budget <= 0:
+            return Text()
+        segs = [
+            Text.assemble(
+                (key, f"bold underline {pal.cyan}"),
+                (" ", pal.dim),
+                (label, pal.dim),
+            )
+            for key, label in self.HINTS
+        ]
+        sep = Text(" " * self.HINT_GAP, style=pal.dim)
+        for keep in range(len(segs), 1, -1):
+            out = Text()
+            for i, seg in enumerate(segs[:keep]):
+                if i:
+                    out.append(sep)
+                out.append(seg)
+            if out.cell_len <= budget:
+                return out
+        return Text()
+
     def render(self) -> Text:
         width = self.content_size.width
         if width <= 0:
@@ -826,9 +866,6 @@ class Waybar(Static):
             return _fit(Text("…"), width)
         online = sum(1 for u in c.units if u.online)
         total = len(c.units)
-        hosted = c.hosted_units
-        model = hosted[0].model_name if hosted and hosted[0].model_name else "…"
-        topo = c.topology.topology_type if c and c.topology else "…"
         risky = any((not u.online) or (u.temp_c >= TEMP_ALERT) for u in c.units)
         # A cluster with no counter-bearing unit stated no rate; "0 tok/s" would
         # be a manufactured reading of a live server, so the segment says so.
@@ -847,10 +884,9 @@ class Waybar(Static):
         badge = Text(" ! ", style=f"bold {pal.bg} on {pal.warn}") if risky else Text("")
         lock_full, lock_short = _lock_chips(c, pal)
         lock = lock_full
-        # The online chip is the last thing kept; KV drops before gen, and the
-        # centred title drops before any stat — so the base serving stats (gen,
-        # KV, online) always survive the compressed/table layouts. A clock-lock
-        # chip first sheds its value, and goes only after gen.
+        # The online chip is the last thing kept; KV drops before gen. A
+        # clock-lock chip first sheds its value, and goes only after gen —
+        # the base serving stats (gen, KV, online) always survive.
         stats = [gen, kv, chip]
         avail = width - badge.cell_len
         steps = (["shrink"] if lock_full else []) + ["kv", "gen"] + (["lock"] if lock_full else [])
@@ -866,15 +902,9 @@ class Waybar(Static):
             else:
                 lock = None
         right = Text.assemble(*([lock] if lock else []), *stats)
-        title = f"{topo} · {model}"
-        midw = width - badge.cell_len - right.cell_len
-        if midw >= 4:
-            mid = title if len(title) <= midw else title[: max(0, midw - 1)] + "…"
-            pad = max(0, midw - len(mid))
-            mid_text = Text(" " * (pad // 2) + mid, style=pal.dim)
-            out = Text.assemble(badge, mid_text, right)
-        else:
-            out = Text.assemble(badge, right)
+        hints = self._fit_hints(width - badge.cell_len - right.cell_len - self.HINT_MIN_GAP, pal)
+        gap = width - badge.cell_len - hints.cell_len - right.cell_len
+        out = Text.assemble(badge, hints, Text(" " * max(0, gap)), right)
         return _fit(out, width)
 
 
