@@ -154,7 +154,7 @@ worker = true
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
 | `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
-| `chart`          | SERVING footer renderer: `area` (default, the four-row ramp chart), `oscilloscope`, or `lines` |
+| `chart`          | SERVING footer renderer: `area` (default, four-row ramp strip), `oscilloscope` or `lines` (both fill the spare height) |
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 | `clock_ceiling_mhz` | Default GPU clock ceiling in MHz for the `c` menu, applied as `nvidia-smi -lgc 0,<ceiling>`, from 1500 to 2400 (default 2200); the menu opens on the recorded lock instead when the nodes have one |
 | `phys_gib`       | Physical memory per node in GiB, from 16 to 4096 (default 128); the part Linux's `MemTotal` does not show counts as reserved |
@@ -307,20 +307,23 @@ narrow right column never densifies the serving surface:
 
 | Tier | Look |
 | --- | --- |
-| `roomy` | The full reference grammar: `gen` / `prompt` / `kv` / `kv%` graphs, requests, cache, ttft, `deploy`, one `rank` row per node, and the four-row area footer; node cards carry the gradient meter, the stack legend and RoCE |
-| `compact` | The `prompt` and `kv%` graphs and the chart drop; SERVING keeps gen/kv/requests/cache/ttft/deploy/rank; node cards keep gpu/mem/bar/cpu/cores and shed the meters, legend and RoCE |
+| `roomy` | The full reference grammar: `gen` / `prompt` / `kv` / `kv%` graphs, requests, cache, ttft, `deploy`, one `rank` row per node, and the chart footer (four rows for `area`, the spare height for `oscilloscope`/`lines`); node cards carry the gradient meter, the stack legend and RoCE |
+| `compact` | The `prompt` and `kv%` graphs and the area chart drop; SERVING keeps gen/kv/requests/cache/ttft/deploy/rank; node cards keep gpu/mem/bar/cpu/cores and shed the meters, legend and RoCE |
 | `rail` | SERVING folds to a fused gen/req/ttft/kv surface (no chart); node cards run gpu/mem/cpu text; the waybar stays visible |
 | `floor` | The never-scroll bottom: each node becomes one **condensed table row** (`● 3  87%  62%  61%`), SERVING to gen/req/ttft, no window frames |
 
-**Fixed footer, no breathing room.** The reference chart is a four-row footer,
-not a fit-computed pane: the row bands are identical at every terminal size and
-surplus height stays at the bottom of the viewport. As the layout densifies,
-lower-value data is dropped rather than crammed: node cards shed the meters and
-RoCE before the bar, then the headline block; the SERVING surface drops the
-prompt and kv% graphs, then the chart, then the deploy/rank block. The base
-surface — node gpu/mem/cpu and serving gen/req/ttft/kv — never disappears at any
-size. With several models served at once, the requests and ttft rows go
-per-model (one row each) while the gen row reports the cluster aggregate.
+**No breathing room.** The `area` footer is a fixed four-row strip, not a
+fit-computed pane: its row bands are identical at every terminal size and
+surplus height stays at the bottom of the viewport. The instrumented renderers
+(`chart = "oscilloscope"` / `"lines"`) are the opposite by design — they fill
+the spare height between their tier bounds, which is what the taller pane is
+for. As the layout densifies, lower-value data is dropped rather than crammed:
+node cards shed the meters and RoCE before the bar, then the headline block;
+the SERVING surface drops the prompt and kv% graphs, then the chart, then the
+deploy/rank block. The base surface — node gpu/mem/cpu and serving
+gen/req/ttft/kv — never disappears at any size. With several models served at
+once, the requests and ttft rows go per-model (one row each) while the gen row
+reports the cluster aggregate.
 
 ## Memory stack
 

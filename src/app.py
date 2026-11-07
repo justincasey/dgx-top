@@ -70,11 +70,14 @@ SERVING_GRAPH_W = 22
 SERVING_RANK_BAR_W = 24
 _TAB_GAP = 3  # rule cells required between a window's title tab and meta tab
 
-# The area chart is a fixed four-row footer in the reference grammar: the
-# tile never grows it, so the row bands stay identical at every terminal size
-# and the fit engine only decides which tier fits. Rail/floor carry no chart.
-CHART_ROWS = 4
-CHART_MIN = {"roomy": CHART_ROWS, "compact": 0, "rail": 0, "floor": 0}
+# The `area` renderer is the reference's fixed four-row footer: it never
+# grows, so the row bands stay identical at every terminal size and the fit
+# engine only decides which tier fits. The instrumented renderers keep their
+# own behaviour — they FILL the leftover height between these bounds, which is
+# the whole point of the taller pane. Rail/floor carry no chart.
+AREA_CHART_ROWS = 4
+CHART_MIN = {"roomy": 5, "compact": 2, "rail": 0, "floor": 0}
+CHART_MAX = {"roomy": 16, "compact": 6, "rail": 0, "floor": 0}
 
 # Interior rows per node tile (borders excluded), matching the reference card:
 # gpu / meter / mem / stack-or-meter / legend-or-nothing / cpu / cores / roce.
@@ -545,17 +548,31 @@ def _stack_legend(stack: MemStack, width: int, pal: Palette) -> Text:
     return out
 
 
+def _resample(data: list[float], width: int) -> list[float]:
+    """Nearest-neighbour resample of a series onto exactly ``width`` columns,
+    preserving order and keeping the newest sample in the last column.
+
+    Unlike ``_stretch`` this also DOWNSAMPLES: a 90-sample history drawn into
+    a 57-cell pane must be compressed, not truncated — truncating kept the
+    oldest 57 samples on screen and pushed the live end of the series past
+    the pane edge."""
+    n = len(data)
+    if n <= 0 or width <= 0:
+        return []
+    return [data[i * n // width] for i in range(width)]
+
+
 def _area_chart_lines(data: list[float], rows: int, width: int, pal: Palette) -> list[Text]:
     """Multi-row block-glyph area chart coloured per column by height, scaled
     from zero to the window's peak (absolute rate, as the reference footer
     plots it — a constant series sits at full height instead of collapsing to
-    a baseline). The history is resampled to the chart width so a short
-    history still fills the window (no blank columns)."""
+    a baseline). The retained history is resampled onto the chart width (both
+    directions), so the pane always shows the whole window newest-at-right."""
     if not data or rows <= 0 or width <= 0:
         return [Text(" " * width) for _ in range(max(0, rows))]
     hi = max(data)
     span = hi if hi > 0 else 1.0
-    norm = [max(0.0, min(1.0, v / span)) for v in _stretch(data, width)]
+    norm = [max(0.0, min(1.0, v / span)) for v in _resample(data, width)]
     blk = " ▁▂▃▄▅▆▇█"
     out: list[Text] = []
     for r in range(rows):
@@ -1936,7 +1953,6 @@ def _serving_base(
     tier: str,
     serv_width: int,
     models: int = 1,
-    chart_rows: int = 1,
     nodes: int = 0,
     stack: bool = False,
 ) -> int:
@@ -1948,7 +1964,7 @@ def _serving_base(
     compact  the same, less the prompt and kv% graphs
     rail   the fused narrow grammar
     floor  the bare base surface
-    narrow  the fused grammar (no chart: ``chart_rows`` is 0 there)
+    narrow  the fused grammar (no chart at that width)
 
     Extra served models add a requests row and a ttft row each."""
     if tier == "rail":
@@ -2038,6 +2054,19 @@ def _serving_height(base: int, chart: int) -> int:
     return base + (1 + chart if chart else 0) + 2
 
 
+def _chart_rows_for(tier: str, chart_mode: str, room: int) -> int:
+    """Chart rows for one tier and renderer given ``room`` spare rows (the
+    spacer already deducted). ``area`` is the reference's fixed footer;
+    ``oscilloscope``/``lines`` fill the leftover height between their bounds,
+    which is what makes the taller pane worth having. 0 = no chart."""
+    if tier in ("rail", "floor") or room <= 0:
+        return 0
+    if chart_mode == "area":
+        # The reference footer is a roomy-tier feature: compact drops it.
+        return AREA_CHART_ROWS if tier == "roomy" and room >= AREA_CHART_ROWS else 0
+    return min(CHART_MAX[tier], max(CHART_MIN[tier], room))
+
+
 def _tier_fit(
     n: int,
     width: int,
@@ -2063,19 +2092,16 @@ def _tier_fit(
             cols = _node_grid_columns(n, nw, tiled)
         tile = _node_tile_rows(tier, -(-nw // cols), stack)
         node_h = _grid_height(n, cols, tile, tier)
-        chart = CHART_MIN[tier] if sw >= SERVING_NARROW_WIDTH else 0
-        base = _serving_base(
-            tier,
-            sw,
-            models,
-            chart_rows=chart,
-            nodes=n,
-            stack=stack,
-        )
+        base = _serving_base(tier, sw, models, nodes=n, stack=stack)
         if tier == "floor":
             serv_h = base
             fits = node_h <= avail and serv_h <= avail
             return fits, cols, node_h, serv_h, 0
+        chart = (
+            0
+            if sw < SERVING_NARROW_WIDTH
+            else _chart_rows_for(tier, chart_mode, avail - (base + 2) - 1)
+        )
         serv_h = _serving_height(base, chart)
         fits = node_h <= avail and serv_h <= avail
         return fits, cols, node_h, serv_h, chart
@@ -2085,20 +2111,13 @@ def _tier_fit(
         cols = _node_grid_columns(n, width, tiled)
     tile = _node_tile_rows(tier, -(-width // cols), stack)
     node_h = _grid_height(n, cols, tile, tier)
-    chart = CHART_MIN[tier] if width >= SERVING_NARROW_WIDTH else 0
-    base = _serving_base(
-        tier,
-        width,
-        models,
-        chart_rows=chart,
-        nodes=n,
-        stack=stack,
-    )
+    base = _serving_base(tier, width, models, nodes=n, stack=stack)
     if tier == "floor":
         serv_h = base  # bare floor lines, no window frame
         fits = serv_h + node_h <= avail
         return fits, cols, node_h, serv_h, 0
-    chart = CHART_MIN[tier]
+    spare = avail - (base + 2 + GRID_GUTTER + node_h) - 1
+    chart = 0 if width < SERVING_NARROW_WIDTH else _chart_rows_for(tier, chart_mode, spare)
     serv_h = _serving_height(base, chart)
     fits = serv_h + GRID_GUTTER + node_h <= avail
     return fits, cols, node_h, serv_h, chart
