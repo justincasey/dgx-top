@@ -12,12 +12,20 @@ from stats import ClusterStats, SparkUnitStats, TopologyInfo
 # ─── fixtures ────────────────────────────────────────────────────────
 
 
-def _config(path: Path, theme: str | None = None, n: int = 2, chart: str | None = None) -> None:
+def _config(
+    path: Path,
+    theme: str | None = None,
+    n: int = 2,
+    chart: str | None = None,
+    meter: str | None = None,
+) -> None:
     lines = ["[app]", "poll_interval = 5", "history_length = 25"]
     if theme:
         lines.append(f'theme = "{theme}"')
     if chart:
         lines.append(f'chart = "{chart}"')
+    if meter:
+        lines.append(f'meter_treatment = "{meter}"')
     lines += [
         "[[nodes]]",
         'label = "head"',
@@ -111,11 +119,13 @@ def _seed_history(app):
     app._update_ui()
 
 
-def _config_cluster(path: Path, n: int, theme: str | None = None) -> None:
+def _config_cluster(path: Path, n: int, theme: str | None = None, chart: str | None = None) -> None:
     """Write a config with ``n`` nodes labelled ``node-1..node-n``."""
     lines = ["[app]", "poll_interval = 5", "history_length = 25"]
     if theme:
         lines.append(f'theme = "{theme}"')
+    if chart:
+        lines.append(f'chart = "{chart}"')
     for i in range(1, n + 1):
         lines += [
             "[[nodes]]",
@@ -191,7 +201,7 @@ async def test_default_theme_and_custom_registration(tmp_path: Path):
     configure(tmp_path / "config.toml")
     app = DGXTop()
     async with app.run_test(size=(132, 40)):
-        assert app.current_theme.name == "dgx-aeon"
+        assert app.current_theme.name == "tokyo-night"
 
 
 # ─── AC1: caret title-in-border header fidelity ──────────────────────
@@ -370,7 +380,7 @@ async def test_density_ladder_steps_down(tmp_path: Path, monkeypatch):
     heights."""
     from app import DGXTop
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", chart="area")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
@@ -393,7 +403,7 @@ async def test_density_ladder_steps_down(tmp_path: Path, monkeypatch):
 async def test_node_meter_is_gradient_kv_is_single_hue(tmp_path: Path, monkeypatch):
     from app import DGXTop, NodeBox, ServingBox
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", meter="gradient")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
@@ -442,7 +452,7 @@ async def test_node_meters_fill_the_tile_interior(tmp_path: Path, monkeypatch):
 async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
     from app import AREA_CHART_ROWS, DGXTop, ServingBox
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", chart="area")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
@@ -986,7 +996,7 @@ async def test_load_only_cluster_paints_no_rate_and_keeps_no_series(tmp_path: Pa
     rate nobody was reporting any more."""
     from app import DGXTop, ServingBox, Waybar
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", chart="area")
     configure(tmp_path / "config.toml")
     units = [
         _load_only(_unit("head"), running=2, waiting=1),
@@ -1528,7 +1538,7 @@ async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
     the tiled roomy tier, then compact, rail and floor."""
     from app import DGXTop
 
-    _config_cluster(tmp_path / "config.toml", 12)
+    _config_cluster(tmp_path / "config.toml", 12, chart="area")
     configure(tmp_path / "config.toml")
     _stub_n(monkeypatch, 12)
     app = DGXTop()
@@ -1611,7 +1621,7 @@ async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
     stretched frame leaves it."""
     from app import DGXTop, NodeBox, ServingBox
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", chart="area")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
@@ -1644,7 +1654,7 @@ async def test_serving_chart_is_a_fixed_footer(tmp_path: Path, monkeypatch):
     space."""
     from app import AREA_CHART_ROWS, DGXTop, ServingBox
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", chart="area")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
@@ -1733,13 +1743,16 @@ async def test_wide_short_pane_puts_the_chart_beside_the_rows(tmp_path: Path, mo
         lines = app.query_one("#serving", ServingBox).render().plain.splitlines()
         body = [ln[2:-2] for ln in lines[1:-1]]
         assert len(body) == 4, body
+
         # every row carries metric text on the left and chart glyphs on the right
-        marks = "▁▂▃▄▅▆▇█⣿⡀⠉⠒⠤┄·◉╱"
-        width = lines[0].cell_len if hasattr(lines[0], "cell_len") else len(lines[0])
+        def is_mark(ch: str) -> bool:
+            return 0x2800 <= ord(ch) <= 0x28FF or ch in "▁▂▃▄▅▆▇█·◉╱┄"
+
+        width = len(lines[0])
         for line in body:
             left, right = line[:ROW_COL_W], line[ROW_COL_W + 1 :]
             assert left.strip() and right.strip(), line
-            assert any(ch in right for ch in marks), line
+            assert any(is_mark(ch) for ch in right) or right.lstrip().startswith("Δ"), line
             assert len(line) < width, (len(line), width)
         assert body[0].startswith("gen ") and body[-1].startswith("kv ")
 
@@ -1751,7 +1764,7 @@ async def test_tiled_serving_frame_spans_the_node_column(tmp_path: Path, monkeyp
     what removing the deploy/rank block did."""
     from app import DGXTop, ServingBox
 
-    _config(tmp_path / "config.toml")
+    _config(tmp_path / "config.toml", chart="area")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()

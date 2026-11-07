@@ -126,7 +126,7 @@ ssh spark-worker true
 [app]
 poll_interval = 5
 history_length = 40
-# theme = "dgx-aeon"  # default; any name from `dgx-top themes` works
+# theme = "tokyo-night"  # default; any name from `dgx-top themes` works
 
 [[nodes]]
 label = "spark-1"
@@ -153,8 +153,8 @@ worker = true
 | `poll_interval`  | Initial polling interval in seconds, from 1 to 60                           |
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
-| `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
-| `chart`          | SERVING footer renderer: `area` (default, four-row ramp strip), `oscilloscope` or `lines` (both fill the spare height) |
+| `meter_treatment`| Style for the GPU / memory / KV% meters: `spark` (default), `gradient`, `tick`, or `line` |
+| `chart`          | SERVING chart renderer: `oscilloscope` (default: graticule, axis, edge markers, Δ slope), `area` (four-row ramp strip) or `lines` (legacy braille); the instrumented renderers fill the spare height and move beside the rows on a wide, short pane |
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 | `clock_ceiling_mhz` | Default GPU clock ceiling in MHz for the `c` menu, applied as `nvidia-smi -lgc 0,<ceiling>`, from 1500 to 2400 (default 2200); the menu opens on the recorded lock instead when the nodes have one |
 | `phys_gib`       | Physical memory per node in GiB, from 16 to 4096 (default 128); the part Linux's `MemTotal` does not show counts as reserved |
@@ -186,10 +186,10 @@ dgx-top --theme tokyo-night-storm
 ```
 
 Every Textual built-in theme is supported out of the box — including the full
-Tokyo Night family — plus the AEON dashboard themes `dgx-aeon` (the default)
-and the classic `dgx-dark`:
+Tokyo Night family — plus the AEON dashboard theme `dgx-aeon` (the
+reference palette) and the classic `dgx-dark`:
 
-- **Dark:** `dgx-aeon` (default), `dgx-dark`, `tokyo-night`, `tokyo-night-storm`,
+- **Dark:** `tokyo-night` (default), `dgx-aeon`, `dgx-dark`, `tokyo-night-storm`,
   `nord`, `gruvbox`, `dracula`, `monokai`, `catppuccin-mocha`,
   `catppuccin-macchiato`, `catppuccin-frappe`, `rose-pine`, `rose-pine-moon`,
   `solarized-dark`, `atom-one-dark`, `textual-dark`, `flexoki`, `ansi-dark`
@@ -264,8 +264,8 @@ green → yellow → orange → red by fill position; identity metrics (KV) keep
 single hue over a dim `▓` track, and the SERVING `kv%` row is that same plain
 bar. The area chart footer ramps the same way by column height. Alarm state
 never depends on color alone: `✗` marks an unreachable node, `!!` a TTFT p95
-past 8s and `!` past 2s, and the value is bold. `dgx-aeon` is the default;
-`tokyo-night` renders the design's exact reference hues.
+past 8s and `!` past 2s, and the value is bold. `tokyo-night` is the default;
+`dgx-aeon` carries the reference design's own hues.
 
 ## Preflight checks
 
