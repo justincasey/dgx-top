@@ -366,22 +366,25 @@ async def test_floor_never_scrolls_or_clips(tmp_path: Path, monkeypatch):
 async def test_density_ladder_steps_down(tmp_path: Path, monkeypatch):
     """Every tier of the ladder is reached as height shrinks. At width 90
     (below TILING_WIDTH) the stacked arrangement exposes the full roomy →
-    dense → compact → rail → floor sequence, each one row denser than the
-    previous at the calibrated heights."""
+    compact → rail → floor sequence, monotonically, at the calibrated
+    heights."""
     from app import DGXTop
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
     _stub(monkeypatch)
     app = DGXTop()
+    rank = {"roomy": 0, "compact": 1, "rail": 2, "floor": 3}
     async with app.run_test(size=(90, 44)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (44, 28, 27, 17, 8):
+        for h in (44, 36, 28, 24, 20, 17, 14, 12, 10, 8):
             await _resize(pilot, 90, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
-        assert seen == ["roomy", "dense", "compact", "rail", "floor"], seen
+    assert seen[0] == "roomy" and seen[-1] == "floor", seen
+    assert [rank[t] for t in seen] == sorted(rank[t] for t in seen), seen
+    assert set(seen) == {"roomy", "compact", "rail", "floor"}, seen
 
 
 # ─── AC5: gradient meters vs single-hue KV ───────────────────────────
@@ -406,11 +409,11 @@ async def test_node_meter_is_gradient_kv_is_single_hue(tmp_path: Path, monkeypat
 
         serv = app.query_one("#serving", ServingBox).render()
         lines = serv.plain.split("\n")
-        # the kv% meter row is folded away: no kv% row may render, and the
-        # kv row carries the merged percentage in its own single hue
-        assert not any(ln.startswith("kv%") for ln in lines), lines
-        kv_line = next(ln for ln in lines if "kv " in ln)
-        assert re.search(r"\d+%", kv_line), kv_line
+        # the kv% row is the pane's single-hue meter; it carries the reading
+        # as its value, in the accent hue, and never ramps by position
+        pct_row = next(ln for ln in lines if ln[2:].startswith("kv%"))
+        assert re.search(r"\d+%", pct_row), pct_row
+        assert set(pct_row[11:33]) <= {"█", "▓"}, pct_row
 
 
 async def test_node_meters_fill_the_tile_interior(tmp_path: Path, monkeypatch):
@@ -437,7 +440,7 @@ async def test_node_meters_fill_the_tile_interior(tmp_path: Path, monkeypatch):
 
 
 async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
-    from app import DGXTop, ServingBox
+    from app import CHART_ROWS, DGXTop, ServingBox
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
@@ -448,10 +451,12 @@ async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
         _seed_history(app)
         lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
         assert not any("last 24 samples" in ln for ln in lines)  # chart label removed
-        # gen/prompt/kv sparklines (blocks) + the multi-series braille chart
+        # series sparklines (blocks) + the fixed four-row ramp area footer
         assert any(c in ln for ln in lines for c in "▁▂▃▄▅▆▇█")
-        chart_rows = [ln for ln in lines if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
-        assert len(chart_rows) >= 2
+        chart = lines[-(CHART_ROWS + 2) : -2]
+        assert len(chart) == CHART_ROWS
+        assert any(c in "▁▂▃▄▅▆▇█" for c in "\n".join(chart)), chart
+        assert not any("\u2800" <= c <= "\u28ff" for c in "\n".join(chart)), chart
 
 
 # ─── AC7: waybar ─────────────────────────────────────────────────────
@@ -478,6 +483,9 @@ async def test_waybar_shows_cluster_chrome(tmp_path: Path, monkeypatch):
         assert " 2 3" not in plain
         # The centred model/topology title is gone: the serving pane names it.
         assert "Qwen3.6-27B-Instruct" not in plain and "DUAL" not in plain
+        # KV moved to the SERVING kv% row: the bar carries live rates only.
+        assert "KV" not in plain
+        assert "tok/s" in plain
         assert len(plain) == wb.content_size.width
 
 
@@ -501,10 +509,9 @@ async def test_waybar_legend_sheds_before_stats(tmp_path: Path, monkeypatch):
             await _resize(pilot, w, h)
             text = wb.render().plain
             assert len(text) == wb.content_size.width, (w, text)
-            # The legend never costs the stats a cell: all three survive every
+            # The legend never costs the stats a cell: both survive every
             # width, and the fleet chip stays flush right.
             assert "2400 tok/s" in text, (w, text)
-            assert "KV 32%" in text, (w, text)
             assert text.rstrip().endswith("● 2/2"), (w, text)
             assert text.startswith(legend), (w, text)
             if legend:
@@ -548,12 +555,11 @@ def test_waybar_hints_are_live_single_word_bindings():
 # ─── AC8: CPU frequency renders MHz ──────────────────────────────────
 
 
-def test_fmt_freq_renders_ghz():
+def test_fmt_freq_renders_mhz():
     from app import _fmt_freq
 
-    assert _fmt_freq(2405.0) == "2.4GHz"
-    assert _fmt_freq(2808.0) == "2.8GHz"
-    assert _fmt_freq(3900.0) == "3.9GHz"
+    assert _fmt_freq(2405.0) == "2405MHz"
+    assert _fmt_freq(2808.0) == "2808MHz"
     assert _fmt_freq(999.0) == "999MHz"
     assert _fmt_freq(0) == ""
 
@@ -569,7 +575,7 @@ async def test_node_gpu_row_shows_sm_clock(tmp_path: Path, monkeypatch):
         await pilot.pause()
         node = app.query_one("#node-0", NodeBox).render().plain
         gpu_line = next(ln for ln in node.split("\n") if "gpu" in ln)
-        assert "2.4GHz" in gpu_line
+        assert "MHz" in gpu_line and "GHz" not in gpu_line
 
 
 # ─── AC9: bottom bar only in the most compressed tiers ───────────────
@@ -592,7 +598,6 @@ async def test_waybar_always_visible_carries_base_stats(tmp_path: Path, monkeypa
             assert wb.styles.display == "block", (w, "waybar should never hide")
             text = wb.render().plain
             assert "tok/s" in text, (w, text)
-            assert "KV 32%" in text, (w, text)
             assert "● 2/2" in text, (w, text)
 
 
@@ -611,7 +616,7 @@ async def test_waybar_warn_marker_on_offline_or_hot(tmp_path: Path, monkeypatch)
         await pilot.pause()
         pal = build_palette(app.current_theme)
         wb = app.query_one("#waybar", Waybar).render()
-        assert "KV 32%" in wb.plain
+        assert "tok/s" in wb.plain
         assert " ! " not in wb.plain  # healthy cluster: no warn marker
 
     _stub(
@@ -747,12 +752,11 @@ def test_box_clamps_overlong_title():
     assert all(len(ln.plain) == 24 for ln in lines)
 
 
-async def test_engine_badge_never_clips_or_hides_a_model(tmp_path: Path, monkeypatch):
-    """The engine badge is a fixed-width column on each model's gen row. It is
-    spent only from slack: at any width every row must fit the pane's interior
-    (the tok/s tail is the content that goes first), the badge is monotone in
-    width, and a model name survives it. Below the width where all the columns
-    fit, the elastic name column is what yields — never the tail."""
+async def test_deploy_row_names_the_engine_and_never_clips(tmp_path: Path, monkeypatch):
+    """The engine family, the TP width and the model's quantisation are one
+    ``deploy`` row. At every width above the fused-grammar floor the row fits
+    the pane's interior (``_box_lines`` ellipsizes anything wider), and a
+    mixed cluster names no single engine."""
     from app import DGXTop, ServingBox, _box_lines, _palette_for
 
     _config(tmp_path / "config.toml")
@@ -767,56 +771,35 @@ async def test_engine_badge_never_clips_or_hides_a_model(tmp_path: Path, monkeyp
     worker.model_metrics = False
     _stub(monkeypatch, [head, worker])
     app = DGXTop()
-    names = ["qwen3.8-flash-next", "NVIDIA-Nemotron-3.5"]
     async with app.run_test(size=(160, 48)) as pilot:
         await pilot.pause()
         await pilot.pause()
         app._update_ui()
         box = app.query_one("#serving", ServingBox)
         pal = _palette_for(app)
-        # Every row must fit the box interior: `_box_lines` fits rows to
-        # `width - 4` and ellipsizes whatever is wider, and the tail is what
-        # gets ellipsized first. `_multi_rows` is called directly here, so
-        # only this bound can see the raw row — from the wide grammar's own
-        # minimum width (SERVING_NARROW_WIDTH) up. The tail itself is checked
-        # on the painted line, because `_fit` runs inside `_box_lines` and a
-        # raw gen row always ends with its own `tok/s` segment.
         for w in range(52, 161):
-            rows = box._multi_rows(pal, w)
+            rows = box._rows(pal, w, False)
             assert all(r.cell_len <= w - 4 for r in rows), (w, [r.plain for r in rows])
             painted = [
                 line.plain[2:-2]  # the interior: `_fit` has already run
                 for line in _box_lines(w, [("^", ""), (" serving", "")], None, rows, False, pal)
             ]
-            for line in painted:
-                if line.startswith("gen ") and "no tok/s" not in line:
-                    assert " tok/s" in line, (w, line)
-        # From 56 up the badge behaves as designed; the fixture's badge
-        # boundary is 69.
-        tagged_at: list[bool] = []
-        for w in range(56, 161):
-            rows = box._multi_rows(pal, w)
-            blob = "\n".join(r.plain for r in rows)
-            tagged = "[sglang]" in blob
-            tagged_at.append(tagged)
-            gen_lines = [ln for ln in blob.split("\n") if ln.startswith("gen ")]
-            assert len(gen_lines) == len(names), (w, blob)
-            for name in names:
-                # Below the width where every column's minimum fits, the
-                # elastic name column truncates a name — it never drops the
-                # model row.
-                assert name in blob or name[:8] in blob, (w, name, blob)
-            if tagged:
-                # Both badges present, and every name in FULL: an admitted
-                # badge implies no column was squeezed for it, so the badge
-                # can never be what costs a name — nor the tail that fits
-                # beside the graph without it.
-                assert "[vllm]" in blob, (w, blob)
-                for name in names:
-                    assert name in blob, (w, name, blob)
-        assert any(tagged_at), "badge never rendered at any width"
-        first = tagged_at.index(True)
-        assert all(tagged_at[first:]), "badge came back at a narrower width"
+            deploy = next(ln for ln in painted if ln.startswith("deploy"))
+            # vllm + sglang are both served: no single engine is claimed.
+            assert "mixed" in deploy, (w, deploy)
+        # One engine, one quant tag.
+        _stub(monkeypatch, [head])
+        app2 = DGXTop()
+        async with app2.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app2._update_ui()
+            interior = [
+                ln[2:-2]
+                for ln in app2.query_one("#serving", ServingBox).render().plain.splitlines()
+            ]
+            deploy = next(ln for ln in interior if ln.startswith("deploy"))
+            assert deploy.startswith("deploy  vllm"), deploy
 
 
 async def test_unknown_kv_renders_as_no_reading_not_zero(tmp_path: Path, monkeypatch):
@@ -849,18 +832,14 @@ async def test_unknown_kv_renders_as_no_reading_not_zero(tmp_path: Path, monkeyp
             # "0 tok" nobody measured.
             tab = interior[0].split("┤ ")[-1].rstrip(" ├")
             assert tab == "—", (size, interior[0])
-            # No percentage is painted for an unknown fill: not the
-            # dataclass's confident 0%, and not the raw sentinel either.
-            kv_lines = [ln for ln in interior if ln.startswith("kv ")]
-            assert kv_lines and all("%" not in ln for ln in kv_lines), (size, kv_lines)
-            if size == (160, 48):
-                # The wide grammar publishes the real used count; with no
-                # capacity it stands alone (the narrow grammar omits it).
-                kv_row = next(ln for ln in interior if ln.startswith("kv "))
-                assert "4K" in kv_row and "/" not in kv_row, (size, kv_row)
-                assert not any(ln.startswith("kv%") for ln in interior)
+            # The kv row publishes the used count and no denominator; the kv%
+            # row says there is no reading rather than painting the sentinel.
+            kv_row = next(ln for ln in interior if ln.startswith("kv "))
+            assert "4K" in kv_row and "/" not in kv_row, (size, kv_row)
+            pct_row = next((ln for ln in interior if ln.startswith("kv%")), "")
+            assert "%" not in pct_row[9:], (size, pct_row)
             chip = app.query_one("#waybar", Waybar).render().plain
-            assert "KV —" in chip, chip
+            assert "KV" not in chip, chip
             # The kv spark plots this history: an unknown fill must not seed
             # a sample the node never reported.
             assert all(v >= 0 for v in app.history["kv-usage-head"]), app.history["kv-usage-head"]
@@ -905,7 +884,7 @@ async def test_kv_spark_clears_when_the_reading_unit_loses_its_fill(tmp_path: Pa
     flips to "KV —" and the spark must plot nothing — skipping the sample
     but keeping the buffer (or freezing on the falsy kv_history guard)
     painted a fill nobody reported any more."""
-    from app import DGXTop, ServingBox, Waybar
+    from app import DGXTop, ServingBox
 
     _config(tmp_path / "config.toml", n=1)
     configure(tmp_path / "config.toml")
@@ -923,8 +902,12 @@ async def test_kv_spark_clears_when_the_reading_unit_loses_its_fill(tmp_path: Pa
         head.kv_cache_pct = -1.0
         app._update_ui()
         assert serving._kv_data == [], serving._kv_data
-        # The headline agrees: no reading, not the stale 32%.
-        assert "KV —" in app.query_one("#waybar", Waybar).render().plain
+        # The kv% row agrees: no reading, not the stale 32%.
+        interior = [
+            ln[2:-2] for ln in app.query_one("#serving", ServingBox).render().plain.splitlines()
+        ]
+        pct_row = next((ln for ln in interior if ln.startswith("kv%")), "")
+        assert "%" not in pct_row[9:], pct_row
         app._update_ui()
         assert serving._kv_data == [], serving._kv_data
 
@@ -951,7 +934,7 @@ async def test_unknown_used_paints_capacity_without_a_numerator(tmp_path: Path, 
         painted = box.render().plain.splitlines()
         interior = [ln[2:-2] for ln in painted]
         kv_row = next(ln for ln in interior if ln.startswith("kv "))
-        assert "3.8M" in kv_row and "/" not in kv_row, (kv_row,)
+        assert "3.8M" in kv_row and "0/" not in kv_row, (kv_row,)
         # Neither figure stated (used at the cluster's -1 sentinel, no
         # capacity): the tail is the em dash, never a literal "-1".
         bare = _unit("head")
@@ -1021,19 +1004,19 @@ async def test_load_only_cluster_paints_no_rate_and_keeps_no_series(tmp_path: Pa
         interior = [
             ln[2:-2] for ln in app.query_one("#serving", ServingBox).render().plain.splitlines()
         ]
-        # the chart carries the decode series: no gen row renders, and an
-        # absent series leaves the chart an honest empty grid
-        assert not any(ln.startswith("gen ") for ln in interior), interior
+        # The gen row is always present but states no rate (an absent series
+        # must not be painted as a flat zero), and the empty chart stays blank.
+        gen = next(ln for ln in interior if ln.startswith("gen "))
+        assert "— tok/s" in gen and "0 tok/s" not in gen, gen
         chart = interior[-(app._chart_rows + 2) : -2]
         assert not any("\u2800" <= c <= "\u28ff" for c in "\n".join(chart)), chart
-        assert "no tok/s · sglang" in next(ln for ln in interior if ln.startswith("prompt ")), (
-            interior
-        )
+        assert not any(c in "▁▂▃▄▅▆▇█" for c in chart[0]), chart
+        assert "— tok/s" in next(ln for ln in interior if ln.startswith("prompt ")), interior
         # the load API's own readings still land
         assert any(ln.startswith("requests") and "2r · 1w" in ln for ln in interior), interior
         assert "—" in next(ln for ln in interior if ln.startswith("cache ")), interior
         assert "1.2M/3.8M tok" in next(ln for ln in interior if ln.startswith("kv ")), interior
-        assert "%" in next(ln for ln in interior if ln.startswith("kv ")), interior
+        assert "%" in next(ln for ln in interior if ln.startswith("kv%")), interior
 
         chip = app.query_one("#waybar", Waybar).render().plain
         assert "— tok/s" in chip and "0 tok/s" not in chip, chip
@@ -1052,14 +1035,12 @@ async def test_load_only_cluster_paints_no_rate_and_keeps_no_series(tmp_path: Pa
         measured = [
             ln[2:-2] for ln in app.query_one("#serving", ServingBox).render().plain.splitlines()
         ]
-        # the counter-bearing poll feeds the chart: a trace with an edge
-        # label carrying the real rate appears (the gen row stays gone).
-        # measured still carries the box rules, so the chart rows are the
-        # 16 above the slope row.
+        # The counter-bearing poll feeds the chart: a block-glyph area trace
+        # appears with the real rate in the gen row.
         chart = measured[-(app._chart_rows + 2) : -2]
         blob = "\n".join(chart)
-        assert any("\u2800" <= c <= "\u28ff" for c in blob), chart
-        assert "42" in blob, chart
+        assert any(c in "▁▂▃▄▅▆▇█" for c in blob), chart
+        assert "84 tok/s" in next(ln for ln in measured if ln.startswith("gen "))
 
 
 async def test_two_load_only_models_paint_an_unknown_prompt_rate(tmp_path: Path, monkeypatch):
@@ -1086,21 +1067,23 @@ async def test_two_load_only_models_paint_an_unknown_prompt_rate(tmp_path: Path,
         ]
         assert len(app.query_one("#serving", ServingBox)._models) == 2
         prompt = next(ln for ln in interior if ln.startswith("prompt "))
-        assert "no tok/s · sglang" in prompt, interior
+        assert "— tok/s" in prompt, interior
         assert "0 tok/s" not in prompt, prompt
-        # the gen rows folded into the chart: none render, and the absent
-        # series leaves the chart an honest empty grid
-        assert not any(ln.startswith("gen") for ln in interior), interior
+        # The gen row is always present (the reference grammar) but states no
+        # rate, and the absent series leaves the chart an honest empty grid.
+        gen = next(ln for ln in interior if ln.startswith("gen "))
+        assert "— tok/s" in gen, gen
+        assert not any(c in "▁▂▃▄▅▆▇█" for c in gen), gen
         chart = interior[-(app._chart_rows + 2) : -2]
         assert not any("\u2800" <= c <= "\u28ff" for c in "\n".join(chart)), chart
+        assert not any(c in "▁▂▃▄▅▆▇█" for c in chart[0]), chart
 
 
 async def test_per_model_rows_bound_the_name_column(tmp_path: Path, monkeypatch):
     """The gen row is not the only row spending the name column: the per-model
-    requests and ttft rows share it. When the gen row's own budget is slack —
-    a short tail and no engine badge — those rows are what bound the column;
-    unaccounted for, a 20-cell name pushed `p50 … · p95 … !!` past the
-    interior and `_fit` ate the p95 tail, hiding a stalled latency."""
+    requests and ttft rows share it. Unaccounted for, a 20-cell name pushed
+    `p50 … · p95 … !!` past the interior and `_fit` ate the p95 tail, hiding a
+    stalled latency."""
     from app import DGXTop, ServingBox, _palette_for
 
     _config(tmp_path / "config.toml")
@@ -1119,7 +1102,7 @@ async def test_per_model_rows_bound_the_name_column(tmp_path: Path, monkeypatch)
                 {
                     "name": name,
                     "color": pal.accent,
-                    "gen": [0.0, 0.0],  # observed but idle: 1-cell hero, short tail
+                    "gen": [0.0, 0.0],  # observed but idle: an empty spark scale
                     "req": 2,
                     "wait": 1,
                     "ttft_p50_ms": 700.0,
@@ -1128,19 +1111,16 @@ async def test_per_model_rows_bound_the_name_column(tmp_path: Path, monkeypatch)
                 }
                 for name, source in (
                     ("NVIDIA-Nemotron-3.5-Lightning-49B", "vllm"),
-                    ("gpt-oss-20b", "sglang"),  # shorter than the column: must pad
+                    ("gpt-oss-20b", "sglang"),
                 )
             ]
         )
         for w in range(52, 121):
-            rows = box._multi_rows(pal, w)
+            rows = box._rows(pal, w, False)
             over = [(r.cell_len, r.plain) for r in rows if r.cell_len > w - 4]
             assert not over, (w, over)
-        # The rows that bound the column keep their tails in full, and the gen
-        # rows stay flush right although the two names differ in length.
-        painted = [r.plain for r in box._multi_rows(pal, 52)]
-        gen_rows = [ln for ln in painted if ln.startswith("gen")]
-        assert len({len(ln) for ln in gen_rows}) == 1, gen_rows
+        # Every per-model row keeps its tail in full at the narrowest width.
+        painted = [r.plain for r in box._rows(pal, 52, False)]
         assert len([ln for ln in painted if ln.startswith("ttft")]) == 2
         assert all("p95" in ln for ln in painted if ln.startswith("ttft")), painted
         assert all("waiting" in ln for ln in painted if ln.startswith("requests")), painted
@@ -1239,8 +1219,8 @@ async def test_line_treatment_renders(tmp_path: Path, monkeypatch):
         assert "━" in row and "─" in row, row
         assert "█" not in row and "▓" not in row
         serv = app.query_one("#serving", ServingBox).render()
-        kv_row = next(ln for ln in serv.plain.split("\n") if "kv " in ln)
-        assert "━" not in kv_row and "%" in kv_row, kv_row
+        pct_row = next(ln for ln in serv.plain.split("\n") if ln[2:].startswith("kv%"))
+        assert "%" in pct_row[35:], pct_row
 
 
 async def test_tick_treatment_renders(tmp_path: Path, monkeypatch):
@@ -1273,8 +1253,8 @@ async def test_spark_treatment_renders(tmp_path: Path, monkeypatch):
         spark_chars = set("▁▂▃▄▅▆▇█")
         assert any(ch in spark_chars for ch in row), row
         serv = app.query_one("#serving", ServingBox).render()
-        kv_row = next(ln for ln in serv.plain.split("\n") if "kv " in ln)
-        assert not any(ch in kv_row for ch in spark_chars), kv_row
+        pct_row = next(ln for ln in serv.plain.split("\n") if ln[2:].startswith("kv%"))
+        assert set(pct_row[11:33]) <= {"█", "▓"}, pct_row
 
 
 def test_spark_meter_scales_against_its_value_not_the_series_extremes():
@@ -1379,10 +1359,9 @@ async def test_meter_escalates_to_crit(tmp_path: Path, monkeypatch):
 
 
 async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
-    """AC: prompt/kv duo rows share one graph lane (dots on the line row, the
-    fill row aligned under the dots), tails align, blank spacer rows
-    separate the graph blocks; the gen rows render only without a chart, so
-    the wide pane shows prompt/kv only."""
+    """The reference column grammar: a 9-cell label gutter, a 22-cell graph,
+    a two-space gap, then the value — so every value in the pane starts on
+    the same cell. The gen, prompt, kv and kv% rows are always present."""
     from app import DGXTop, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -1408,48 +1387,30 @@ async def test_serving_top_rows_aligned(tmp_path: Path, monkeypatch):
         )
         await pilot.pause()
         width = box.content_size.width
-        lines = box.render().plain.split("\n")
-        interior = lines[1:-1]  # strip heavy borders
+        interior = box.render().plain.split("\n")[1:-1]  # strip the border rules
         assert all(len(ln) == width for ln in interior), "row not padded to box width"
-        by_label = {}
-        for i, ln in enumerate(interior):
-            m = re.match(r"^\u2502 (gen    |prompt |kv     )", ln)
-            if m:
-                by_label.setdefault(m.group(1), []).append((i, ln))
-        assert set(by_label) == {"prompt ", "kv     "}
-        braille = {chr(c) for c in range(0x2801, 0x2900)}
-        starts, lens = set(), set()
-        for label, entries in by_label.items():
-            i, ln = entries[0]
-            # pure dot rows: contiguous braille dots on the line row
-            cols = [j for j, ch in enumerate(ln) if ch in braille]
-            assert cols, f"no dot glyphs on {label!r}"
-            assert cols == list(range(min(cols), max(cols) + 1)), f"ragged dots {label!r}"
-            # fill row beneath: a contiguous █ run aligned with the dots
-            fcols = [j for j, ch in enumerate(interior[i + 1]) if ch == "\u2588"]
-            assert fcols, f"no fill row under {label!r}"
-            assert fcols == list(range(min(fcols), max(fcols) + 1)), f"ragged fill {label!r}"
-            assert (min(fcols), len(fcols)) == (min(cols), len(cols)), (
-                f"fill misaligned under {label!r}"
-            )
-            starts.add(min(cols))
-            lens.add(len(cols))
-        assert len(lens) == 1, f"graph lengths differ: {lens}"
-        assert len(starts) == 1, f"graph starts differ: {starts}"
-        # each duo block is line row + fill row; blank spacers between blocks
-        prompt_i = by_label["prompt "][0][0]
-        kv_i = by_label["kv     "][0][0]
-        assert kv_i - prompt_i == 3
-
-        def blank(ln: str) -> bool:
-            return ln[1:-1].strip() == ""
-
-        assert blank(interior[prompt_i + 2]) and blank(interior[kv_i + 2])
-        # the kv block runs into requests (gen and kv% rows are folded away
-        # while the chart carries the decode series)
-        assert interior[kv_i + 3].strip().startswith("\u2502 requests")
-        # the widest tail (kv's merged tok+pct tail) reaches the right edge
-        assert len(by_label["kv     "][0][1][1:-1].rstrip()) == width - 3
+        rows = {}
+        for ln in interior:
+            for label in ("gen", "prompt", "kv", "kv%"):
+                if ln[2:].startswith(label.ljust(9)):
+                    rows[label] = ln
+        assert set(rows) == {"gen", "prompt", "kv", "kv%"}, rows.keys()
+        blocks = "▁▂▃▄▅▆▇█"
+        for label in ("gen", "prompt", "kv"):
+            ln = rows[label]
+            graph = ln[11:33]
+            assert len(graph) == 22, (label, repr(ln))
+            assert all(ch in blocks for ch in graph), (label, graph)
+            assert ln[33:35] == "  ", (label, repr(ln[33:35]))
+            assert ln[35:].strip(), (label, "value column empty")
+        # The kv% row's graph is a single-hue meter, not a sparkline.
+        meter = rows["kv%"][11:33]
+        assert set(meter) <= {"█", "▓"}, meter
+        assert rows["kv%"][35:].strip().startswith("32")
+        # One blank spacer row separates the graph block from the meta rows.
+        gen_i = interior.index(rows["gen"])
+        assert interior[gen_i + 4][1:-1].strip() == ""
+        assert interior[gen_i + 5][1:].strip().startswith("requests")
 
 
 # ─── cluster scaling: 1-12 nodes, fluid node grid ────────────────────
@@ -1555,23 +1516,25 @@ async def test_never_scroll_or_clip_for_cluster_sizes(tmp_path: Path, monkeypatc
 
 
 async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
-    """A 12-node cluster steps through the whole ladder as height shrinks
-    (at width 180 the wide tiled roomy tier and the denser tiers both
-    appear; the duo spark rows cost height, so dense now needs ≥32 rows)."""
+    """A 12-node cluster steps through the whole ladder as height shrinks:
+    the tiled roomy tier, then compact, rail and floor."""
     from app import DGXTop
 
     _config_cluster(tmp_path / "config.toml", 12)
     configure(tmp_path / "config.toml")
     _stub_n(monkeypatch, 12)
     app = DGXTop()
+    rank = {"roomy": 0, "compact": 1, "rail": 2, "floor": 3}
     async with app.run_test(size=(180, 60)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (60, 29, 28, 20, 8):
+        for h in (60, 50, 44, 40, 36, 32, 29, 24, 20, 16, 8):
             await _resize(pilot, 180, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
-        assert seen == ["roomy", "dense", "compact", "rail", "floor"], seen
+    assert seen[0] == "roomy" and seen[-1] == "floor", seen
+    assert [rank[t] for t in seen] == sorted(rank[t] for t in seen), seen
+    assert set(seen) == {"roomy", "compact", "rail", "floor"}, seen
 
 
 async def test_condensed_table_row_shows_gpu_mem_cpu(tmp_path: Path, monkeypatch):
@@ -1640,31 +1603,28 @@ async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
     async with app.run_test(size=(132, 44)) as pilot:
         await pilot.pause()
         _seed_history(app)
-        await _resize(pilot, 132, 20)
+        await _resize(pilot, 132, 16)
         assert app.density == "compact" and not app.rail and not app.floor
-        assert app._chart_rows >= 2, app._chart_rows  # line chart survives compact
+        assert app._chart_rows == 0, app._chart_rows  # the reference compact drops the chart
         serv_lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
-        # sparkline blocks ∪ braille line-chart dots (U+2800–U+28FF)
-        assert (
-            sum(
-                1
-                for ln in serv_lines
-                if any(c in "▁▂▃▄▅▆▇█" or 0x2800 <= ord(c) < 0x2900 for c in ln)
-            )
-            >= 3
-        )
+        # the gen and kv spark rows survive; prompt / kv% / the chart do not
+        assert any(ln[2:].startswith("gen") for ln in serv_lines), serv_lines
+        assert any(ln[2:].startswith("kv ") for ln in serv_lines), serv_lines
+        assert not any(ln[2:].startswith("prompt") for ln in serv_lines), serv_lines
+        assert not any(ln[2:].startswith("kv%") for ln in serv_lines), serv_lines
         node = app.query_one("#node-0", NodeBox).render().plain
         assert "73%" in node and "52%" in node and "50%" in node
-        assert any(c in node for c in "█▓━╾┈"), "meter glyphs survive compact"
         assert "■" in node, "core grid survives compact"
-        assert "roce" not in node, "RoCE drops before the meters"
+        assert not any(c in node for c in "█▓"), "the compact card drops its meters"
+        assert "roce" not in node, "RoCE drops with the meters"
         assert app.screen.max_scroll_y == 0
 
 
-async def test_serving_chart_grows_with_height(tmp_path: Path, monkeypatch):
-    """AC3: the serving area chart grows into the leftover height instead of a
-    symmetric pad (bounded by the tier max)."""
-    from app import DGXTop
+async def test_serving_chart_is_a_fixed_footer(tmp_path: Path, monkeypatch):
+    """The reference chart is a fixed four-row footer: it never grows with
+    height (surplus height stays at the bottom), and the body is anchored to
+    the row under the bar rather than centred."""
+    from app import CHART_ROWS, DGXTop
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
@@ -1675,11 +1635,11 @@ async def test_serving_chart_grows_with_height(tmp_path: Path, monkeypatch):
         _seed_history(app)
         await _resize(pilot, 90, 44)
         assert not app.tiled
-        assert app._chart_rows >= 12, app._chart_rows
+        assert app._chart_rows == CHART_ROWS, app._chart_rows
         body = app.query_one("#body")
-        assert body.region.y <= 3, body.region  # leftover consumed, not padded
+        assert body.region.y <= 1, body.region  # top-anchored, not padded
         await _resize(pilot, 132, 44)
-        assert app.tiled and app._chart_rows >= 10, app._chart_rows
+        assert app.tiled and app._chart_rows == CHART_ROWS, app._chart_rows
         assert app.screen.max_scroll_y == 0
 
 
@@ -1696,13 +1656,8 @@ async def test_serving_wins_gen_reqs_ttft(tmp_path: Path, monkeypatch):
         for w, h in [(132, 44), (100, 40), (80, 40), (50, 20), (40, 8)]:
             await _resize(pilot, w, h)
             blob = app.query_one("#serving", ServingBox).render().plain
-            tier = "floor" if app.floor else ("rail" if app.rail else app.density)
-            # the chart carries the decode series; gen renders only without
-            # one (rail/floor). The requests line and ttft always stay.
-            if tier in ("rail", "floor"):
-                assert "gen" in blob, (w, h, tier, blob)
-            else:
-                assert "gen" not in blob, (w, h, tier, blob)
+            # the gen row is the pane's first row at every tier
+            assert "gen" in blob, (w, h, blob)
             assert "req" in blob or "requests" in blob, (w, h, blob)
             assert "ttft" in blob, (w, h, blob)
 
@@ -1742,20 +1697,14 @@ async def test_two_models_share_one_serving_pane(tmp_path: Path, monkeypatch):
         )
         app._update_ui()
         blob = app.query_one("#serving", ServingBox).render().plain
-        # both models appear in the pane; the gen rows folded into the
-        # chart, so identity lives in the per-model requests/ttft rows and
-        # the title legend's engine badges
+        # Both models appear in the pane: identity lives in the per-model
+        # requests/ttft rows, and the gen row is the shared aggregate.
         assert "qwen3.8-flash-next" in blob
         assert "NVIDIA-Nemotron" in blob
-        # the engine badges ride the title legend only when the rule has
-        # room (two long names spend it here); identity still maps 1:1 via
-        # the per-model rows and the chart's edge labels
-        assert not any("gen    " in ln for ln in blob.split("\n")), blob
+        assert any(ln[2:].startswith("gen") for ln in blob.split("\n")), blob
         req_lines = [ln for ln in blob.split("\n") if "requests" in ln]
         assert any("NVIDIA-Nemotron" in ln for ln in req_lines), req_lines
         assert any("qwen3.8-flash-next" in ln for ln in req_lines), req_lines
-        braille = [ln for ln in blob.split("\n") if any(0x2800 <= ord(c) < 0x2900 for c in ln)]
-        assert len(braille) >= 2, braille  # the shared time-series chart
         assert blob.count("requests") == 2, blob  # one concurrency row per model
         for w, h in [(100, 40), (95, 24), (60, 18), (40, 8)]:
             await _resize(pilot, w, h)
@@ -2087,7 +2036,9 @@ async def test_chart_y_axis_gutter_and_suppression(tmp_path: Path, monkeypatch):
     suppressed when nothing is plotted."""
     from app import ServingBox
 
-    async with _two_model_app(tmp_path, monkeypatch, [100.0] * 24, [10.0] * 24) as app:
+    async with _two_model_app(
+        tmp_path, monkeypatch, [100.0] * 24, [10.0] * 24, chart="oscilloscope"
+    ) as app:
         serving = app.query_one("#serving", ServingBox)
         w = serving.content_size.width
         rows = serving.render().split("\n")
@@ -2101,7 +2052,7 @@ async def test_chart_y_axis_gutter_and_suppression(tmp_path: Path, monkeypatch):
     # all-zero throughput: no range to label — the pane renders unlabeled
     # (the fixture pins stub throughput to the seed tail, so an empty seed
     # really does leave only 0s in the history)
-    async with _two_model_app(tmp_path, monkeypatch, [], []) as app:
+    async with _two_model_app(tmp_path, monkeypatch, [], [], chart="oscilloscope") as app:
         serving = app.query_one("#serving", ServingBox)
         blob = serving.render().plain
         assert not any(ln[2:].startswith(("0 ", " 0 ")) for ln in blob.split("\n")[1:-1]), blob
@@ -2118,7 +2069,7 @@ async def test_oscilloscope_chart_grammar(tmp_path, monkeypatch):
     from app import ServingBox
 
     hist = [20 + (i * 5) % 60 for i in range(24)]  # hi=75, last=75, rising tail
-    async with _two_model_app(tmp_path, monkeypatch, hist, hist) as app:
+    async with _two_model_app(tmp_path, monkeypatch, hist, hist, chart="oscilloscope") as app:
         serving = app.query_one("#serving", ServingBox)
         rows = serving.render().plain.split("\n")
         interior = rows[1:-1]
@@ -2134,9 +2085,9 @@ async def test_oscilloscope_chart_grammar(tmp_path, monkeypatch):
         assert "model-a" in blob and "model-b" in blob, blob
         slope = interior[-1]
         assert "Δ5" in slope and "steady" in slope, slope
-        kv_row = next(ln for ln in interior if "kv " in ln)
-        assert "tok" in kv_row and "%" in kv_row, kv_row
-        assert not any(ln.strip().startswith("│ kv%") for ln in interior), interior
+        kv_row = next(ln for ln in interior if ln[2:].startswith("kv "))
+        assert "tok" in kv_row, kv_row
+        assert any(ln[2:].startswith("kv%") for ln in interior), interior
 
 
 async def test_lines_mode_keeps_legacy_chart(tmp_path, monkeypatch):
@@ -2175,57 +2126,36 @@ def test_slope_row_states():
 
 
 def test_serving_base_modes():
-    """AC: the wide base is mode-dependent (the kv% row and its blank left,
-    the Δ5 slope row only in oscilloscope mode) and gen-conditional — the
-    per-model gen rows join only when no chart renders. Narrow is the same
-    fold at one row; rail/floor keep gen (they never render a chart)."""
+    """AC: the base is the reference row set (gen, prompt, kv, kv% + the meta
+    rows + deploy), plus one rank row per stacked node and one extra
+    requests/ttft pair per additional model. Compact drops the prompt and kv%
+    graphs; rail/floor keep their fixed surfaces."""
     from app import _serving_base
 
     assert _serving_base("roomy", 80, 1) == 10
-    assert _serving_base("roomy", 80, 1, "lines") == 9
-    assert _serving_base("roomy", 80, 3) == 14
-    assert _serving_base("roomy", 80, 3, "lines") == 13
-    assert _serving_base("roomy", 80, 1, chart_rows=0) == 12
-    assert _serving_base("roomy", 80, 3, chart_rows=0) == 22
-    assert _serving_base("roomy", 80, 1, "lines", 0) == 12
-    assert _serving_base("compact", 80, 1) == 4
-    assert _serving_base("compact", 80, 1, chart_rows=0) == 5
+    assert _serving_base("roomy", 80, 3) == 14  # + a requests/ttft pair each
+    assert _serving_base("roomy", 80, 1, nodes=2, stack=True) == 12  # two rank rows
+    assert _serving_base("roomy", 80, 1, nodes=2, stack=False) == 10  # no stack, no rows
+    assert _serving_base("compact", 80, 1) == 7  # gen, kv, requests, cache, ttft
+    assert _serving_base("compact", 80, 2) == 9
     assert _serving_base("rail", 80, 1) == 4
     assert _serving_base("floor", 80, 1) == 3
 
 
-async def test_gen_rows_lead_with_hue_values_and_duo_fill(tmp_path: Path, monkeypatch):
-    """AC Y8 (duo grammar): each gen row leads with that model's CURRENT
-    total output in its own hue, then its duo spark — braille dots at the
-    full hue — with a fill row beneath in the chart's translucent shade
-    (hue blended 75% toward the background)."""
-    from app import ServingBox, _palette_for
-    from themes import blend_toward
+async def test_gen_row_leads_with_the_rate_and_a_block_spark(tmp_path: Path, monkeypatch):
+    """The gen row is the pane's first row: the current rate in the body
+    foreground, then a single-hue block spark spanning the fixed 22-cell
+    graph lane."""
+    from app import ServingBox
 
-    hist = [20 + (i * 7) % 50 for i in range(24)]  # last=31, avg=44, hi=69
+    hist = [20 + (i * 7) % 50 for i in range(24)]  # last = 31
     async with _two_model_app(tmp_path, monkeypatch, hist, hist) as app:
         serving = app.query_one("#serving", ServingBox)
-        app._chart_rows = 0  # the gen duo rows render only without a chart
-        hue = {m["name"]: m["color"] for m in serving._models}["model-a"]
-        pal = _palette_for(app)
-        rows = serving.render().split("\n")
-        gi = next(i for i, t in enumerate(rows) if "gen" in t.plain and "model-a" in t.plain)
-        gen = rows[gi]
-        assert "31" in gen.plain and "44" in gen.plain and "69" in gen.plain, gen.plain
-        assert f"bold {hue}" in {s.style for s in gen._spans}, gen.plain
-        # dots at the full hue share the row with the leading value
-        assert any("\u2800" <= c <= "\u28ff" for c in gen.plain), gen.plain
-        # the row beneath is the fill: solid blocks in the 75%-lighter shade
-        fill = rows[gi + 1]
-        assert "\u2588" in fill.plain, fill.plain
-        expected = f"bold {blend_toward(hue, pal.bg, 0.75)}"
-        assert expected in {s.style for s in fill._spans}, (
-            expected,
-            [s.style for s in fill._spans],
-        )
-        # model-b's fill carries ITS hue — the two light fills are distinct
-        hue_b = {m["name"]: m["color"] for m in serving._models}["model-b"]
-        assert blend_toward(hue_b, pal.bg, 0.75) != blend_toward(hue, pal.bg, 0.75)
+        rows = serving.render().plain.split("\n")
+        gen = next(ln for ln in rows if ln[2:].startswith("gen"))
+        assert re.search(r"gen\s+[▁▂▃▄▅▆▇█]+\s+\d+ tok/s", gen), gen
+        graph = gen[11:33]
+        assert len(graph) == 22 and all(c in "▁▂▃▄▅▆▇█" for c in graph), graph
 
 
 # ─── review-hardening: hero honesty, order, hue hygiene, duo sparks ──
@@ -2264,38 +2194,22 @@ async def _served_models_app(tmp_path, monkeypatch, specs, hists, size=(132, 44)
         yield app
 
 
-async def test_gen_hero_shows_rep_value_not_cluster_aggregate(tmp_path, monkeypatch):
-    """AC6: one model name served by 2 endpoints — the hero reads the
-    authoritative rep's own series, not the N× cluster aggregate."""
+async def test_gen_row_reports_the_cluster_rate(tmp_path, monkeypatch):
+    """One model name served by 2 endpoints: the pane's gen row reports the
+    cluster's decode rate, and its spark plots the same aggregate series the
+    waybar counts."""
     from app import ServingBox
 
-    hist = [20 + (i * 7) % 50 for i in range(24)]  # rep tail = 31
+    hist = [20 + (i * 7) % 50 for i in range(24)]  # last = 31
     specs = [("model-a", 300.0, 31.0), ("model-a", 100.0, 1000.0)]
     async with _served_models_app(tmp_path, monkeypatch, specs, [hist, hist]) as app:
         serving = app.query_one("#serving", ServingBox)
-        app._chart_rows = 0  # the gen duo rows render only without a chart
         assert len(serving._models) == 1  # one pane, not two
         gen_row = next(t for t in serving.render().split("\n") if t.plain.startswith("│ gen"))
-        # pin the parsed hero TOKEN (leading value at the graph lane), not a
-        # substring that larger numbers could contain
-        m = re.search(r"gen\s+(\d+)", gen_row.plain)
-        assert m and m.group(1) == "31", gen_row.plain
-        # the aggregate (31 + 1000) must not leak into the hero or the tail
-        assert "1031" not in gen_row.plain, gen_row.plain
-        # the spark scales to the REP's series (peak 69 reaches the top dot
-        # row); the N× aggregate scale would flatten it onto the baseline
-        from app import _BRAILLE_BITS
-
-        dot_rows = [
-            row
-            for ch in gen_row.plain
-            if 0x2800 < ord(ch) <= 0x28FF
-            for (_col, row), bit in _BRAILLE_BITS.items()
-            if (ord(ch) - 0x2800) & bit
-        ]
-        # spread too: the rep series (20..69) spans dot rows; a single
-        # self-scaled aggregate sample would be one flat row
-        assert dot_rows and min(dot_rows) == 0 and max(dot_rows) >= 1, gen_row.plain
+        m = re.search(r"gen\s+[▁▂▃▄▅▆▇█]+\s+(\d+) tok/s", gen_row.plain)
+        assert m, gen_row.plain
+        # the row plots the recorded aggregate, which is what it prints
+        assert m.group(1) == f"{app.cluster.total_throughput:.0f}", gen_row.plain
 
 
 async def test_model_series_sorted_by_name(tmp_path, monkeypatch):
@@ -2374,7 +2288,7 @@ def _palette_of(app):
 def test_chart_and_spark_helpers_tolerate_non_finite_samples():
     """AC14: NaN/Inf samples are dropped at the door — the helpers are
     total over their input (no NaN scale, no divmod-on-NaN crash)."""
-    from app import _lines_chart_lines, _spark_duo_lines
+    from app import _lines_chart_lines, _spark_line
     from themes import build_palette, get_theme
 
     pal = build_palette(get_theme("dgx-aeon"))
@@ -2382,24 +2296,20 @@ def test_chart_and_spark_helpers_tolerate_non_finite_samples():
     rows = _lines_chart_lines(series, 4, 20, pal)
     assert len(rows) == 4 and all(t.cell_len == 20 for t in rows)
     assert all("nan" not in t.style for t in rows), [t.style for t in rows]
-    duo = _spark_duo_lines([float("nan"), 5.0, float("inf")], "#8A7CFF", 12, pal)
-    assert len(duo) == 2 and all(t.cell_len == 12 for t in duo)
-    all_nan = _spark_duo_lines([float("nan")], "#8A7CFF", 8, pal)
-    assert len(all_nan) == 2 and all(t.cell_len == 8 for t in all_nan)
-    assert all(not c for t in all_nan for c in t.plain if c == "█")
+    spark = _spark_line([float("nan"), 5.0, float("inf")], "#8A7CFF", 12)
+    assert spark.cell_len == 12
+    all_nan = _spark_line([float("nan")], "#8A7CFF", 8)
+    assert all_nan.cell_len == 8
 
 
-def test_spark_duo_boundary_inputs():
+def test_spark_boundary_inputs():
     """AC11: empty / single-sample / all-equal / all-zero / width-1 inputs
-    all render exactly 2 rows x width without crashing."""
-    from app import _spark_duo_lines
-    from themes import build_palette, get_theme
+    all render exactly ``width`` cells without crashing."""
+    from app import _spark_line
 
-    pal = build_palette(get_theme("dgx-aeon"))
     for data, w in (([], 10), ([5.0], 10), ([5.0, 5.0, 5.0], 10), ([1.0], 1), ([0.0, 0.0], 12)):
-        rows = _spark_duo_lines(list(data), "#8A7CFF", w, pal)
-        assert len(rows) == 2, (data, w)
-        assert all(t.cell_len == w for t in rows), (data, w)
+        row = _spark_line(list(data), "#8A7CFF", w)
+        assert row.cell_len == w, (data, w)
 
 
 # ─── endpoint scan modal (s) ─────────────────────────────────────────
@@ -2801,20 +2711,19 @@ async def test_waybar_clock_lock_chip_sheds_value_first_and_goes_after_gen(
             await _resize(pilot, width, 20)
             plain = wb.render().plain
             full, short = "≤2200" in plain, "≤" in plain
-            kv, gen = "KV 32%" in plain, "tok/s" in plain
-            assert "● 2/2" in plain, (width, plain)  # the online chip is never dropped
-            if not kv:
-                assert not full, (width, plain)  # the value is shed before KV drops
+            gen = "tok/s" in plain
+            assert "● 2/2" in plain, (width, plain)  # the fleet chip is never dropped
             if gen:
-                assert short, (width, plain)  # the chip goes only after gen
-            seen.add((full, short, kv, gen))
-    # Every rung of the ladder was observed on the way down.
+                assert short, (width, plain)  # the chip goes only after the rate
+            seen.add((full, short, gen))
+    # Every rung of the ladder was observed on the way down: full chip, the
+    # value shed to the bare marker, then the chip gone with the rate kept, and
+    # finally the rate gone too.
     assert {
-        (True, True, True, True),
-        (False, True, True, True),
-        (False, True, False, True),
-        (False, True, False, False),
-        (False, False, False, False),
+        (True, True, True),
+        (False, True, True),
+        (False, True, False),
+        (False, False, False),
     } <= seen
 
 
@@ -3081,10 +2990,10 @@ async def test_lock_outranks_the_sm_clock_when_only_one_fits(tmp_path: Path, mon
         box = app.query_one("#node-0", NodeBox)
         pal = app_module._palette_for(app)
         # 37 cells → a 33-cell interior: "gpu 73% · 64°C · 430W" (21) has room
-        # for the clock (+9) or the lock (+8), not both (+17).
+        # for the clock (+10) or the lock (+8), not both (+18).
         unlocked = box._interior_rows(_unit("head"), pal, 37, "roomy")[0].plain
         locked = box._interior_rows(_locked(_unit("head"), 2200), pal, 37, "roomy")[0].plain
-    assert unlocked == "gpu 73% · 64°C · 430W · 2.4GHz"
+    assert unlocked == "gpu 73% · 64°C · 430W · 2411MHz"
     assert locked == "gpu 73% · 64°C · 430W · ≤2200"
 
 
