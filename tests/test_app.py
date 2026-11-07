@@ -440,7 +440,7 @@ async def test_node_meters_fill_the_tile_interior(tmp_path: Path, monkeypatch):
 
 
 async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
-    from app import CHART_ROWS, DGXTop, ServingBox
+    from app import AREA_CHART_ROWS, DGXTop, ServingBox
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
@@ -453,10 +453,32 @@ async def test_serving_area_chart_present(tmp_path: Path, monkeypatch):
         assert not any("last 24 samples" in ln for ln in lines)  # chart label removed
         # series sparklines (blocks) + the fixed four-row ramp area footer
         assert any(c in ln for ln in lines for c in "▁▂▃▄▅▆▇█")
-        chart = lines[-(CHART_ROWS + 2) : -2]
-        assert len(chart) == CHART_ROWS
+        chart = lines[-(AREA_CHART_ROWS + 2) : -2]
+        assert len(chart) == AREA_CHART_ROWS
         assert any(c in "▁▂▃▄▅▆▇█" for c in "\n".join(chart)), chart
         assert not any("\u2800" <= c <= "\u28ff" for c in "\n".join(chart)), chart
+
+
+def test_area_chart_compresses_a_long_history_to_the_pane():
+    """A 90-sample history inside a 57-cell pane must be COMPRESSED, not
+    truncated: the old resample bailed out once the history was longer than
+    the pane, so every row painted the oldest 57 samples and `_fit` clipped
+    the live end behind an ellipsis — the graph froze in the past."""
+    from app import _area_chart_lines
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+    # 80 rising samples, then a flat peak: the live end must land on the last
+    # column, and the oldest (near-zero) samples on the first.
+    data = [float(i) for i in range(80)] + [100.0] * 10
+    rows = _area_chart_lines(data, 4, 57, pal)
+    assert len(rows) == 4
+    assert all(r.cell_len == 57 for r in rows), [r.cell_len for r in rows]
+    assert "…" not in "".join(r.plain for r in rows)
+    bottom = rows[-1].plain
+    assert bottom[-1] == "█", rows[-1].plain
+    assert rows[0].plain[-1] == "█", rows[0].plain
+    assert bottom[0] == " " and rows[0].plain[0] == " ", "oldest column must stay low"
 
 
 # ─── AC7: waybar ─────────────────────────────────────────────────────
@@ -1624,7 +1646,7 @@ async def test_serving_chart_is_a_fixed_footer(tmp_path: Path, monkeypatch):
     """The reference chart is a fixed four-row footer: it never grows with
     height (surplus height stays at the bottom), and the body is anchored to
     the row under the bar rather than centred."""
-    from app import CHART_ROWS, DGXTop
+    from app import AREA_CHART_ROWS, DGXTop
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
@@ -1635,11 +1657,33 @@ async def test_serving_chart_is_a_fixed_footer(tmp_path: Path, monkeypatch):
         _seed_history(app)
         await _resize(pilot, 90, 44)
         assert not app.tiled
-        assert app._chart_rows == CHART_ROWS, app._chart_rows
+        assert app._chart_rows == AREA_CHART_ROWS, app._chart_rows
         body = app.query_one("#body")
         assert body.region.y <= 1, body.region  # top-anchored, not padded
         await _resize(pilot, 132, 44)
-        assert app.tiled and app._chart_rows == CHART_ROWS, app._chart_rows
+        assert app.tiled and app._chart_rows == AREA_CHART_ROWS, app._chart_rows
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_oscilloscope_still_fills_the_leftover_height(tmp_path: Path, monkeypatch):
+    """The fixed four-row footer is the `area` renderer's contract only. The
+    instrumented renderers keep filling the spare height (bounded by their
+    tier max) — capping them at four rows squashed the oscilloscope into a
+    strip and threw away its axis gutter, graticule and edge markers."""
+    from app import AREA_CHART_ROWS, CHART_MAX, DGXTop
+
+    _config(tmp_path / "config.toml", chart="oscilloscope")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(90, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        await _resize(pilot, 90, 44)
+        assert app._chart_rows > AREA_CHART_ROWS, app._chart_rows
+        assert app._chart_rows <= CHART_MAX["roomy"], app._chart_rows
+        await _resize(pilot, 132, 44)
+        assert app.tiled and app._chart_rows > AREA_CHART_ROWS, app._chart_rows
         assert app.screen.max_scroll_y == 0
 
 

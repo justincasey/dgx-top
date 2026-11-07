@@ -10,11 +10,12 @@ theme = "dgx-dark"
 #   line     = thin hairline fill over a hairline track
 meter_treatment = "gradient"
 # Decode chart renderer in the SERVING pane:
-#   area         = four-row ramp-coloured area chart, no gutter or overlays
+#   area         = four-row ramp-coloured strip, no gutter or overlays
 #                  (default; the reference footer)
 #   oscilloscope = dim graticule, bright leading window, edge markers and
-#                  inline labels, Δ5 slope readout
-#   lines        = legacy smooth braille lines with translucent fills
+#                  inline labels, Δ5 slope readout; fills the spare height
+#   lines        = legacy smooth braille lines with translucent fills; also
+#                  fills the spare height
 chart = "area"
 # Quiet mode: calm the whole UI — identity hues render neutral and colour
 # appears only on caution/critical. Composes with any meter treatment.
