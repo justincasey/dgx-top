@@ -286,7 +286,12 @@ def _meter_line(
         color = pal.warn
     if treatment == "spark":
         data = list(history) if history else [pct]
-        return _spark_line(data, color, max(1, width))
+        # A short (or brand-new) history is resampled across the whole meter
+        # instead of leaving it nearly blank; the newest sample stays at the
+        # right edge and the row still spans the card. Every meter input is a
+        # 0-100 percentage, so the row is scaled against 100 rather than the
+        # series' own extremes.
+        return _spark_line(_stretch(data, max(1, width)), color, max(1, width), ceiling=100.0)
     f = round(pct / 100 * width)
     if treatment == "line":
         return Text.assemble(
@@ -315,14 +320,27 @@ def _stretch(data: list[float], width: int) -> list[float]:
     return [data[i * n // width] for i in range(width)]
 
 
-def _spark_line(data: list[float], color: str, width: int) -> Text:
-    """Block sparkline (▁…█), single owning hue per series."""
+def _spark_line(data: list[float], color: str, width: int, ceiling: float | None = None) -> Text:
+    """Block sparkline (▁…█), single owning hue per series.
+
+    Heights scale from a ZERO baseline, never min…max: the lowest sample of
+    a window is a reading, not the floor of the scale. Percent meters pass
+    their fixed ``ceiling`` (100) so a block's height means the value it
+    prints; a series with no fixed domain (token rate) scales to its own
+    peak, the same 0…max scaling the serving chart uses.
+
+    Min-max did neither: a GPU steady at 96% collapsed onto the lowest
+    glyph and read as 0% beside its own 96% label, while one unit of jitter
+    in the same window saturated the row to 100%."""
     if not data or width <= 0:
         return Text(" " * width)
-    lo, hi = min(data), max(data)
-    span = (hi - lo) or 1
+    values = [v for v in data if math.isfinite(v)][-width:]
+    if not values:
+        return Text(" " * width)
+    hi = ceiling if ceiling and ceiling > 0 else max(values)
+    span = hi if hi > 0 else 1.0
     glyphs = "▁▂▃▄▅▆▇█"
-    seg = "".join(glyphs[min(7, int((v - lo) / span * 7.999))] for v in data[-width:])
+    seg = "".join(glyphs[min(7, int(min(1.0, max(0.0, v / span)) * 7.999))] for v in values)
     seg = seg.ljust(width)[:width]
     return Text(seg, style=f"bold {color}")
 

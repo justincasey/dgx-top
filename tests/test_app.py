@@ -1277,6 +1277,46 @@ async def test_spark_treatment_renders(tmp_path: Path, monkeypatch):
         assert not any(ch in kv_row for ch in spark_chars), kv_row
 
 
+def test_spark_meter_scales_against_its_value_not_the_series_extremes():
+    """A meter block's height must mean the value it prints.
+
+    Live regression: a node's GPU sat at a steady 96% and its spark meter drew
+    the LOWEST block across the row — min…max normalization mapped a flat
+    series onto the bottom, so the tile read as "no GPU usage" beside its own
+    96% label while the other nodes (one unit of jitter) drew █."""
+    from app import _meter_line, _spark_line
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("dgx-aeon"))
+
+    def steady(pct: float) -> str:
+        return _meter_line("spark", pct, 20, pal, pal.blue, [pct] * 40).plain
+
+    assert steady(96.0) == "█" * 20
+    assert steady(50.0) == "▄" * 20
+    assert steady(0.0) == "▁" * 20
+    # A brand-new/short history fills the row at that height, not one glyph.
+    assert _meter_line("spark", 96.0, 20, pal, pal.blue, [96.0]).plain == "█" * 20
+    # A series with no percent domain (token rate) keeps its own 0…peak scale.
+    assert _spark_line([30, 60], pal.blue, 2).plain == "▄█"
+    # Non-finite samples never reach the glyph arithmetic.
+    assert _spark_line([float("nan"), float("inf")], pal.blue, 4).plain == " " * 4
+
+
+async def test_steady_gpu_history_does_not_render_as_an_empty_meter(tmp_path: Path, monkeypatch):
+    import collections
+
+    async with _treated_app(tmp_path, monkeypatch, "spark") as (app, pilot):
+        await pilot.pause()
+        app.history["gpu-head"] = collections.deque([96.0] * 25, maxlen=25)
+        app._update_ui()
+        await pilot.pause()
+        row, _, _ = _meter_row(app)
+        assert "▁" not in row, row  # not the empty-looking bottom row
+        cells = [ch for ch in row if ch in "▁▂▃▄▅▆▇█"]
+        assert cells and cells.count("█") >= len(cells) - 2, row
+
+
 async def test_gpu_mem_history_recorded(tmp_path: Path, monkeypatch):
     from app import NodeBox
 
