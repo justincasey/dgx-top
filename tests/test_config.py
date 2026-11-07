@@ -144,7 +144,7 @@ def test_meter_treatment_validation(tmp_path: Path):
 
 
 def test_chart_validation(tmp_path: Path):
-    for chart in ("oscilloscope", "lines"):
+    for chart in ("area", "oscilloscope", "lines"):
         path = tmp_path / f"{chart}.toml"
         path.write_text(_with_app_line(f'chart = "{chart}"'))
         assert load_config(path).chart == chart
@@ -154,8 +154,8 @@ def test_chart_validation(tmp_path: Path):
     with pytest.raises(ConfigError, match="app.chart"):
         load_config(path)
 
-    # default is the oscilloscope
-    assert load_config(_write(tmp_path)).chart == "oscilloscope"
+    # default is the reference area chart
+    assert load_config(_write(tmp_path)).chart == "area"
 
 
 def test_quiet_validation(tmp_path: Path):

@@ -154,6 +154,7 @@ worker = true
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
 | `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
+| `chart`          | SERVING footer renderer: `area` (default, the four-row ramp chart), `oscilloscope`, or `lines` |
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 | `clock_ceiling_mhz` | Default GPU clock ceiling in MHz for the `c` menu, applied as `nvidia-smi -lgc 0,<ceiling>`, from 1500 to 2400 (default 2200); the menu opens on the recorded lock instead when the nodes have one |
 | `phys_gib`       | Physical memory per node in GiB, from 16 to 4096 (default 128); the part Linux's `MemTotal` does not show counts as reserved |
@@ -218,18 +219,30 @@ btop-style caret tab, with a right-edge meta tab flush at the corner:
 ```
 
 The caret and role are cyan for the host, orange for a worker; the SERVING
-title carries the model in magenta, and every window border is dim grey. The
+title carries the model in the body foreground (per-model hues return when
+several models are served), and every window border is dim grey. The
 **waybar** rides the top and is the **only chrome**: one row with the controls
 left — single-word labels, each hotkey underlined (`s scan`, `+/- poll`,
 `r refresh`, `c clock`, `t theme`, `q quit`) — and the working stats right:
-a warn marker when a node is unreachable or hot, gen `tok/s`, KV%, the
-clock-lock chip and the `● online/total` fleet chip. The legend gives way
-first, shedding entries from its tail, then the stats drop in order (KV before
-gen, the lock chip after gen); the fleet chip is the last thing kept. The
-model still names itself in the SERVING window's title; the topology label
-(`DUAL`/`SWITCHED`) leaves with the header title and is not shown elsewhere.
-The footer status bar is dropped at every size — the header carries gen, KV%
-and the online count even in the compressed table view.
+a warn marker when a node is unreachable or hot, gen `tok/s`, the clock-lock
+chip and the `● online/total` fleet chip. The legend gives way first, shedding
+entries from its tail, then the stats drop in order (the rate, then the lock
+chip); the fleet chip is the last thing kept. The model names itself in the
+SERVING window's title and the pool reading lives on its `kv%` row, so the bar
+carries live rates only; the topology label (`DUAL`/`SWITCHED`) leaves with the
+header title and is not shown elsewhere. The footer status bar is dropped at
+every size.
+
+The SERVING pane is a strict column grid, not free-form text: a **9-cell label
+gutter**, a **22-cell graph**, a two-space gap, then the value — so every value
+in the pane starts on the same cell, and a short figure never shifts the column
+beside it.
+
+```
+│ gen      ▁▂▃▅▇█▆▄▂▁▂▄▆▇█▇▅▃▁▂▄▆█  1435 tok/s   │
+│ kv       ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁▂▃▄▅▆▇█  587K/3.8M tok │
+│ kv%      ███▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  15%          │
+```
 
 The semantic palette maps every theme onto these roles:
 
@@ -248,10 +261,11 @@ The semantic palette maps every theme onto these roles:
 
 Utilization meters are btop gradient bars — each `█` cell ramps
 green → yellow → orange → red by fill position; identity metrics (KV) keep a
-single hue over a dim `▓` track. Alarm state never depends on color alone:
-`✗` marks an unreachable node, `!!` a TTFT p95 past 8s and `!` past 2s, and the
-value is bold. `dgx-aeon` is the default; `tokyo-night` renders the design's
-exact reference hues.
+single hue over a dim `▓` track, and the SERVING `kv%` row is that same plain
+bar. The area chart footer ramps the same way by column height. Alarm state
+never depends on color alone: `✗` marks an unreachable node, `!!` a TTFT p95
+past 8s and `!` past 2s, and the value is bold. `dgx-aeon` is the default;
+`tokyo-night` renders the design's exact reference hues.
 
 ## Preflight checks
 
@@ -277,41 +291,36 @@ always keeps the most detail it can carry:
 
 | Composition | Layout |
 | --- | --- |
-| Wide, few nodes | SERVING tiles left with a tall time-series line chart; node cards stack right beside it, each a full card (meters, core grid, RoCE) |
+| Wide, few nodes | SERVING tiles left with the four-row area footer; node cards stack right beside it, each a full card (meter, core grid, RoCE) |
 | Wide, many nodes | SERVING left with the chart; the right column wraps a **card grid** (each tile held at a usable width) |
 | Narrow, few nodes | SERVING hero on top, full **card** tiles in one row |
 | Narrow, many nodes | SERVING hero on top, node **cards tile into rows** below, each held at a minimum width; when no usable card fits, every node collapses to a **condensed table row** |
 
-Height picks how tight it gets. Every candidate tier — `roomy` → `dense` →
-`compact` → `rail` → `floor` — has an exact total height for the current width,
-node count and arrangement (calibrated to the real rendered heights), and the
-densest tier that fits wins, so the dashboard degrades one step at a time and
-**never scrolls** (`overflow-y: hidden`); the floor tier packs every node into a
-compact condensed table row and fits down to an 8-row viewport. The tiled
-arrangement is used only when it reaches a tier at least as rich as the
-stacked one, so a narrow right column never densifies the serving surface:
+Height picks how tight it gets. Every candidate tier — `roomy` → `compact` →
+`rail` → `floor` — has an exact total height for the current width, node count
+and arrangement (calibrated to the real rendered heights), and the densest tier
+that fits wins, so the dashboard degrades one step at a time and **never
+scrolls** (`overflow-y: hidden`); the floor tier packs every node into a compact
+condensed table row and fits down to an 8-row viewport. The tiled arrangement is
+used only when it reaches a tier at least as rich as the stacked one, so a
+narrow right column never densifies the serving surface:
 
 | Tier | Look |
 | --- | --- |
-| `roomy` | Full metric rows, gradient meters, two-row core grid, a SERVING multi-series line chart that **grows into the leftover height** (up to the tier max) |
-| `dense` | The same rows with a shorter upper chart bound |
-| `compact` | Node cards keep their **meters and core grid** (RoCE drops first) as long as the tile is wide enough; SERVING keeps a small line chart and favours gen (the last chart visual) + requests + ttft |
-| `rail` | SERVING chart gone (gen/req/ttft/kv% remain); node cards run gpu/mem/cpu text; the waybar stays visible carrying gen/kv/online |
+| `roomy` | The full reference grammar: `gen` / `prompt` / `kv` / `kv%` graphs, requests, cache, ttft, `deploy`, one `rank` row per node, and the four-row area footer; node cards carry the gradient meter, the stack legend and RoCE |
+| `compact` | The `prompt` and `kv%` graphs and the chart drop; SERVING keeps gen/kv/requests/cache/ttft/deploy/rank; node cards keep gpu/mem/bar/cpu/cores and shed the meters, legend and RoCE |
+| `rail` | SERVING folds to a fused gen/req/ttft/kv surface (no chart); node cards run gpu/mem/cpu text; the waybar stays visible |
 | `floor` | The never-scroll bottom: each node becomes one **condensed table row** (`● 3  87%  62%  61%`), SERVING to gen/req/ttft, no window frames |
 
-**Bounded fill, then breathe.** The fit selector guarantees the natural content
-fits; the SERVING line chart is fit-computed (never thinner than its tier
-minimum, never taller than its tier maximum) so leftover viewport rows become
-graph, and only when a tier caps out does symmetric breathing room frame the
-dashboard rather than stretching any panel into a slab. As the layout
-densifies, lower-value data is dropped rather than crammed: node cards favour
-`gpu · mem · cpu` and shed RoCE, then the meters/core grid, for plain text; the
-SERVING surface favours gen, the requests line (concurrency) and TTFT, dropping
-the window stat first and the large line chart before the gen sparkline. The
-base surface — node gpu/mem/cpu and serving gen/req/ttft (+ KV% through rail) —
-never disappears at any size. With several models served at once, the wide
-SERVING pane becomes a single multi-model view: a gen/requests/ttft row per
-model and one shared time axis in the line chart, one hue per model.
+**Fixed footer, no breathing room.** The reference chart is a four-row footer,
+not a fit-computed pane: the row bands are identical at every terminal size and
+surplus height stays at the bottom of the viewport. As the layout densifies,
+lower-value data is dropped rather than crammed: node cards shed the meters and
+RoCE before the bar, then the headline block; the SERVING surface drops the
+prompt and kv% graphs, then the chart, then the deploy/rank block. The base
+surface — node gpu/mem/cpu and serving gen/req/ttft/kv — never disappears at any
+size. With several models served at once, the requests and ttft rows go
+per-model (one row each) while the gen row reports the cluster aggregate.
 
 ## Memory stack
 
@@ -340,10 +349,11 @@ plain MEM meter; nothing else changes. Only some ranks log a plan (a TensorFold
 worker rank, for instance, prints none); point `log` at a file that has one, or
 leave that node on the plain meter.
 
-Full node cards (`roomy`/`dense`) add a colour-key row under the bar; `compact`
-cards draw the bar alone; the `floor` table row carries a 6-cell mini bar when
-it fits. The bar lives on the node cards only — SERVING keeps its stats
-grammar and chart.
+Full node cards add a colour-key row under the bar (`■wts 26 ■gfx 1.0 ■kv 11
+■oth 5.5*`, the `*` marking the one derived figure); `compact` cards draw the
+bar alone; the `floor` table row carries a short mini bar when it fits. The bar
+is also mirrored in the SERVING pane's `rank 0` / `rank 1` rows, so every rank's
+accounting can be compared side by side.
 
 ## Finding inference endpoints
 

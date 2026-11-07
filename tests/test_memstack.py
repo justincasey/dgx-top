@@ -141,10 +141,10 @@ def test_stack_legend_drops_whole_items_at_the_width_budget():
 
     pal = _palette()
     st = mem_stack(_unit())
-    assert _stack_legend(st, 7, pal).plain == ""  # the first item needs 8
-    assert _stack_legend(st, 8, pal).plain == "■wts 60G"
-    assert _stack_legend(st, 20, pal).plain == "■wts 60G ■kv 12G"  # oth needs 25
-    assert _stack_legend(st, 40, pal).plain.endswith("■gfx 1.0G")
+    assert _stack_legend(st, 6, pal).plain == ""  # the first item needs 7
+    assert _stack_legend(st, 7, pal).plain == "■wts 60"
+    assert _stack_legend(st, 18, pal).plain == "■wts 60 ■gfx 1.0"  # kv needs 24
+    assert _stack_legend(st, 40, pal).plain.endswith("■oth 27*")
 
 
 def test_stack_cells_kv_pool_shows_measured_fill_and_unfilled_remainder():
@@ -209,7 +209,8 @@ async def test_node_card_replaces_mem_meter_with_stack_bar_and_legend(tmp_path: 
         node = app.query_one("#node-0", NodeBox)
         lines = node.render().plain.split("\n")
         text = "\n".join(lines)
-        assert "wts 60G" in text and "kv 12G" in text and "oth 27G" in text
+        assert "wts 60" in text and "kv 12" in text and "oth 27*" in text
+        assert "Σ100*" in next(ln for ln in lines if ln.startswith("│ mem "))
         mem = next(i for i, ln in enumerate(lines) if ln.startswith("│ mem "))
         assert "╱" in lines[mem + 1]  # the bar (with its reserved slice) sits under the headline
         assert "■wts" in lines[mem + 2]  # the legend row follows the bar
@@ -238,9 +239,10 @@ async def test_node_card_without_a_plan_keeps_the_plain_mem_meter(tmp_path: Path
         assert not app._has_stack
 
 
-async def test_serving_pane_does_not_duplicate_the_node_bars(tmp_path: Path, monkeypatch):
-    """The stack lives on the node cards only: SERVING carries no deploy block
-    (its rows are the stats grammar plus the chart)."""
+async def test_serving_pane_carries_the_rank_block(tmp_path: Path, monkeypatch):
+    """The reference serving pane owns the deploy line and one rank row per
+    node, each carrying a copy of that node's bar and its plan total — the
+    pane's cross-check that every rank accounts for the same model."""
     from app import DGXTop, ServingBox
 
     _config(tmp_path / "c.toml")
@@ -251,7 +253,13 @@ async def test_serving_pane_does_not_duplicate_the_node_bars(tmp_path: Path, mon
         await pilot.pause()
         assert app._has_stack
         text = app.query_one("#serving", ServingBox).render().plain
-        assert "deploy" not in text and "╱" not in text and "wts" not in text
+        assert "deploy  vllm · TP2" in text
+        ranks = [ln for ln in text.splitlines() if "rank " in ln]
+        assert len(ranks) == 2, ranks
+        assert "head" in ranks[0] and "worker" in ranks[1], ranks
+        # Each rank row carries the same bar grammar as the node card.
+        assert "╱" in ranks[0] and "╱" in ranks[1], ranks
+        assert "100G*" in ranks[0] and "98G*" in ranks[1], ranks
 
 
 async def test_plan_arriving_late_grows_the_node_card_without_clipping(tmp_path: Path, monkeypatch):
