@@ -59,6 +59,7 @@ TILING_GUTTER = 1  # blank column between the tiled serving and node column
 NODE_CARD_MIN = 22  # a usable card (text) shows gpu/mem/cpu; below this -> table
 NODE_FULL_MIN = 26  # a tile at/above this keeps the meter/core/RoCE grammar
 NODE_FLOOR_MAX = 20  # condensed table rows prefer this width (keeps gpu/mem/cpu)
+FLOOR_GAP = 3  # blank cells that separate two condensed nodes packed side by side
 GIB = 1024**3
 SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 
@@ -67,6 +68,10 @@ SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 # pane lands on the same cell regardless of its digits.
 SERVING_LABEL_W = 9
 SERVING_GRAPH_W = 22
+# Wildest reference row: gutter, graph, gap, and the ttft tail value column.
+SERVING_ROW_COL_W = 57
+SERVING_SIDE_CHART_MIN = 20  # narrowest useful side chart
+SERVING_SIDE_MIN_ROWS = 4  # under this, a stacked chart is not worth a row
 _TAB_GAP = 3  # rule cells required between a window's title tab and meta tab
 
 # The `area` renderer is the reference's fixed four-row footer: it never
@@ -1188,17 +1193,30 @@ class ServingBox(Static):
         # fused rows are the whole surface (the fit engine mirrors this).
         chart_rows = 0 if width < SERVING_NARROW_WIDTH else getattr(self.app, "_chart_rows", 0)
         interior = self._interior_rows(pal, width, _density(self), tier)
-        rows = list(interior)
-        if chart_rows:
-            rows.append(Text(""))
-            rows.extend(self._chart(pal, width, chart_rows))
+        height = self.expected_height
+        # Wide and short: the rows cannot stack a chart under them, so the
+        # chart takes the pane's right-hand side at the full interior height
+        # instead of leaving half the frame empty.
+        below = height - 2 - len(interior) - 1 if height else chart_rows
+        side = (
+            width >= SERVING_NARROW_WIDTH
+            and width - 4 >= SERVING_ROW_COL_W + 1 + SERVING_SIDE_CHART_MIN
+            and below < SERVING_SIDE_MIN_ROWS
+        )
+        if side:
+            rows = self._side_rows(pal, width, tier)
+            chart_rows = 0  # the chart is already in the rows, beside them
+        else:
+            rows = list(interior)
+            if chart_rows:
+                rows.append(Text(""))
+                rows.extend(self._chart(pal, width, chart_rows))
         kv = self._kv or {}
         total_tok = kv.get("total_tok", 0)
         # A stretched frame (tiled desk) keeps its slack as blank rows inside
         # the border, under the top-anchored grammar. Never measure the
         # widget's own ``size`` here: that height is the padding's own output
         # and would ratchet the frame and never let it shrink again.
-        height = self.expected_height
         for _ in range(max(0, height - 2 - len(rows))):
             rows.append(Text(""))
         rtab = [(f"{_fmt_tokens(total_tok)} tok" if total_tok else "—", pal.dim)]
@@ -1226,8 +1244,30 @@ class ServingBox(Static):
             title.append((self._model(), pal.accent))
         return Text("\n").join(_box_lines(width, title, rtab, rows, False, pal))
 
+    def _side_rows(self, pal: Palette, width: int, tier: str) -> list[Text]:
+        """Rows for a wide, short pane: the metric column keeps its reference
+        width and the chart takes every remaining cell at the full interior
+        height. The chart is the pane's only elastic element, so on a pane too
+        short to stack it under the rows it belongs beside them."""
+        inner = max(1, width - 4)
+        row_w = SERVING_ROW_COL_W
+        chart_w = max(1, inner - row_w - 1)
+        interior = self._interior_rows(pal, row_w + 4, _density(self), tier)
+        if self.expected_height:
+            interior = interior[: max(1, self.expected_height - 2)]
+        foot = (
+            1 if getattr(getattr(self.app, "settings", None), "chart", "") == "oscilloscope" else 0
+        )
+        chart = self._chart(pal, chart_w + 4, max(1, len(interior) - foot))
+        blank = Text(" " * chart_w)
+        rows: list[Text] = []
+        for i, row in enumerate(interior):
+            right = chart[i] if i < len(chart) else blank
+            rows.append(Text.assemble(_fit(row, row_w), Text(" "), _fit(right, chart_w)))
+        return rows
+
     def _chart(self, pal: Palette, width: int, chart_rows: int) -> list[Text]:
-        """The pane's footer chart. ``area`` (the reference look) is a ramp-
+        """The pane's footer chart: ``area`` (the reference look) is a ramp-
         coloured area chart with no gutter, axis labels or overlay marks;
         ``oscilloscope`` and ``lines`` keep the instrumented renderers."""
         mode = getattr(getattr(self.app, "settings", None), "chart", "area")
@@ -1465,10 +1505,13 @@ class ServingBox(Static):
         width the aggregate rate and latency are the whole surface."""
         s = self._kv or {}
         r = []
-        gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
+        # The gen value is the CURRENT decode rate — the last sample, the same
+        # number the waybar prints. Averaging the window here made the row
+        # drift slowly upward and disagree with the header.
+        gen_now = self._gen_data[-1] if self._gen_data else 0.0
         gen = Text.assemble(
             Text("gen ", style=pal.dim),
-            Text(f"{gen_avg:.0f}", style=f"bold {pal.ok}")
+            Text(f"{gen_now:.0f}", style=f"bold {pal.ok}")
             if self._gen_data
             else Text("—", style=pal.dim),
             Text(" tok/s", style=pal.dim),
@@ -1523,12 +1566,12 @@ class ServingBox(Static):
     def _floor_rows(self, pal: Palette, width: int) -> list[Text]:
         """Never-scroll floor: the base serving surface (gen · requests ·
         ttft) with no window frame."""
-        gen_avg = sum(self._gen_data) / len(self._gen_data) if self._gen_data else 0.0
+        gen_now = self._gen_data[-1] if self._gen_data else 0.0
         s = self._kv or {}
         r = []
         gen = Text.assemble(
             Text("gen ", style=pal.dim),
-            Text(f"{gen_avg:.0f}", style=f"bold {pal.ok}")
+            Text(f"{gen_now:.0f}", style=f"bold {pal.ok}")
             if self._gen_data
             else Text("—", style=pal.dim),
             Text(" tok/s", style=pal.dim),
@@ -1640,8 +1683,9 @@ class NodeBox(Static):
 
     def _table_row(self, s: SparkUnitStats, pal: Palette, width: int) -> Text:
         """One aligned condensed-table row: online glyph, short label, then
-        right-aligned GPU / MEM / CPU util. No window frame; _fit truncation
-        keeps the label and GPU first when the tile is tight."""
+        right-aligned GPU / MEM / CPU util and the stack bar. The tile keeps a
+        trailing gap so two nodes side by side never read as one run of
+        numbers; _fit truncation keeps the label and GPU first when tight."""
         if s.online:
             gpu = f"{s.gpu_util_pct:.0f}%"
             mem = f"{s.mem_used_bytes / s.mem_total_bytes * 100:.0f}%" if s.mem_total_bytes else "—"
@@ -1653,7 +1697,7 @@ class NodeBox(Static):
         parts = [
             Text("● " if s.online else "✗ ", style=pal.ok if s.online else pal.warn),
             Text(_short_label(s.label), style=f"bold {pal.fg}"),
-            Text("  ", style=""),
+            Text("   ", style=""),
             Text(f"{gpu:>4}", style=f"bold {pal.blue}"),
             Text(" ", style=pal.dim),
             Text(f"{mem:>4}", style=f"bold {pal.ok}" if s.online else pal.dim),
@@ -1663,10 +1707,13 @@ class NodeBox(Static):
         stack = mem_stack(s)
         if stack:
             parts += [Text(" ", style=pal.dim), _stack_cells(stack, 6, pal)]
+        # The trailing gap is part of the tile: the grid packs tiles flush, so
+        # the separation between nodes has to live inside the row.
+        avail = max(1, width - FLOOR_GAP)
         out = Text.assemble()
         for part in parts:
-            if out.cell_len + part.cell_len > width:
-                break  # drop trailing fields (cpu, then mem) cleanly, no ellipsis
+            if out.cell_len + part.cell_len > avail:
+                break  # drop trailing fields (bar, then cpu, then mem) cleanly
             out.append_text(part)
         return _fit(out, width)
 
@@ -1928,7 +1975,10 @@ def _floor_cols(grid_w: int, n: int, row_budget: int) -> int:
     the height budget allows (``row_budget`` node rows) and no wider than
     NODE_FLOOR_MAX cells, so a row keeps its gpu/mem/cpu fields when the
     column can carry them and the never-scroll floor holds."""
-    cols = max(-(-n // max(1, row_budget)), max(1, grid_w // NODE_FLOOR_MAX))
+    cols = max(
+        -(-n // max(1, row_budget)),
+        max(1, (grid_w + FLOOR_GAP) // (NODE_FLOOR_MAX + FLOOR_GAP)),
+    )
     return min(n, cols)
 
 
@@ -2534,6 +2584,14 @@ class DGXTop(App):
         pad = self._body_pad(avail, tier, tiled, node_h, serv_h)
         sw = _serving_tiled_width(width) if tiled else 0
         nw = width - sw - TILING_GUTTER if tiled else 0
+        if tiled and sw >= SERVING_NARROW_WIDTH:
+            # The stretched frame hands every interior row it has left to the
+            # chart, whatever tier fitted: the desk column (not the fit
+            # engine) is what sets the pane's height, so the chart takes the
+            # difference and gains the resolution for it.
+            base = _serving_base(tier, sw, self._models_n)
+            foot = 1 if self.settings.chart == "oscilloscope" else 0
+            chart = max(chart, max(serv_h, node_h) - 2 - base - 1 - foot)
         if (
             density == self.density
             and cols == self.cols

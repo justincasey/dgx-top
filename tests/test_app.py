@@ -1561,6 +1561,12 @@ async def test_condensed_table_row_shows_gpu_mem_cpu(tmp_path: Path, monkeypatch
         assert "73%" in line  # gpu util
         assert "52%" in line  # mem util
         assert "50%" in line  # cpu util
+        # Each node's tile ends with a gap, so a packed floor row reads as
+        # separate nodes rather than one run of numbers.
+        from app import FLOOR_GAP
+
+        assert line[:-FLOOR_GAP].strip() == line.strip()
+        assert line[-FLOOR_GAP:].strip() == ""
         assert app.screen.max_scroll_y == 0
 
 
@@ -1601,7 +1607,8 @@ async def test_serving_never_mentions_window(tmp_path: Path, monkeypatch):
 async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
     """AC2: the graphs survive an extra tier. At compact the node cards still
     carry the meters + core grid (RoCE is the first graph to go) and the
-    serving keeps a multi-row gen line chart (braille dots)."""
+    serving keeps a multi-row gen line chart (braille dots) in the rows the
+    stretched frame leaves it."""
     from app import DGXTop, NodeBox, ServingBox
 
     _config(tmp_path / "config.toml")
@@ -1613,13 +1620,14 @@ async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
         _seed_history(app)
         await _resize(pilot, 132, 16)
         assert app.density == "compact" and not app.rail and not app.floor
-        assert app._chart_rows == 0, app._chart_rows  # the reference compact drops the chart
+        assert app._chart_rows > 0, app._chart_rows  # the frame's slack is the chart's
         serv_lines = app.query_one("#serving", ServingBox).render().plain.split("\n")
-        # the gen and kv spark rows survive; prompt / kv% / the chart do not
+        # the gen and kv spark rows survive; prompt and kv% do not
         assert any(ln[2:].startswith("gen") for ln in serv_lines), serv_lines
         assert any(ln[2:].startswith("kv ") for ln in serv_lines), serv_lines
         assert not any(ln[2:].startswith("prompt") for ln in serv_lines), serv_lines
         assert not any(ln[2:].startswith("kv%") for ln in serv_lines), serv_lines
+        assert any(any(ch in ln for ch in "▁▂▃▄▅▆▇█⣿⡀⠉") for ln in serv_lines[6:]), serv_lines
         node = app.query_one("#node-0", NodeBox).render().plain
         assert "73%" in node and "52%" in node and "50%" in node
         assert "■" in node, "core grid survives compact"
@@ -1629,10 +1637,12 @@ async def test_compact_keeps_meter_cards_and_chart(tmp_path: Path, monkeypatch):
 
 
 async def test_serving_chart_is_a_fixed_footer(tmp_path: Path, monkeypatch):
-    """The reference chart is a fixed four-row footer: it never grows with
-    height (surplus height stays at the bottom), and the body is anchored to
-    the row under the bar rather than centred."""
-    from app import AREA_CHART_ROWS, DGXTop
+    """In the stacked arrangement the reference chart is a four-row footer:
+    it never grows with height (surplus height stays at the bottom the body is
+    anchored to). In the tiled desk the frame is sized by the node column and
+    the chart takes every row the metrics do not, so the pane has no dead
+    space."""
+    from app import AREA_CHART_ROWS, DGXTop, ServingBox
 
     _config(tmp_path / "config.toml")
     configure(tmp_path / "config.toml")
@@ -1647,7 +1657,12 @@ async def test_serving_chart_is_a_fixed_footer(tmp_path: Path, monkeypatch):
         body = app.query_one("#body")
         assert body.region.y <= 1, body.region  # top-anchored, not padded
         await _resize(pilot, 132, 44)
-        assert app.tiled and app._chart_rows == AREA_CHART_ROWS, app._chart_rows
+        assert app.tiled and app._chart_rows >= AREA_CHART_ROWS, app._chart_rows
+        # The chart fills the stretched frame: interior = base + spacer + chart
+        serving = app.query_one("#serving", ServingBox)
+        interior = len(serving.render().plain.splitlines()) - 2
+        assert app._chart_rows > AREA_CHART_ROWS, app._chart_rows
+        assert app._chart_rows <= interior, (app._chart_rows, interior)
         assert app.screen.max_scroll_y == 0
 
 
@@ -1671,6 +1686,62 @@ async def test_oscilloscope_still_fills_the_leftover_height(tmp_path: Path, monk
         await _resize(pilot, 132, 44)
         assert app.tiled and app._chart_rows > AREA_CHART_ROWS, app._chart_rows
         assert app.screen.max_scroll_y == 0
+
+
+async def test_fused_gen_row_shows_the_current_rate_not_the_window_mean(
+    tmp_path: Path, monkeypatch
+):
+    """The fused (rail) and floor grammars print the CURRENT decode rate — the
+    last sample, the number the waybar prints. Averaging the history made the
+    row drift upward and disagree with the header, which read as fabricated
+    telemetry."""
+    from app import DGXTop, ServingBox, _palette_for
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(90, 44)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#serving", ServingBox)
+        box.update_throughput([100.0, 300.0, 900.0], [])
+        pal = _palette_for(app)
+        rail = [r.plain for r in box._narrow_rows(pal, 80, "rail")]
+        assert rail[0].startswith("gen 900 tok/s"), rail
+        floor = [r.plain for r in box._floor_rows(pal, 80)]
+        assert floor[0].startswith("gen 900 tok/s"), floor
+        # No samples at all is unknown, never a confident zero.
+        box.update_throughput([], [])
+        assert [r.plain for r in box._narrow_rows(pal, 80, "rail")][0].startswith("gen — tok/s")
+
+
+async def test_wide_short_pane_puts_the_chart_beside_the_rows(tmp_path: Path, monkeypatch):
+    """A pane too short to stack a chart under the metrics gives it the right
+    half of the frame at full interior height instead of leaving it empty."""
+    from app import SERVING_ROW_COL_W as ROW_COL_W
+    from app import DGXTop, ServingBox
+
+    _config_cluster(tmp_path / "config.toml", 4)
+    configure(tmp_path / "config.toml")
+    _stub_n(monkeypatch, 4)
+    app = DGXTop()
+    async with app.run_test(size=(90, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        await _resize(pilot, 196, 15)
+        assert not app.tiled and app.rail
+        lines = app.query_one("#serving", ServingBox).render().plain.splitlines()
+        body = [ln[2:-2] for ln in lines[1:-1]]
+        assert len(body) == 4, body
+        # every row carries metric text on the left and chart glyphs on the right
+        marks = "▁▂▃▄▅▆▇█⣿⡀⠉⠒⠤┄·◉╱"
+        width = lines[0].cell_len if hasattr(lines[0], "cell_len") else len(lines[0])
+        for line in body:
+            left, right = line[:ROW_COL_W], line[ROW_COL_W + 1 :]
+            assert left.strip() and right.strip(), line
+            assert any(ch in right for ch in marks), line
+            assert len(line) < width, (len(line), width)
+        assert body[0].startswith("gen ") and body[-1].startswith("kv ")
 
 
 async def test_tiled_serving_frame_spans_the_node_column(tmp_path: Path, monkeypatch):
