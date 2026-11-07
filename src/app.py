@@ -35,7 +35,7 @@ from config import (
     save_node_endpoint,
 )
 from input_driver import ResilientLinuxDriver
-from stats import ClusterStats, SparkUnitStats
+from stats import ClusterStats, MemStack, SparkUnitStats, mem_stack
 from themes import CUSTOM_THEMES, SERIES_HUES, Palette, blend_toward, build_palette, series_hue
 
 log = logging.getLogger("dgx-top")
@@ -59,6 +59,7 @@ TILING_GUTTER = 1  # blank column between the tiled serving and node column
 NODE_CARD_MIN = 22  # a usable card (text) shows gpu/mem/cpu; below this -> table
 NODE_FULL_MIN = 26  # a tile at/above this keeps the meter/core/RoCE grammar
 NODE_FLOOR_MAX = 20  # condensed table rows prefer this width (keeps gpu/mem/cpu)
+GIB = 1024**3
 SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 
 # Bounded growth (bounded + breathe): the SERVING area chart fills the
@@ -375,6 +376,118 @@ def _cores_line(vals: list[float], pal: Palette, spaced: bool = True) -> Text:
             parts.append(Text(" "))
         parts.append(Text("■", style=f"bold {_ramp(v, pal)}"))
     return Text.assemble(*parts)
+
+
+_EIGHTHS = "▏▎▍▌▋▊▉"  # left-aligned 1/8 … 7/8 blocks: sub-cell segment boundaries
+
+
+def _fmt_gib(b: float) -> str:
+    """Compact GiB figure: one decimal below 10 (``0.3``, ``9.1``), none above."""
+    g = b / GIB
+    return f"{g:.1f}" if g < 9.95 else f"{g:.0f}"
+
+
+def _stack_tones(pal: Palette) -> dict[str, str]:
+    """Stack segment hues from the semantic palette: weights → ok (the MEM
+    hue), graphs → warn, kv → accent (the KV hue) with the pool's unfilled
+    remainder the same hue dimmed toward the canvas but never off it,
+    other → a lifted dim, free/reserved → the meter track."""
+    return {
+        "weights": pal.ok,
+        "graphs": pal.warn,
+        "kv": pal.accent,
+        "kv_free": blend_toward(pal.accent, pal.bg, 0.35),
+        "other": blend_toward(pal.dim, pal.fg, 0.4),
+        "free": pal.track,
+        "reserved": pal.track,
+    }
+
+
+def _stack_cells(stack: MemStack, width: int, pal: Palette) -> Text:
+    """The node's memory as one segmented bar (weights | graphs | kv | other |
+    free | reserved) whose whole width is physical RAM. A cell holding a
+    segment boundary is a left-eighth block painted segment-on-segment, so
+    boundaries land between cells; a cell spanning more than two segments
+    keeps the two that cover most of it. The kv pool splits into its measured
+    fill and the unfilled remainder (the whole pool one tone when the fill is
+    unknown)."""
+    kv_used = stack.kv if stack.kv_fill < 0 else stack.kv * min(100.0, stack.kv_fill) / 100
+    sizes = (
+        ("weights", stack.weights),
+        ("graphs", stack.graphs),
+        ("kv", kv_used),
+        ("kv_free", stack.kv - kv_used),
+        ("other", stack.other),
+        ("free", stack.free),
+        ("reserved", stack.reserved),
+    )
+    spans: list[tuple[str, float, float]] = []
+    at = 0.0
+    for key, size in sizes:
+        if size > 0:
+            spans.append((key, at, at + size))
+            at += size
+    if width <= 0 or not spans:
+        return Text(" " * max(0, width))
+    tone = _stack_tones(pal)
+    order = {key: i for i, (key, _s, _e) in enumerate(spans)}
+    per = at / width
+
+    def solid(key: str) -> Text:
+        if key == "free":
+            return Text("▓", style=tone["free"])
+        if key == "reserved":
+            return Text("╱", style=f"{pal.dim} on {pal.track}")
+        return Text("█", style=tone[key])
+
+    cells: list[Text] = []
+    for i in range(width):
+        lo, hi = i * per, (i + 1) * per
+        cover = [
+            (key, min(e, hi) - max(s, lo)) for key, s, e in spans if min(e, hi) - max(s, lo) > 1e-9
+        ]
+        if not cover:  # float edge on the last cell
+            cover = [(spans[-1][0], 1.0)]
+        if len(cover) == 1:
+            cells.append(solid(cover[0][0]))
+            continue
+        (lk, lw), (rk, rw) = sorted(
+            sorted(cover, key=lambda c: -c[1])[:2], key=lambda c: order[c[0]]
+        )
+        eighths = round(lw / (lw + rw) * 8)
+        if eighths <= 0:
+            cells.append(solid(rk))
+        elif eighths >= 8:
+            cells.append(solid(lk))
+        else:
+            cells.append(Text(_EIGHTHS[eighths - 1], style=f"{tone[lk]} on {tone[rk]}"))
+    return Text.assemble(*cells)
+
+
+def _stack_legend(stack: MemStack, width: int, pal: Palette) -> Text:
+    """Colour key for the stack bar with GiB figures, dropping trailing
+    entries (priority: weights, kv, other, graphs) once the row is full."""
+    tone = _stack_tones(pal)
+    items = (
+        ("wts", stack.weights, tone["weights"]),
+        ("kv", stack.kv, tone["kv"]),
+        ("oth", stack.other, tone["other"]),
+        ("gfx", stack.graphs, tone["graphs"]),
+    )
+    out = Text()
+    for name, size, color in items:
+        if size <= 0:
+            continue
+        part = Text.assemble(
+            Text("■", style=color), Text(f"{name} {_fmt_gib(size)}G", style=pal.dim)
+        )
+        gap = 1 if out.cell_len else 0
+        if out.cell_len + gap + part.cell_len > width:
+            break
+        if gap:
+            out.append(" ")
+        out.append_text(part)
+    return out
 
 
 def _area_chart_lines(data: list[float], rows: int, width: int, pal: Palette) -> list[Text]:
@@ -1680,6 +1793,9 @@ class NodeBox(Static):
             Text(" ", style=pal.dim),
             Text(f"{cpu:>4}", style=f"bold {pal.warn}" if s.online else pal.dim),
         ]
+        stack = mem_stack(s)
+        if stack:
+            parts += [Text(" ", style=pal.dim), _stack_cells(stack, 6, pal)]
         out = Text.assemble()
         for part in parts:
             if out.cell_len + part.cell_len > width:
@@ -1796,7 +1912,15 @@ class NodeBox(Static):
                     style=f"bold {pal.warn}" if swap_pct > 70 else f"bold {pal.fg}",
                 )
             rows.append(mem)
-            rows.append(_meter_line(_treatment(self), used_pct, mw, pal, pal.ok, self._mem_history))
+            stack = mem_stack(s)
+            if stack:
+                rows.append(_stack_cells(stack, mw, pal))
+                if roce:
+                    rows.append(_stack_legend(stack, iw, pal))
+            else:
+                rows.append(
+                    _meter_line(_treatment(self), used_pct, mw, pal, pal.ok, self._mem_history)
+                )
         elif s.online:
             rows.append(
                 Text.assemble(
@@ -1918,18 +2042,19 @@ def _serving_chart(tier: str, room: int) -> int:
     return min(CHART_MAX[tier], max(CHART_MIN[tier], room))
 
 
-def _node_tile_rows(tier: str, tile_w: int) -> int:
+def _node_tile_rows(tier: str, tile_w: int, stack: bool = False) -> int:
     """Rendered height of one node tile (borders included): a 1-row condensed
     table row at floor; a framed full card (meters + core grid + RoCE) when the
     tile is wide enough and roomy/dense; a framed compact meter card (meters +
     core grid, no RoCE); else a framed text card (gpu/mem/cpu only). The
     estimator passes the *widest* grid column (ceil of the column width) so the
-    full/meter/text decision matches what NodeBox.render actually does."""
+    full/meter/text decision matches what NodeBox.render actually does. A full
+    card with a memory stack carries one more row (the stack legend)."""
     if tier == "floor":
         return 1
     if tile_w >= NODE_FULL_MIN:
         if tier in ("roomy", "dense"):
-            return NODE_ROWS_FULL + 2
+            return NODE_ROWS_FULL + int(stack) + 2
         if tier == "compact":
             return NODE_ROWS_METER + 2
     return NODE_ROWS_TEXT + 2
@@ -1994,6 +2119,7 @@ def _tier_fit(
     tiled: bool,
     models: int = 1,
     chart_mode: str = "oscilloscope",
+    stack: bool = False,
 ) -> tuple[bool, int, int, int, int]:
     """(fits, cols, node_h, serv_h, chart) for one tier in one arrangement.
     Mirrors the CSS row grammar exactly (estimate/layout duality): the stacked
@@ -2008,10 +2134,14 @@ def _tier_fit(
             cols = _floor_cols(nw, n, avail - SERVING_ROWS_FLOOR)
         else:
             cols = _node_grid_columns(n, nw, tiled)
-        tile = _node_tile_rows(tier, -(-nw // cols))
+        tile = _node_tile_rows(tier, -(-nw // cols), stack)
         node_h = _grid_height(n, cols, tile, tier)
         base = _serving_base(
-            tier, sw, models, chart_mode, chart_rows=0 if tier in ("rail", "floor") else 1
+            tier,
+            sw,
+            models,
+            chart_mode,
+            chart_rows=0 if tier in ("rail", "floor") else 1,
         )
         chart = _serving_chart(tier, avail - base - 2)
         serv_h = base + chart + (2 if tier != "floor" else 0)
@@ -2021,10 +2151,14 @@ def _tier_fit(
         cols = _floor_cols(width, n, avail - SERVING_ROWS_FLOOR)
     else:
         cols = _node_grid_columns(n, width, tiled)
-    tile = _node_tile_rows(tier, -(-width // cols))
+    tile = _node_tile_rows(tier, -(-width // cols), stack)
     node_h = _grid_height(n, cols, tile, tier)
     base = _serving_base(
-        tier, width, models, chart_mode, chart_rows=0 if tier in ("rail", "floor") else 1
+        tier,
+        width,
+        models,
+        chart_mode,
+        chart_rows=0 if tier in ("rail", "floor") else 1,
     )
     if tier == "floor":
         serv_h = base  # bare floor lines, no window frame
@@ -2047,12 +2181,13 @@ def _tier_for(
     tiled: bool,
     models: int = 1,
     chart_mode: str = "oscilloscope",
+    stack: bool = False,
 ) -> str:
     """Densest tier whose estimated body fits (loosest first) for one
     arrangement; the floor is the unconditional fallback."""
     avail = height - WAYBAR_HEIGHT
     for tier in ("roomy", "dense", "compact", "rail"):
-        if _tier_fit(n, width, avail, tier, tiled, models, chart_mode)[0]:
+        if _tier_fit(n, width, avail, tier, tiled, models, chart_mode, stack)[0]:
             return tier
     return "floor"
 
@@ -2451,6 +2586,8 @@ class DGXTop(App):
         self._current_topology: str = ""
         self._host_model: str = ""
         self._models_n = 1
+        self._has_stack = False  # some node has a memory stack (adds a legend row)
+        self._in_kpis = False  # _update_kpis is re-entered by _apply_tier
         self._model_hue: dict[str, int] = {}
         self._model_hue_miss: dict[str, int] = {}
         self._last_size = (80, 24)
@@ -2494,8 +2631,12 @@ class DGXTop(App):
         right column must never densify the serving surface (the hero chart is
         the priority). Ties prefer the tiled layout the request asks for."""
         tiled = _arrangement(width)
-        tier_t = _tier_for(n, width, height, True, self._models_n, self.settings.chart)
-        tier_s = _tier_for(n, width, height, False, self._models_n, self.settings.chart)
+        tier_t = _tier_for(
+            n, width, height, True, self._models_n, self.settings.chart, self._has_stack
+        )
+        tier_s = _tier_for(
+            n, width, height, False, self._models_n, self.settings.chart, self._has_stack
+        )
         if tiled and _TIER_RANK[tier_t] <= _TIER_RANK[tier_s]:
             return True, tier_t
         return False, tier_s
@@ -2505,7 +2646,7 @@ class DGXTop(App):
         avail = height - WAYBAR_HEIGHT
         tiled, tier = self._choose_layout(n, width, height)
         _fits, cols, node_h, serv_h, chart = _tier_fit(
-            n, width, avail, tier, tiled, self._models_n, self.settings.chart
+            n, width, avail, tier, tiled, self._models_n, self.settings.chart, self._has_stack
         )
         node_mode = "table" if tier == "floor" else "card"
         rail = tier == "rail"
@@ -2634,6 +2775,17 @@ class DGXTop(App):
         self._update_kpis(stats)
 
     def _update_kpis(self, stats: ClusterStats):
+        if self._in_kpis:
+            # _apply_tier() re-enters through _update_ui(); one poll must record
+            # one history sample. The outer call repaints after the tier.
+            return
+        self._in_kpis = True
+        try:
+            self._update_kpis_body(stats)
+        finally:
+            self._in_kpis = False
+
+    def _update_kpis_body(self, stats: ClusterStats):
         units = stats.units
         skipped: list[str] = []
 
@@ -2779,6 +2931,10 @@ class DGXTop(App):
             self._models_n = n_models
             # Each extra model claims 4 serving rows; re-check the tier fit
             # at the current viewport so the grammar never clips.
+            self._apply_tier(*self._last_size)
+        has_stack = any(mem_stack(u) for u in units)
+        if has_stack != self._has_stack:
+            self._has_stack = has_stack
             self._apply_tier(*self._last_size)
 
         self._host_model = " · ".join(m["name"] for m in models_payload)

@@ -4,9 +4,11 @@ import asyncio
 import math
 import os
 import re
+import shlex
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -859,6 +861,156 @@ async def _ssh_run(target: str, cmd: str) -> str:
     return stdout.decode()
 
 
+def _endpoint_port(url: str) -> int:
+    """Listening port of an engine base URL (80/443 by scheme when absent)."""
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    return port or (443 if parsed.scheme == "https" else 80)
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_GIB = 1024**3
+STACK_LOG_LINES = 16
+"""Matching log lines considered: a log may hold several launches, the latest
+(its last lines) wins."""
+STACK_LOG_TTL = 60.0
+"""Seconds a node's parsed startup log is reused. The log only changes when
+the engine restarts, so the grep must not ride every poll."""
+
+_STACK_LOG_PATTERN = (
+    "Model loading took [0-9.]+ GiB"
+    "|Available KV cache memory: [0-9.]+ GiB"
+    "|reserved [0-9.]+ GiB memory for KV Cache"
+    "|Graph capturing finished in .* took -?[0-9.]+ GiB"
+    "|Load weight end.*mem usage=[0-9.]+ GB"
+    "|KV Cache is allocated.*K size: [0-9.]+ GB, V size: [0-9.]+ GB"
+    "|Capture cuda ?graph end.*mem usage=-?[0-9.]+ GB"
+    r"|\[tensorfold\].* model [0-9.]+ GiB.*pages of [0-9]+ rows \([0-9.]+ GiB\)"
+)
+"""One ERE (``grep -a -E``) selecting exactly the engine log lines
+``_parse_stack_log`` reads: vLLM's model-load / KV / graph-capture lines,
+SGLang's weight-load / KV-allocation / graph-capture lines and TensorFold's
+one-line plan. A vLLM launch with ``kv_cache_memory_bytes`` reports its pool
+as "reserved N GiB memory for KV Cache" instead of the profiler line. SGLang's
+"GB" are GiB."""
+_VLLM_LOAD_RE = re.compile(r"Model loading took ([0-9.]+) GiB")
+_VLLM_KV_RE = re.compile(r"Available KV cache memory: ([0-9.]+) GiB")
+_VLLM_KV_BYTES_RE = re.compile(r"reserved ([0-9.]+) GiB memory for KV Cache")
+"""A vLLM launch with ``kv_cache_memory_bytes`` set skips profiling and logs
+the pool it reserved instead of the memory-profiler's "Available KV cache
+memory" line."""
+_VLLM_GRAPH_RE = re.compile(r"Graph capturing finished in .* took (-?[0-9.]+) GiB")
+_SGLANG_LOAD_RE = re.compile(r"Load weight end.*mem usage=([0-9.]+) GB")
+_SGLANG_KV_RE = re.compile(r"KV Cache is allocated.*K size: ([0-9.]+) GB, V size: ([0-9.]+) GB")
+_SGLANG_GRAPH_RE = re.compile(r"Capture cuda ?graph end.*mem usage=(-?[0-9.]+) GB")
+_TENSORFOLD_RE = re.compile(
+    r"\[tensorfold\].* model ([0-9.]+) GiB.*pages of [0-9]+ rows \(([0-9.]+) GiB\)"
+)
+_STACK_LOG_RE = re.compile(_STACK_LOG_PATTERN)
+
+
+def _parse_stack_log(text: str) -> tuple[int, int, int]:
+    """(weights, kv, graphs) bytes from an engine's startup log; 0 = not found.
+
+    Understands vLLM, SGLang and TensorFold lines in one pass (the formats do
+    not overlap). Only the last ``STACK_LOG_LINES`` matching lines count. A
+    load line after the current launch already contributed plan data starts a
+    new launch, so the window never mixes two: within a launch the weights are
+    the largest load figure (a draft model loads smaller and is ignored), and
+    KV and graphs are the last value seen, graphs clamped at 0 (a capture can
+    report a negative delta)."""
+    lines = [line for line in _ANSI_RE.sub("", text).splitlines() if _STACK_LOG_RE.search(line)][
+        -STACK_LOG_LINES:
+    ]
+    weights = kv = graphs = 0.0
+    for line in lines:
+        for regex, kind in (
+            (_VLLM_LOAD_RE, "w"),
+            (_SGLANG_LOAD_RE, "w"),
+            (_VLLM_KV_RE, "k"),
+            (_VLLM_KV_BYTES_RE, "k"),
+            (_SGLANG_KV_RE, "k"),
+            (_VLLM_GRAPH_RE, "g"),
+            (_SGLANG_GRAPH_RE, "g"),
+            (_TENSORFOLD_RE, "t"),
+        ):
+            m = regex.search(line)
+            if m is None:
+                continue
+            try:
+                nums = [float(g) for g in m.groups()]
+            except ValueError:
+                continue
+            if kind == "w":
+                if kv or graphs:
+                    # A load line after this launch's plan data starts the next
+                    # launch: keep the newest, never a mixture.
+                    weights = kv = graphs = 0.0
+                weights = max(weights, nums[0])
+            elif kind == "k":
+                kv = sum(nums)
+            elif kind == "g":
+                graphs = max(nums[0], 0.0)
+            else:
+                # TensorFold states a whole plan on one line: a later line is a
+                # later launch (and logs no graphs).
+                weights, kv, graphs = nums[0], nums[1], 0.0
+            break
+    return int(weights * _GIB), int(kv * _GIB), int(graphs * _GIB)
+
+
+def _stack_log_command(log: str | None, port: int) -> str | None:
+    """Remote command printing the log lines ``_parse_stack_log`` reads, or
+    None when the node's log is switched off (``"off"``).
+
+    ``None`` finds the process listening on ``port`` and reads its stdout fd
+    directly (``/proc/<pid>/fd/1``), only when that is a regular file (a pipe
+    or tty has nothing to grep; the fd also survives the path being unlinked —
+    e.g. a pruned rotated log — where ``readlink`` returns a name suffixed
+    " (deleted)"); every config-derived value is shell-quoted."""
+    if log == "off":
+        return None
+    grep = f"grep -a -E {shlex.quote(_STACK_LOG_PATTERN)}"
+    tail = f"tail -n {STACK_LOG_LINES}"
+    if log is None:
+        return (
+            f'pid=$(ss -H -ltnp "sport = :{int(port)}" 2>/dev/null'
+            " | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2); "
+            '[ -n "$pid" ] && f=/proc/$pid/fd/1 && [ -f "$f" ] '
+            f'&& {grep} "$f" | {tail}; true'
+        )
+    if log.startswith("docker:"):
+        return f"docker logs {shlex.quote(log[len('docker:') :])} 2>&1 | {grep} | {tail}"
+    return f"{grep} {shlex.quote(log)} | {tail}"
+
+
+_stack_log_cache: dict[tuple[str, str | None, int], tuple[float, tuple[int, int, int]]] = {}
+"""(ssh target, log setting, port) -> (monotonic time fetched, plan). Failed
+reads are cached too, so a broken log costs one SSH per TTL, not one per poll."""
+
+
+async def _fetch_stack_log(ssh_target: str, log: str | None, port: int) -> tuple[int, int, int]:
+    """(weights, kv, graphs) bytes read from the node's engine log over SSH,
+    cached for ``STACK_LOG_TTL``. Total: any failure is the zero plan."""
+    command = _stack_log_command(log, port)
+    if command is None:
+        return (0, 0, 0)
+    key = (ssh_target, log, port)
+    now = time.monotonic()
+    cached = _stack_log_cache.get(key)
+    if cached is not None and now - cached[0] < STACK_LOG_TTL:
+        return cached[1]
+    try:
+        plan = _parse_stack_log(await _ssh_run(ssh_target, command))
+    except Exception:
+        plan = (0, 0, 0)
+    _stack_log_cache[key] = (time.monotonic(), plan)
+    return plan
+
+
 def clock_lock_command(max_mhz: int) -> str:
     """Remote command locking the GPU clocks to ``0,max_mhz`` and, only once
     that succeeded, recording the lock (boot id + apply time) in the marker.
@@ -1534,6 +1686,11 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
     # Fetch HTTP and SSH telemetry concurrently. All nodes may serve a model.
     metrics_task = asyncio.create_task(_fetch_metrics(vllm_url))
     telemetry_task = asyncio.create_task(_fetch_telemetry(ssh_target))
+    # The engine's startup log (memory plan) rides alongside; it is cached and
+    # total, so it never raises and never outlives the SSH timeout.
+    stack_task = asyncio.create_task(
+        _fetch_stack_log(ssh_target, cfg.get("log"), _endpoint_port(vllm_url))
+    )
 
     metrics_error: Exception | None = None
     try:
@@ -1661,6 +1818,11 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
                     s.mem_used_bytes = (mem_total_kb - mem_avail_kb) * 1024
         except Exception:
             pass  # thrash fields stay at defaults
+
+    plan = await stack_task
+    if s.mem_total_bytes > 0:
+        s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes = plan
+        s.mem_phys_bytes = int(cfg.get("phys_gib", 128)) * _GIB
 
     # Parse RoCE/IB counter deltas into RX/TX rates
     if "roce_output" in telemetry:
@@ -1929,6 +2091,8 @@ def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> int:
     _prev_prompt_tokens.pop(unit_id, None)
     _prev_prefix.pop(unit_id, None)
     _model_names.pop(unit_id, None)
+    for key in [k for k in _stack_log_cache if k[0] == str(SPARK_UNITS[unit_id]["ssh_target"])]:
+        del _stack_log_cache[key]
     epoch = _endpoint_epoch.get(unit_id, 0) + 1
     _endpoint_epoch[unit_id] = epoch
     return epoch

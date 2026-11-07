@@ -10,12 +10,24 @@ from __future__ import annotations
 import math
 import random
 
+import config
 from stats import ClusterStats, SparkUnitStats, TopologyInfo
 
 _MEM_TOTAL_BYTES = 120 * 1024**3
+_MEM_PHYS_BYTES = 128 * 1024**3
 _SWAP_TOTAL_KB = 4 * 1024 * 1024
 _ROCE_CAPACITY_BPS = 5e10
 _INTERIOR = 20  # per-node cores shown in the core grid
+
+
+def _configured_phys_bytes() -> int:
+    """Physical RAM of a simulated node: ``[app].phys_gib`` when a
+    configuration is loaded (``--simulate`` still reads the ``[app]`` block),
+    else the 128 GiB default."""
+    try:
+        return config.get_settings().phys_gib * 1024**3
+    except config.ConfigError:
+        return _MEM_PHYS_BYTES
 
 
 class Simulator:
@@ -40,6 +52,8 @@ class Simulator:
         self._drift = [0.0] * n
         self._mem_used = [rng.uniform(30.0, 95.0) for _ in range(n)]  # GiB
         self._temp = [rng.uniform(52.0, 72.0) for _ in range(n)]
+        self._kv_pool = [rng.uniform(9.0, 14.0) for _ in range(n)]  # GiB
+        self._phys_bytes = _configured_phys_bytes()
 
     def _bounded(self, value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
@@ -140,6 +154,14 @@ class Simulator:
         s.ttft_p99_ms = s.ttft_p95_ms * 1.25
         s.mem_avail_kb = int((_MEM_TOTAL_BYTES - s.mem_used_bytes) / 1024)
         s.mem_free_kb = int((_MEM_TOTAL_BYTES - s.mem_used_bytes - 8 * 1024**3) / 1024)
+        # The startup-log plan the collector reads: weights ~60% of use, a 1 GiB
+        # graph pool and a KV pool capped at a quarter of use, so the plan
+        # stays comfortably under the measured use.
+        used_gib = self._mem_used[i]
+        s.mem_weights_bytes = int(used_gib * 0.6 * 1024**3)
+        s.mem_graphs_bytes = 1024**3
+        s.mem_kv_pool_bytes = int(min(self._kv_pool[i], used_gib * 0.25) * 1024**3)
+        s.mem_phys_bytes = self._phys_bytes
         return s
 
     def cluster(self) -> ClusterStats:

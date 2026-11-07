@@ -21,6 +21,7 @@
   clock ceiling dgx-top locked on each node (`≤2200`)
 - CPU utilization, temperature, and per-core activity
 - Memory-pressure and thrashing risk from Linux PSI, swap, reclaim, and fault counters
+- A per-node memory stack — weights / graphs / KV pool / other / free / reserved — built from the engine's own startup log
 - InfiniBand/RoCE link state and throughput (RX/TX rates and wire utilization) derived from sysfs without requiring `ibstat`
 
 ## Requirements
@@ -148,12 +149,14 @@ worker = true
 | `vllm_url`       | Inference-engine base URL reachable from the control machine; do not include `/metrics` |
 | `worker`         | Marks a worker node in a tensor-parallel deployment                         |
 | `engine`         | Optional `"vllm"`, `"sglang"` or `"tensorfold"`. Absent: inferred from the endpoint's own metrics (authoritative). Set to `"vllm"` or `"tensorfold"` to skip SGLang's load-API probes entirely |
+| `log`            | Optional engine startup log read over SSH for the memory plan (weights / graphs / KV). Absent: the log of the process listening on `vllm_url`'s port. `"off"` never reads one; `"docker:<container>"` reads `docker logs`; an absolute path reads that file on the node |
 | `poll_interval`  | Initial polling interval in seconds, from 1 to 60                           |
 | `history_length` | Number of samples retained in memory, from 10 to 1000                       |
 | `theme`          | Color theme name; see [Themes](#themes)                                    |
 | `meter_treatment`| Style for the GPU / memory / KV% meters: `gradient` (default), `spark`, `tick`, or `line` |
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 | `clock_ceiling_mhz` | Default GPU clock ceiling in MHz for the `c` menu, applied as `nvidia-smi -lgc 0,<ceiling>`, from 1500 to 2400 (default 2200); the menu opens on the recorded lock instead when the nodes have one |
+| `phys_gib`       | Physical memory per node in GiB, from 16 to 4096 (default 128); the part Linux's `MemTotal` does not show counts as reserved |
 
 The SSH target and engine URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
 
@@ -303,6 +306,38 @@ base surface — node gpu/mem/cpu and serving gen/req/ttft (+ KV% through rail) 
 never disappears at any size. With several models served at once, the wide
 SERVING pane becomes a single multi-model view: a gen/requests/ttft row per
 model and one shared time axis in the line chart, one hue per model.
+
+## Memory stack
+
+When a node's engine startup log can be read, its MEM meter becomes one
+segmented bar spanning the node's physical memory (`phys_gib`):
+
+| Segment | Source |
+| --- | --- |
+| **weights** | the engine's model-load figure, from its startup log |
+| **graphs** | CUDA-graph capture memory, from the log (engines that print none show none) |
+| **kv** | the KV pool size from the log, filled to the measured KV % (the unfilled remainder is dimmer) |
+| **other** | measured use beyond the three above — activations, CUDA context, NCCL, a draft model, the OS. It is what makes the bar always add up to `MemTotal − MemAvailable` |
+| **free** | `MemAvailable` |
+| **reserved** | physical memory `MemTotal` does not report (hatched) |
+
+Lines are read over SSH from the log of the process listening on the node's
+`vllm_url` port (its stdout, when that is a regular file), or from the node's
+`log` setting (`"docker:<container>"`, an absolute file path, or `"off"`). vLLM
+(`Model loading took`, `Available KV cache memory` — or `reserved N GiB memory
+for KV Cache` under `kv_cache_memory_bytes` — `Graph capturing finished`),
+SGLang (`Load weight end`, `KV Cache is allocated`, `Capture cuda graph end`) and
+TensorFold's startup plan line are recognised; the latest launch in the log wins,
+and the log is re-read at most once a minute. A node whose log yields no plan —
+or whose plan is larger than what is measured in use (a stale log) — keeps the
+plain MEM meter; nothing else changes. Only some ranks log a plan (a TensorFold
+worker rank, for instance, prints none); point `log` at a file that has one, or
+leave that node on the plain meter.
+
+Full node cards (`roomy`/`dense`) add a colour-key row under the bar; `compact`
+cards draw the bar alone; the `floor` table row carries a 6-cell mini bar when
+it fits. The bar lives on the node cards only — SERVING keeps its stats
+grammar and chart.
 
 ## Finding inference endpoints
 

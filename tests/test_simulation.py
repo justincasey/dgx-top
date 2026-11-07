@@ -28,6 +28,41 @@ def test_simulate_cluster_returns_online_hosted_finite_units():
         assert all(math.isfinite(v) for v in u.cpu_cores_util)
 
 
+def test_simulated_units_carry_a_memory_plan_below_measured_use(monkeypatch):
+    import simulation
+    from config import ConfigError
+    from simulation import simulate_cluster
+    from stats import mem_stack
+
+    def unset():
+        raise ConfigError("no configuration")
+
+    # The 128 GiB constant is the fallback when no configuration is loaded.
+    monkeypatch.setattr(simulation, "_simulator", None)  # build a fresh one
+    monkeypatch.setattr(simulation.config, "get_settings", unset)
+    for _ in range(3):
+        for u in simulate_cluster(12).units:
+            assert u.mem_phys_bytes == 128 * 1024**3 > u.mem_total_bytes
+            plan = u.mem_weights_bytes + u.mem_kv_pool_bytes + u.mem_graphs_bytes
+            assert u.mem_weights_bytes > 0 and u.mem_kv_pool_bytes > 0 and u.mem_graphs_bytes > 0
+            assert plan < u.mem_used_bytes
+            assert mem_stack(u) is not None
+
+
+def test_simulated_reserved_slice_follows_configured_phys_gib(monkeypatch):
+    import simulation
+    from stats import mem_stack
+
+    class _Loaded:
+        phys_gib = 256
+
+    monkeypatch.setattr(simulation, "_simulator", None)  # build a fresh one
+    monkeypatch.setattr(simulation.config, "get_settings", lambda: _Loaded())
+    st = mem_stack(simulation.simulate_cluster(2).units[0])
+    assert st is not None
+    assert st.reserved == (256 - 120) * 1024**3  # MemTotal is always 120 GiB
+
+
 def test_simulate_cluster_evolves_between_polls():
     from simulation import simulate_cluster
 

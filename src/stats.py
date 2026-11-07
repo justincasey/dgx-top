@@ -106,6 +106,14 @@ class SparkUnitStats:
     workingset_refault_rate: float = 0.0
     mem_avail_kb: int = 0
     mem_free_kb: int = 0
+    # Engine memory plan, parsed from the engine's own startup log over SSH
+    # (collector._fetch_stack_log). Per-node (per-rank) bytes; 0 = unknown.
+    mem_weights_bytes: int = 0
+    mem_kv_pool_bytes: int = 0
+    mem_graphs_bytes: int = 0
+    # Physical RAM (settings.phys_gib); the part MemTotal does not report is
+    # the stack's "reserved" slice. 0 = unknown (no reserved slice).
+    mem_phys_bytes: int = 0
 
 
 @dataclass
@@ -314,3 +322,60 @@ def compute_thrash_risk(stats: SparkUnitStats) -> tuple[ThrashLevel, str]:
     elif caution_count >= 2:
         return (ThrashLevel.CAUTION, reasons)
     return (ThrashLevel.OK, reasons)
+
+
+@dataclass(frozen=True)
+class MemStack:
+    """Where one node's memory goes, in bytes, left to right on the stack bar:
+    weights | graphs | kv | other | free | reserved.
+
+    ``weights``, ``graphs`` and ``kv`` are the engine's startup-log figures;
+    ``other`` is what is *measured* in use beyond them (activations, CUDA
+    context, NCCL, drafter, OS) so the bar always sums to the measured total.
+    ``usable`` is MemTotal; ``reserved`` is physical RAM MemTotal does not report.
+    """
+
+    weights: float
+    graphs: float
+    kv: float
+    other: float
+    free: float
+    reserved: float
+    kv_fill: float  # measured KV pool fill 0-100; -1 = no reading
+
+    @property
+    def used(self) -> float:
+        return self.weights + self.graphs + self.kv + self.other
+
+    @property
+    def usable(self) -> float:
+        return self.used + self.free
+
+
+MEM_STACK_TOLERANCE = 1.05
+"""A plan whose weights+graphs+kv exceed measured use by more than this factor
+describes a different launch (stale log) and is not drawn."""
+
+
+def mem_stack(s: SparkUnitStats) -> MemStack | None:
+    """The node's memory stack, or None when it cannot be drawn honestly:
+    offline, no MemTotal, no plan from the startup log, or a plan larger than
+    what is measured in use (stale log)."""
+    if not s.online or s.mem_total_bytes <= 0:
+        return None
+    planned = s.mem_weights_bytes + s.mem_graphs_bytes + s.mem_kv_pool_bytes
+    if planned <= 0:
+        return None
+    used = min(s.mem_used_bytes, s.mem_total_bytes)
+    if planned > used * MEM_STACK_TOLERANCE:
+        return None
+    scale = min(1.0, used / planned)  # a plan a little above measured use is scaled down
+    return MemStack(
+        weights=s.mem_weights_bytes * scale,
+        graphs=s.mem_graphs_bytes * scale,
+        kv=s.mem_kv_pool_bytes * scale,
+        other=max(0.0, used - planned * scale),
+        free=s.mem_total_bytes - used,
+        reserved=max(0, s.mem_phys_bytes - s.mem_total_bytes),
+        kv_fill=s.kv_cache_pct,
+    )

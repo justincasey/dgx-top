@@ -23,6 +23,9 @@ quiet = false
 # opens on the lock already recorded on the nodes, if any, and ←/→ move it in
 # 100 MHz steps before applying.
 clock_ceiling_mhz = 2200
+# Physical memory of each node in GiB (default 128). The memory bar shows what
+# Linux's MemTotal does not (firmware / GPU carve-out) as "reserved".
+phys_gib = 128
 
 # ssh_target accepts either user@host or an alias from ~/.ssh/config.
 # vllm_url is the inference-engine base URL, accessed directly from the machine
@@ -30,6 +33,11 @@ clock_ceiling_mhz = 2200
 # engine is optional: "vllm", "sglang" or "tensorfold". Leave it out and dgx-top
 # detects the engine from the endpoint's own metrics. Declaring "vllm" or
 # "tensorfold" skips SGLang's load-API probes.
+# log is optional: where the engine's startup log is read from (over SSH) to
+# split memory into weights / graphs / KV. Leave it out to follow the log of
+# the process listening on vllm_url's port; "off" never reads one;
+# "docker:<container>" reads `docker logs <container>`; an absolute path reads
+# that file on the node, e.g. log = "/srv/engine/logs/rank-0.log".
 [[nodes]]
 label = "spark-1"
 ssh_target = "spark@spark01.example.com"

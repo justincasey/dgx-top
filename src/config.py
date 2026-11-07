@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import sysconfig
 import tempfile
@@ -38,6 +39,11 @@ class NodeConfig:
     probe on a node declared as an engine without one (vLLM, TensorFold),
     and it names the engine on a load-only row (``collector.poll_unit``
     sets ``model_source`` from it)."""
+    log: str | None = None
+    """Where the node's engine writes its startup log, read for the memory
+    plan: ``None`` finds the log of the process listening on the endpoint's
+    port, ``"off"`` never reads one, ``"docker:<container>"`` reads
+    ``docker logs``, an absolute path reads that file."""
 
 
 ENGINES = {"vllm", "sglang", "tensorfold"}
@@ -47,6 +53,11 @@ Must stay equal to ``collector.ENGINE_PROFILES``: every engine the collector
 can parse needs a declared value. The collector imports this module, so the
 two sets cannot be derived from one another; ``tests/test_config.py`` pins
 the coupling instead of leaving it to drift."""
+
+LOG_DOCKER_PREFIX = "docker:"
+LOG_DOCKER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+"""Docker's own container-name grammar; ``NodeConfig.log`` interpolates the
+name into a remote shell command, so nothing outside it is accepted."""
 
 
 METER_TREATMENTS = {"gradient", "spark", "tick", "line"}
@@ -62,6 +73,10 @@ CLOCK_CEILING_MAX = 2400
 """Bounds (MHz) of ``app.clock_ceiling_mhz`` and of the `c` menu's ceiling: the
 menu only locks a ceiling from 1500 to 2400 MHz."""
 
+PHYS_GIB_MIN = 16
+PHYS_GIB_MAX = 4096
+"""Bounds (GiB) of ``app.phys_gib``, the physical memory of one node."""
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -74,6 +89,8 @@ class Settings:
     quiet: bool = False
     # GPU clock ceiling (MHz) the `c` menu applies: nvidia-smi -lgc 0,<ceiling>.
     clock_ceiling_mhz: int = 2200
+    # Physical memory per node (GiB); the part MemTotal does not show is "reserved".
+    phys_gib: int = 128
 
 
 def _parse_theme(app: dict, override: str | None) -> str:
@@ -140,7 +157,21 @@ def _parse_node(raw: object, node_number: int) -> NodeConfig:
                 f"nodes[{node_number}].engine must be one of: " + ", ".join(sorted(ENGINES))
             )
         engine = engine.strip().lower()
-    return NodeConfig(label, ssh_target, vllm_url, worker, engine)
+    log = raw.get("log")
+    if log is not None:
+        message = (
+            f'nodes[{node_number}].log must be "off", "docker:<container>" or an absolute file path'
+        )
+        if not isinstance(log, str):
+            raise ConfigError(message)
+        if log.strip().lower() == "off":
+            log = "off"
+        elif log.startswith(LOG_DOCKER_PREFIX):
+            if not LOG_DOCKER_NAME.fullmatch(log[len(LOG_DOCKER_PREFIX) :]):
+                raise ConfigError(message)
+        elif not log.startswith("/") or "\0" in log or "\n" in log or "\r" in log:
+            raise ConfigError(message)
+    return NodeConfig(label, ssh_target, vllm_url, worker, engine, log)
 
 
 def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
@@ -156,9 +187,9 @@ def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
     )
 
 
-def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, bool, int]:
+def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, bool, int, int]:
     """Validate the ``[app]`` block and return (poll_interval, history_length,
-    theme, meter_treatment, chart, quiet, clock_ceiling_mhz)."""
+    theme, meter_treatment, chart, quiet, clock_ceiling_mhz, phys_gib)."""
     app = raw.get("app", {})
     if not isinstance(app, dict):
         raise ConfigError("[app] must be a TOML table")
@@ -186,6 +217,10 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, b
             f"app.clock_ceiling_mhz must be an integer from {CLOCK_CEILING_MIN} "
             f"to {CLOCK_CEILING_MAX}"
         )
+    phys_gib = app.get("phys_gib", 128)
+    # bools fall outside the range too
+    if not isinstance(phys_gib, int) or not PHYS_GIB_MIN <= phys_gib <= PHYS_GIB_MAX:
+        raise ConfigError(f"app.phys_gib must be an integer from {PHYS_GIB_MIN} to {PHYS_GIB_MAX}")
     return (
         poll_interval,
         history_length,
@@ -194,6 +229,7 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, b
         chart,
         quiet,
         ceiling,
+        phys_gib,
     )
 
 
@@ -272,6 +308,8 @@ def configure(
                 "vllm_url": node.vllm_url,
                 "worker": node.worker,
                 "engine": node.engine,
+                "log": node.log,
+                "phys_gib": settings.phys_gib,
             }
             for index, node in enumerate(settings.nodes, 1)
         }
