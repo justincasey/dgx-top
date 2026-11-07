@@ -3,14 +3,13 @@
 The dashboard renders with a tiling-desktop semantic palette:
 `bg`, `fg`, `dim`, `track`, `panel`, `panel_hi` (chrome) plus the identity
 hues `accent` (KV/RoCE/model), `ok` (health/MEM), `warn` (CPU/worker/caution),
-`blue` (GPU util) and `cyan` (focus borders, host caret). The `dgx-aeon`
-default theme carries the design's hues; every other theme remaps the same
-roles onto its own hues, so switching themes restyles the roles without
-introducing new ones.
+`blue` (GPU util) and `cyan` (focus borders, host caret). Tokyo Night is the
+default theme; every theme remaps the same roles onto its own hues, so
+switching themes restyles the roles without introducing new ones.
 
 All common Textual themes (tokyo-night, nord, gruvbox, dracula, ...) are
-available out of the box; this module adds the dgx-top default theme (AEON)
-and the classic hardcoded-look dgx-dark theme, plus the missing tokyo-night
+available out of the box; this module adds the tiling-desktop theme (AEON),
+the classic hardcoded-look dgx-dark theme, plus the missing tokyo-night
 storm and light variants, and turns any active theme into the semantic palette
 the dashboard's dynamically rendered Text styles use.
 """
@@ -22,8 +21,10 @@ from dataclasses import dataclass
 from textual.color import Color
 from textual.theme import BUILTIN_THEMES, Theme
 
-DEFAULT_THEME = "dgx-aeon"
-"""Default theme name; carries the tiling-desktop palette hues."""
+DEFAULT_THEME = "tokyo-night"
+"""Default theme name: Tokyo Night, the dashboard's shipping palette. The
+custom ``dgx-aeon`` palette (the tiling-desktop hues) and ``dgx-dark`` (the
+classic hardcoded look) stay registered and selectable."""
 
 # Tokyo Night palettes from folke/tokyonight.nvim. All three variants are
 # registered here: Textual's built-in ``tokyo-night`` uses ``fg_gutter``

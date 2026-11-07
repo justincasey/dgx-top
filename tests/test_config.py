@@ -87,10 +87,10 @@ def test_simulate_builds_synthetic_nodes_without_config(tmp_path: Path):
     assert settings.poll_interval == 5  # defaults when no [app] block
 
 
-def test_default_theme_is_dgx_aeon(tmp_path: Path):
+def test_default_theme_is_tokyo_night(tmp_path: Path):
     settings = load_config(_write(tmp_path))
 
-    assert settings.theme == "dgx-aeon"
+    assert settings.theme == "tokyo-night"
 
 
 def test_theme_option_is_loaded(tmp_path: Path):
@@ -139,8 +139,8 @@ def test_meter_treatment_validation(tmp_path: Path):
     with pytest.raises(ConfigError, match="meter_treatment"):
         load_config(path)
 
-    # default preserves the current gradient look
-    assert load_config(_write(tmp_path)).meter_treatment == "gradient"
+    # default is the sparkline treatment
+    assert load_config(_write(tmp_path)).meter_treatment == "spark"
 
 
 def test_chart_validation(tmp_path: Path):
@@ -154,8 +154,8 @@ def test_chart_validation(tmp_path: Path):
     with pytest.raises(ConfigError, match="app.chart"):
         load_config(path)
 
-    # default is the reference area chart
-    assert load_config(_write(tmp_path)).chart == "area"
+    # default is the instrumented oscilloscope
+    assert load_config(_write(tmp_path)).chart == "oscilloscope"
 
 
 def test_quiet_validation(tmp_path: Path):

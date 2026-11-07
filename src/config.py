@@ -62,8 +62,15 @@ name into a remote shell command, so nothing outside it is accepted."""
 
 METER_TREATMENTS = {"gradient", "spark", "tick", "line"}
 CHART_MODES = {"area", "oscilloscope", "lines"}
-"""Decode-chart renderers: the ramp area chart (default, the reference
-footer), the instrumented oscilloscope, and the legacy braille-fill line
+DEFAULT_METER_TREATMENT = "spark"
+"""Meter treatment when the config states none: the sparkline history of the
+metric, the densest read of a steady-state node."""
+DEFAULT_CHART = "oscilloscope"
+"""Decode-chart renderer when the config states none: the instrumented
+oscilloscope (graticule, axis, edge markers, Δ slope). ``area`` is the
+reference footer, ``lines`` the legacy braille chart."""
+"""Decode-chart renderers: the ramp area chart (the reference footer), the
+instrumented oscilloscope (default), and the legacy braille-fill line
 chart."""
 
 MAX_NODES = 12
@@ -85,8 +92,8 @@ class Settings:
     poll_interval: int = 5
     history_length: int = 40
     theme: str = DEFAULT_THEME
-    meter_treatment: str = "gradient"
-    chart: str = "area"
+    meter_treatment: str = DEFAULT_METER_TREATMENT
+    chart: str = DEFAULT_CHART
     quiet: bool = False
     # GPU clock ceiling (MHz) the `c` menu applies: nvidia-smi -lgc 0,<ceiling>.
     clock_ceiling_mhz: int = 2200
@@ -200,12 +207,12 @@ def _parse_app(raw: dict, theme: str | None) -> tuple[int, int, str, str, str, b
         raise ConfigError("app.poll_interval must be an integer from 1 to 60")
     if not isinstance(history_length, int) or not 10 <= history_length <= 1000:
         raise ConfigError("app.history_length must be an integer from 10 to 1000")
-    meter_treatment = app.get("meter_treatment", "gradient")
+    meter_treatment = app.get("meter_treatment", DEFAULT_METER_TREATMENT)
     if not isinstance(meter_treatment, str) or meter_treatment not in METER_TREATMENTS:
         raise ConfigError(
             "app.meter_treatment must be one of: " + ", ".join(sorted(METER_TREATMENTS))
         )
-    chart = app.get("chart", "area")
+    chart = app.get("chart", DEFAULT_CHART)
     if not isinstance(chart, str) or chart not in CHART_MODES:
         raise ConfigError("app.chart must be one of: " + ", ".join(sorted(CHART_MODES)))
     quiet = app.get("quiet", False)

@@ -2,21 +2,22 @@
 poll_interval = 5
 history_length = 40
 # Color theme; run `dgx-top themes` for the full list of supported themes.
-theme = "dgx-dark"
+theme = "tokyo-night"
 # Meter treatment for the GPU / memory / KV% bars (one value for all):
-#   gradient = btop-style green→red ramp (default)
-#   spark    = sparkline of the metric's recent history
+#   gradient = btop-style green→red ramp
+#   spark    = sparkline of the metric's recent history (default)
 #   tick     = dim scale with a single bright marker at the current value
 #   line     = thin hairline fill over a hairline track
-meter_treatment = "gradient"
+meter_treatment = "spark"
 # Decode chart renderer in the SERVING pane:
 #   area         = four-row ramp-coloured strip, no gutter or overlays
-#                  (default; the reference footer)
+#                  (the reference footer)
 #   oscilloscope = dim graticule, bright leading window, edge markers and
-#                  inline labels, Δ5 slope readout; fills the spare height
+#                  inline labels, Δ5 slope readout (default); fills the
+#                  spare height, and moves beside the rows on a wide, short pane
 #   lines        = legacy smooth braille lines with translucent fills; also
 #                  fills the spare height
-chart = "area"
+chart = "oscilloscope"
 # Quiet mode: calm the whole UI — identity hues render neutral and colour
 # appears only on caution/critical. Composes with any meter treatment.
 quiet = false
