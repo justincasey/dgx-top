@@ -67,7 +67,6 @@ SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 # pane lands on the same cell regardless of its digits.
 SERVING_LABEL_W = 9
 SERVING_GRAPH_W = 22
-SERVING_RANK_BAR_W = 24
 _TAB_GAP = 3  # rule cells required between a window's title tab and meta tab
 
 # The `area` renderer is the reference's fixed four-row footer: it never
@@ -90,10 +89,9 @@ NODE_ROWS_TEXT = 3  # text card interior (gpu, mem, cpu)
 # Natural interior rows per SERVING window by density (borders excluded).
 # Reference grammar labels every metric row with a 9-cell gutter, a 22-cell
 # graph and a two-space gap before the value column:
-#   gen / prompt / kv / kv% / blank / requests / cache / ttft / blank /
-#   deploy / rank × nodes / blank / four chart rows.
-WIDE_BASE = 10  # through the deploy row, before the per-node rank rows
-NARROW_BASE = 7  # compact: gen, kv, requests, cache, ttft, blank, deploy
+#   gen / prompt / kv / kv% / blank / requests / cache / ttft
+WIDE_BASE = 8  # roomy: the four graph rows, a spacer, the three meta rows
+NARROW_BASE = 6  # compact: gen, kv, spacer, requests, cache, ttft
 FUSED_BASE = 5  # below SERVING_NARROW_WIDTH: gen, requests, ttft, kv, cache
 SERVING_ROWS_RAIL = 4  # gen, requests, ttft, kv (merged tail) — no chart
 SERVING_ROWS_FLOOR = 3  # gen, requests, ttft — no chart
@@ -399,29 +397,6 @@ def _kv_reading(used: int, total: int, pct: float, pal: Palette) -> Text:
 def label_text(text: str, pal: Palette, style: str | None = None) -> Text:
     """A metric label padded to the reference gutter width."""
     return Text(text.ljust(SERVING_LABEL_W), style=style or pal.dim)
-
-
-_QUANT_TAGS = (
-    ("nvfp4", "NVFP4"),
-    ("fp4", "FP4"),
-    ("fp8", "FP8"),
-    ("int4", "INT4"),
-    ("int8", "INT8"),
-    ("awq", "AWQ"),
-    ("gptq", "GPTQ"),
-    ("w4a16", "W4A16"),
-    ("w8a8", "W8A8"),
-)
-
-
-def _quant_tag(model_name: str) -> str:
-    """The quantisation a model id states (``...-NVFP4``), or ``""`` when it
-    states none — the deploy row never invents one."""
-    lowered = model_name.lower()
-    for needle, tag in _QUANT_TAGS:
-        if needle in lowered:
-            return tag
-    return ""
 
 
 def _cores_line(vals: list[float], pal: Palette, spaced: bool = True) -> Text:
@@ -1152,6 +1127,8 @@ class ServingBox(Static):
         self._kv_data: list[float] = []
         self._kv: dict | None = None
         self._models: list[dict] = []
+        # Row count the frame is asked to occupy; 0 means auto (content).
+        self.expected_height = 0
 
     def update_throughput(
         self,
@@ -1217,6 +1194,13 @@ class ServingBox(Static):
             rows.extend(self._chart(pal, width, chart_rows))
         kv = self._kv or {}
         total_tok = kv.get("total_tok", 0)
+        # A stretched frame (tiled desk) keeps its slack as blank rows inside
+        # the border, under the top-anchored grammar. Never measure the
+        # widget's own ``size`` here: that height is the padding's own output
+        # and would ratchet the frame and never let it shrink again.
+        height = self.expected_height
+        for _ in range(max(0, height - 2 - len(rows))):
+            rows.append(Text(""))
         rtab = [(f"{_fmt_tokens(total_tok)} tok" if total_tok else "—", pal.dim)]
         title = [
             ("^", f"bold {pal.cyan}"),
@@ -1411,9 +1395,6 @@ class ServingBox(Static):
                 r.append(self._ttft_row(pal, m, iw, m["name"]))
         else:
             r.append(self._ttft_row(pal, s, iw))
-        r.append(Text(""))
-        r.append(self._deploy_row(pal, iw))
-        r.extend(self._rank_rows(pal, iw))
         return r
 
     def _requests_row(self, pal: Palette, s: dict, iw: int, name: str = "") -> Text:
@@ -1476,57 +1457,6 @@ class ServingBox(Static):
             )
         row.append_text(value)
         return row
-
-    def _deploy_row(self, pal: Palette, iw: int) -> Text:
-        """``deploy  vllm · TP2 · NVFP4 experts`` — the engine family, the
-        tensor-parallel width the cluster spans, and the quantisation the
-        model name states (omitted when it states none). The row is fitted to
-        the pane, dropping trailing parts before it can overflow."""
-        parts: list[str] = []
-        sources = {m["source"] for m in self._models if m.get("source")}
-        if len(sources) == 1:
-            parts.append(next(iter(sources)))
-        elif sources:
-            parts.append("mixed")
-        nodes = len(self._units())
-        if nodes > 1:
-            parts.append(f"TP{nodes}")
-        quant = _quant_tag(self._models[0]["name"] if self._models else "")
-        if quant:
-            parts.append(f"{quant} experts")
-        budget = max(0, iw - len("deploy  "))
-        while parts and len(" · ".join(parts)) > budget:
-            parts.pop()
-        text = " · ".join(parts) if parts else "—"
-        return Text.assemble(
-            Text("deploy", style=f"bold {pal.fg}"),
-            Text("  " + (text if len(text) <= budget else "—"), style=pal.dim),
-        )
-
-    def _units(self) -> list:
-        cluster = getattr(self.app, "cluster", None)
-        return list(cluster.units) if cluster else []
-
-    def _rank_rows(self, pal: Palette, iw: int) -> list[Text]:
-        """One row per node that carries a memory stack: its rank, its label,
-        a 24-cell copy of its bar, and the plan total. The row is the pane's
-        cross-check — every rank's bar must agree."""
-        units = self._units()
-        bar_w = min(SERVING_RANK_BAR_W, max(6, iw - SERVING_LABEL_W - 20))
-        rows: list[Text] = []
-        for i, unit in enumerate(units):
-            stack = mem_stack(unit)
-            if not stack:
-                continue
-            rows.append(
-                Text.assemble(
-                    Text(f"rank {i}".ljust(SERVING_LABEL_W), style=pal.dim),
-                    Text(f"{unit.label} ", style=f"bold {pal.fg}"),
-                    _stack_cells(stack, bar_w, pal),
-                    Text(f" {_fmt_gib(stack.used)}G*", style=f"bold {pal.ok}"),
-                )
-            )
-        return rows
 
     def _narrow_rows(self, pal: Palette, width: int, tier: str) -> list[Text]:
         """Fused narrow grammar, used when the pane is narrower than
@@ -1953,14 +1883,11 @@ def _serving_base(
     tier: str,
     serv_width: int,
     models: int = 1,
-    nodes: int = 0,
-    stack: bool = False,
 ) -> int:
     """SERVING interior rows without the chart, mirroring ``ServingBox._rows``
     exactly: a 9-cell gutter, then
 
-    roomy  gen, prompt, kv, kv%, spacer, requests, cache, ttft, spacer, deploy,
-           one rank row per stacked node
+    roomy  gen, prompt, kv, kv%, spacer, requests, cache, ttft
     compact  the same, less the prompt and kv% graphs
     rail   the fused narrow grammar
     floor  the bare base surface
@@ -1974,8 +1901,7 @@ def _serving_base(
     if serv_width < SERVING_NARROW_WIDTH:
         return FUSED_BASE
     base = WIDE_BASE if tier != "compact" else NARROW_BASE
-    base += (nodes if stack else 0) + 2 * max(0, models - 1)
-    return base
+    return base + 2 * max(0, models - 1)
 
 
 def _node_tile_rows(tier: str, tile_w: int, stack: bool = False) -> int:
@@ -2048,10 +1974,11 @@ def _grid_height(n: int, cols: int, tile: int, tier: str) -> int:
     return rows * tile + max(0, rows - 1) * gutter
 
 
-def _serving_height(base: int, chart: int) -> int:
+def _serving_height(base: int, chart: int, chart_mode: str = "area") -> int:
     """Rendered SERVING height: interior rows, a spacer before the chart, the
-    chart itself, and the two border rows."""
-    return base + (1 + chart if chart else 0) + 2
+    chart itself (plus the oscilloscope's Δ row), and the two border rows."""
+    foot = 1 if chart_mode == "oscilloscope" else 0
+    return base + (1 + chart + foot if chart else 0) + 2
 
 
 def _chart_rows_for(tier: str, chart_mode: str, room: int) -> int:
@@ -2092,7 +2019,7 @@ def _tier_fit(
             cols = _node_grid_columns(n, nw, tiled)
         tile = _node_tile_rows(tier, -(-nw // cols), stack)
         node_h = _grid_height(n, cols, tile, tier)
-        base = _serving_base(tier, sw, models, nodes=n, stack=stack)
+        base = _serving_base(tier, sw, models)
         if tier == "floor":
             serv_h = base
             fits = node_h <= avail and serv_h <= avail
@@ -2102,7 +2029,7 @@ def _tier_fit(
             if sw < SERVING_NARROW_WIDTH
             else _chart_rows_for(tier, chart_mode, avail - (base + 2) - 1)
         )
-        serv_h = _serving_height(base, chart)
+        serv_h = _serving_height(base, chart, chart_mode)
         fits = node_h <= avail and serv_h <= avail
         return fits, cols, node_h, serv_h, chart
     if tier == "floor":
@@ -2111,14 +2038,14 @@ def _tier_fit(
         cols = _node_grid_columns(n, width, tiled)
     tile = _node_tile_rows(tier, -(-width // cols), stack)
     node_h = _grid_height(n, cols, tile, tier)
-    base = _serving_base(tier, width, models, nodes=n, stack=stack)
+    base = _serving_base(tier, width, models)
     if tier == "floor":
         serv_h = base  # bare floor lines, no window frame
         fits = serv_h + node_h <= avail
         return fits, cols, node_h, serv_h, 0
     spare = avail - (base + 2 + GRID_GUTTER + node_h) - 1
     chart = 0 if width < SERVING_NARROW_WIDTH else _chart_rows_for(tier, chart_mode, spare)
-    serv_h = _serving_height(base, chart)
+    serv_h = _serving_height(base, chart, chart_mode)
     fits = serv_h + GRID_GUTTER + node_h <= avail
     return fits, cols, node_h, serv_h, chart
 
@@ -2667,7 +2594,13 @@ class DGXTop(App):
         """Auto-size every window and centre the body with a top pad."""
         body = self.query_one("#body", Vertical)
         body.styles.margin = (pad, 0, 0, 0) if pad else 0
-        self.query_one("#serving", ServingBox).styles.height = "auto"
+        # The reference desk stretches its columns (``align-items: stretch``):
+        # in the tiled arrangement the serving frame reaches the bottom of the
+        # node stack and keeps its slack inside the frame, so trimming rows
+        # from the pane never punches a hole in the column.
+        serving = self.query_one("#serving", ServingBox)
+        serving.expected_height = max(self._serv_h, self._node_h) if self.tiled else 0
+        serving.styles.height = serving.expected_height or "auto"
         for node in self.query(NodeBox):
             node.styles.height = "auto"
 

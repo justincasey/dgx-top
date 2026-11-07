@@ -239,10 +239,9 @@ async def test_node_card_without_a_plan_keeps_the_plain_mem_meter(tmp_path: Path
         assert not app._has_stack
 
 
-async def test_serving_pane_carries_the_rank_block(tmp_path: Path, monkeypatch):
-    """The reference serving pane owns the deploy line and one rank row per
-    node, each carrying a copy of that node's bar and its plan total — the
-    pane's cross-check that every rank accounts for the same model."""
+async def test_serving_pane_does_not_duplicate_the_node_bars(tmp_path: Path, monkeypatch):
+    """The memory stack lives on the node cards only: the SERVING pane carries
+    the serving grammar, not a copy of each node's bar, rank or plan total."""
     from app import DGXTop, ServingBox
 
     _config(tmp_path / "c.toml")
@@ -253,13 +252,8 @@ async def test_serving_pane_carries_the_rank_block(tmp_path: Path, monkeypatch):
         await pilot.pause()
         assert app._has_stack
         text = app.query_one("#serving", ServingBox).render().plain
-        assert "deploy  vllm · TP2" in text
-        ranks = [ln for ln in text.splitlines() if "rank " in ln]
-        assert len(ranks) == 2, ranks
-        assert "head" in ranks[0] and "worker" in ranks[1], ranks
-        # Each rank row carries the same bar grammar as the node card.
-        assert "╱" in ranks[0] and "╱" in ranks[1], ranks
-        assert "100G*" in ranks[0] and "98G*" in ranks[1], ranks
+        assert "deploy" not in text and "rank " not in text
+        assert "╱" not in text and "wts" not in text and "Σ" not in text
 
 
 async def test_plan_arriving_late_grows_the_node_card_without_clipping(tmp_path: Path, monkeypatch):

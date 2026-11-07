@@ -774,11 +774,10 @@ def test_box_clamps_overlong_title():
     assert all(len(ln.plain) == 24 for ln in lines)
 
 
-async def test_deploy_row_names_the_engine_and_never_clips(tmp_path: Path, monkeypatch):
-    """The engine family, the TP width and the model's quantisation are one
-    ``deploy`` row. At every width above the fused-grammar floor the row fits
-    the pane's interior (``_box_lines`` ellipsizes anything wider), and a
-    mixed cluster names no single engine."""
+async def test_serving_rows_fit_the_pane_at_every_width(tmp_path: Path, monkeypatch):
+    """Every row of the wide grammar fits the pane interior at any width above
+    the fused-grammar floor — a long model name on a per-model row ellipsizes
+    inside its own column instead of pushing the value past the border."""
     from app import DGXTop, ServingBox, _box_lines, _palette_for
 
     _config(tmp_path / "config.toml")
@@ -806,22 +805,9 @@ async def test_deploy_row_names_the_engine_and_never_clips(tmp_path: Path, monke
                 line.plain[2:-2]  # the interior: `_fit` has already run
                 for line in _box_lines(w, [("^", ""), (" serving", "")], None, rows, False, pal)
             ]
-            deploy = next(ln for ln in painted if ln.startswith("deploy"))
-            # vllm + sglang are both served: no single engine is claimed.
-            assert "mixed" in deploy, (w, deploy)
-        # One engine, one quant tag.
-        _stub(monkeypatch, [head])
-        app2 = DGXTop()
-        async with app2.run_test(size=(160, 48)) as pilot:
-            await pilot.pause()
-            await pilot.pause()
-            app2._update_ui()
-            interior = [
-                ln[2:-2]
-                for ln in app2.query_one("#serving", ServingBox).render().plain.splitlines()
-            ]
-            deploy = next(ln for ln in interior if ln.startswith("deploy"))
-            assert deploy.startswith("deploy  vllm"), deploy
+            ttft = [ln for ln in painted if ln.startswith("ttft")]
+            assert len(ttft) == 2, (w, painted)
+            assert all("p95" in ln for ln in ttft), (w, ttft)
 
 
 async def test_unknown_kv_renders_as_no_reading_not_zero(tmp_path: Path, monkeypatch):
@@ -1550,7 +1536,7 @@ async def test_density_ladder_for_twelve_nodes(tmp_path: Path, monkeypatch):
     async with app.run_test(size=(180, 60)) as pilot:
         await pilot.pause()
         seen = []
-        for h in (60, 50, 44, 40, 36, 32, 29, 24, 20, 16, 8):
+        for h in (60, 50, 44, 40, 36, 32, 29, 24, 22, 20, 16, 8):
             await _resize(pilot, 180, h)
             tier = "floor" if app.floor else ("rail" if app.rail else app.density)
             seen.append(tier)
@@ -1685,6 +1671,37 @@ async def test_oscilloscope_still_fills_the_leftover_height(tmp_path: Path, monk
         await _resize(pilot, 132, 44)
         assert app.tiled and app._chart_rows > AREA_CHART_ROWS, app._chart_rows
         assert app.screen.max_scroll_y == 0
+
+
+async def test_tiled_serving_frame_spans_the_node_column(tmp_path: Path, monkeypatch):
+    """The desk stretches its columns, so the serving frame reaches the
+    bottom of the node stack and keeps its slack inside the border. Without
+    it, trimming rows from the pane punches a hole under the frame — which is
+    what removing the deploy/rank block did."""
+    from app import DGXTop, ServingBox
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub(monkeypatch)
+    app = DGXTop()
+    async with app.run_test(size=(90, 44)) as pilot:
+        await pilot.pause()
+        _seed_history(app)
+        await _resize(pilot, 132, 40)
+        assert app.tiled
+        serving = app.query_one("#serving", ServingBox)
+        nodes = list(app.query("NodeBox"))
+        assert len(nodes) == 2
+        assert serving.region.bottom == max(n.region.bottom for n in nodes)
+        # The frame is padded to that height, so its closing rule sits on the
+        # last visible row of the column rather than floating above it.
+        lines = serving.render().plain.splitlines()
+        assert len(lines) == serving.region.height
+        assert lines[-1].startswith("╰")
+        # Stacked arrangement keeps the frame at content height.
+        await _resize(pilot, 90, 44)
+        assert not app.tiled
+        assert app.query_one("#serving", ServingBox).expected_height == 0
 
 
 async def test_serving_wins_gen_reqs_ttft(tmp_path: Path, monkeypatch):
@@ -2170,18 +2187,16 @@ def test_slope_row_states():
 
 
 def test_serving_base_modes():
-    """AC: the base is the reference row set (gen, prompt, kv, kv% + the meta
-    rows + deploy), plus one rank row per stacked node and one extra
-    requests/ttft pair per additional model. Compact drops the prompt and kv%
-    graphs; rail/floor keep their fixed surfaces."""
+    """AC: the base is the reference row set — gen, prompt, kv, kv% plus the
+    three meta rows at roomy; gen, kv and the meta rows at compact; one extra
+    requests/ttft pair per additional model. Rail/floor keep their fixed
+    surfaces."""
     from app import _serving_base
 
-    assert _serving_base("roomy", 80, 1) == 10
-    assert _serving_base("roomy", 80, 3) == 14  # + a requests/ttft pair each
-    assert _serving_base("roomy", 80, 1, nodes=2, stack=True) == 12  # two rank rows
-    assert _serving_base("roomy", 80, 1, nodes=2, stack=False) == 10  # no stack, no rows
-    assert _serving_base("compact", 80, 1) == 7  # gen, kv, requests, cache, ttft
-    assert _serving_base("compact", 80, 2) == 9
+    assert _serving_base("roomy", 80, 1) == 8
+    assert _serving_base("roomy", 80, 3) == 12  # + a requests/ttft pair each
+    assert _serving_base("compact", 80, 1) == 6  # gen, kv, spacer, 3 meta rows
+    assert _serving_base("compact", 80, 2) == 8
     assert _serving_base("rail", 80, 1) == 4
     assert _serving_base("floor", 80, 1) == 3
 
