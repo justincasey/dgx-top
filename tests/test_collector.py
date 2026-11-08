@@ -464,16 +464,19 @@ class SglangMetricsTests(unittest.TestCase):
 
     def test_sglang_out_of_range_usage_gauge_is_rejected_not_scaled(self):
         # token_usage is a 0-1 fraction and the ×100 happens in the collector,
-        # so a hostile or mis-scaled sample must leave the no-reading sentinel
-        # rather than paint a 4200% (or -50%) KV meter and seed the Sparkline
-        # history with it.
+        # so a hostile or mis-scaled sample must be rejected rather than
+        # clamped into a fake 4200% (or -50%) KV meter. The rejected fraction
+        # does not leave the no-reading sentinel when the raw token gauges
+        # state the pool honestly: the fill is then derived from
+        # num_used_tokens / max_total_num_tokens (45%), the same source the
+        # used count always came from.
         payload = self._payload()
         line = f"sglang:token_usage{self.LABELS} 0.45\n"
         for value in ("42", "-0.5", "1.0000001", "NaN", "+Inf", "garbage"):
             s = collector._parse_engine_metrics(
                 payload.replace(line, f"sglang:token_usage{self.LABELS} {value}\n")
             )
-            self.assertEqual(s.kv_cache_pct, -1.0, value)
+            self.assertAlmostEqual(s.kv_cache_pct, 45.0, msg=value)
             # The used count comes from its own gauge, never from the fraction.
             self.assertEqual(s.kv_cache_used_tokens, 450_000, value)
         for value, expected in (("0.0", 0.0), ("1.0", 100.0)):
@@ -765,6 +768,106 @@ class TensorFoldMetricsTests(unittest.TestCase):
             collector.metrics_engine(self._payload() + "vllm:prompt_tokens_total 1\n"),
             "tensorfold",
         )
+
+
+class RexlMetricsTests(unittest.TestCase):
+    """REXL's exposition differs from every other engine twice over: the
+    namespace is an underscored versioned prefix (``rexl3_``, not
+    ``rexl3:``), and its KV pool is stated as two raw token gauges — capacity
+    and used — with no 0-1 usage fraction at all. Every semantic is read
+    through the engine's own profile; the fill percentage is derived."""
+
+    def _payload(self) -> str:
+        return (
+            "# HELP rexl3_kv_pool_tokens Token capacity of the KV pool.\n"
+            "# TYPE rexl3_kv_pool_tokens gauge\n"
+            "rexl3_kv_pool_tokens 1179648\n"
+            "# TYPE rexl3_kv_pool_tokens_used gauge\n"
+            "rexl3_kv_pool_tokens_used 529536\n"
+            "# TYPE rexl3_active_sequences gauge\n"
+            "rexl3_active_sequences 2\n"
+            "# TYPE rexl3_queue_depth gauge\n"
+            "rexl3_queue_depth 1\n"
+            "# TYPE rexl3_prompt_tokens_total counter\n"
+            "rexl3_prompt_tokens_total 556443\n"
+            "# TYPE rexl3_completion_tokens_total counter\n"
+            "rexl3_completion_tokens_total 5361\n"
+            "# TYPE rexl3_prefix_cache_hits_total counter\n"
+            "rexl3_prefix_cache_hits_total 26\n"
+            "# TYPE rexl3_prefix_cache_lookups_total counter\n"
+            "rexl3_prefix_cache_lookups_total 31\n"
+            "# TYPE rexl3_request_ttft_seconds histogram\n"
+            'rexl3_request_ttft_seconds_bucket{le="0.512"} 4\n'
+            'rexl3_request_ttft_seconds_bucket{le="1.024"} 8\n'
+            'rexl3_request_ttft_seconds_bucket{le="2.048"} 16\n'
+            'rexl3_request_ttft_seconds_bucket{le="+Inf"} 30\n'
+            "rexl3_request_ttft_seconds_count 30\n"
+            "# TYPE rexl3_token_batch_itl_seconds histogram\n"
+            'rexl3_token_batch_itl_seconds_bucket{le="0.25"} 10\n'
+            'rexl3_token_batch_itl_seconds_bucket{le="+Inf"} 20\n'
+            "rexl3_token_batch_itl_seconds_count 20\n"
+            "# TYPE rexl3_build_info gauge\n"
+            'rexl3_build_info{version="0.1.0",commit="49cbd0461a71"} 1\n'
+        )
+
+    def test_rexl_payload_populates_every_stated_semantic(self):
+        s = collector._parse_engine_metrics(self._payload())
+
+        self.assertEqual(s.model_source, "rexl")
+        self.assertTrue(s.model_hosted)
+        self.assertEqual((s.requests_running, s.requests_waiting), (2, 1))
+        # 529536 / 1179648 — derived from the two raw token gauges, not read
+        # from any fraction series (REXL states none).
+        self.assertAlmostEqual(s.kv_cache_pct, 529536 / 1179648 * 100)
+        self.assertEqual(s.kv_total_tokens, 1_179_648)
+        self.assertEqual(s.kv_cache_used_tokens, 529_536)
+        self.assertAlmostEqual(s.ttft_p50_ms, 1920.0)
+        self.assertAlmostEqual(s.itl_p50_ms, 250.0)
+        self.assertEqual(s.generation_tokens_total, 5361.0)
+        self.assertEqual(s.prompt_tokens_total, 556443.0)
+        self.assertTrue(s.model_metrics)
+
+    def test_rexl_prefix_hit_rate_is_derived_from_the_counter_pair(self):
+        s = collector._parse_engine_metrics(self._payload())
+
+        # 26 hits / 31 lookups: the parser stores the cumulative counters and
+        # the poll-time delta machinery derives the rate (no rate gauge exists).
+        collector._update_prefix_hit_rate(1, s)
+        self.assertAlmostEqual(s.kv_prefix_hit_rate, 26 / 31 * 100)
+
+    def test_rexl_zero_used_gauge_is_a_real_empty_pool_not_a_missing_reading(self):
+        payload = self._payload().replace(
+            "rexl3_kv_pool_tokens_used 529536", "rexl3_kv_pool_tokens_used 0"
+        )
+
+        s = collector._parse_engine_metrics(payload)
+
+        self.assertAlmostEqual(s.kv_cache_pct, 0.0)
+        self.assertEqual(s.kv_cache_used_tokens, 0)
+
+    def test_rexl_used_gauge_absent_leaves_the_no_reading_sentinel(self):
+        lines = [
+            l for l in self._payload().splitlines() if not l.startswith("rexl3_kv_pool_tokens_used")
+        ]
+
+        s = collector._parse_engine_metrics("\n".join(lines))
+
+        self.assertEqual(s.kv_cache_pct, -1.0)
+        self.assertEqual(s.kv_cache_used_tokens, 0)
+
+    def test_rexl_majority_wins_detection(self):
+        # A stray vllm: sample must not flip the parse away from the rexl3
+        # namespace that carries the actual evidence.
+        text = self._payload() + "vllm:generation_tokens_total 1\n"
+
+        self.assertEqual(collector.metrics_engine(text), "rexl")
+
+    def test_rexl_dead_metric_names_are_not_read_by_the_vllm_profile(self):
+        # The rexl3 namespace must never satisfy a vllm: lookup (the
+        # underscore separator keeps the namespaces disjoint).
+        self.assertEqual(collector.metrics_engine(self._payload()), "rexl")
+        s = collector._parse_engine_metrics(self._payload())
+        self.assertEqual(s.model_source, "rexl")
 
 
 class EngineLoadTests(unittest.IsolatedAsyncioTestCase):

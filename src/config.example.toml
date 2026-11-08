@@ -34,9 +34,9 @@ phys_gib = 128
 # ssh_target accepts either user@host or an alias from ~/.ssh/config.
 # vllm_url is the inference-engine base URL, accessed directly from the machine
 # running dgx-top.
-# engine is optional: "vllm", "sglang" or "tensorfold". Leave it out and dgx-top
-# detects the engine from the endpoint's own metrics. Declaring "vllm" or
-# "tensorfold" skips SGLang's load-API probes.
+# engine is optional: "vllm", "sglang", "tensorfold" or "rexl". Leave it out and
+# dgx-top detects the engine from the endpoint's own metrics. Declaring "vllm",
+# "tensorfold" or "rexl" skips SGLang's load-API probes.
 # log is optional: where the engine's startup log is read from (over SSH) to
 # split memory into weights / graphs / KV. Leave it out to follow the log of
 # the process listening on vllm_url's port; "off" never reads one;
