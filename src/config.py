@@ -32,8 +32,8 @@ class NodeConfig:
     vllm_url: str
     worker: bool = False
     engine: str | None = None
-    """Expected inference engine (``"vllm"``, ``"sglang"`` or
-    ``"tensorfold"``); ``None`` means infer it from the endpoint's own
+    """Expected inference engine (``"vllm"``, ``"sglang"``, ``"tensorfold"``
+    or ``"rexl"``); ``None`` means infer it from the endpoint's own
     metrics. The URL is engine-agnostic, so the field selects no metric
     profile and no protocol of its own: it suppresses SGLang's load-API
     probe on a node declared as an engine without one (vLLM, TensorFold),
@@ -46,7 +46,7 @@ class NodeConfig:
     ``docker logs``, an absolute path reads that file."""
 
 
-ENGINES = {"vllm", "sglang", "tensorfold"}
+ENGINES = {"vllm", "sglang", "tensorfold", "rexl"}
 """Recognised values for ``NodeConfig.engine``.
 
 Must stay equal to ``collector.ENGINE_PROFILES``: every engine the collector

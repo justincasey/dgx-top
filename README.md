@@ -14,7 +14,7 @@
 - Prompt-to-generation ratio
 - Running and waiting requests
 - KV-cache utilization, block-allocated token capacity, and prefix-cache hit rate
-- The engine serving each model (`vllm` / `sglang` / `tensorfold` badge), detected from its own metrics
+- The engine serving each model (`vllm` / `sglang` / `tensorfold` / `rexl` badge), detected from its own metrics
 - Time-to-first-token p50–p95, with the tail taking warn past 2s and an `!!`
   alarm past 8s
 - GPU utilization, temperature, SM clock, memory, and power draw, plus the
@@ -43,7 +43,10 @@
   - SGLang started with `--enable-metrics` (exposes the `sglang:` series), or
     plain SGLang, whose load API `dgx-top` reads instead, or
   - TensorFold exposing `/metrics` (its `tensorfold:` series repeats every
-    reading under vLLM-compatible names)
+    reading under vLLM-compatible names), or
+  - REXL exposing `/metrics` (its `rexl3_` series; it states the KV pool as
+    raw used/capacity token gauges, so the fill percentage is derived from
+    them rather than read from a usage fraction)
 
 `dgx-top` reads whichever engine is there. It identifies the engine family from
 the metric names in `/metrics`; a server without `--enable-metrics` is detected

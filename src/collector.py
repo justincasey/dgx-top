@@ -288,10 +288,38 @@ ENGINE_PROFILES: Dict[str, Dict[str, Tuple[str, ...]]] = {
         "running": ("num_requests_running",),
         "waiting": ("num_requests_waiting",),
     },
+    "rexl": {
+        # REXL states its KV pool as two raw token gauges (capacity and used),
+        # not a 0-1 fraction: the usage percentage is derived from them below.
+        # Its concurrency is split prefilling/decoding; active_sequences is the
+        # total in flight, matching vLLM's num_requests_running semantics.
+        "generation_tokens": ("completion_tokens_total",),
+        "prompt_tokens": ("prompt_tokens_total",),
+        "ttft": ("request_ttft_seconds",),
+        "itl": ("token_batch_itl_seconds",),
+        "kv_capacity": ("kv_pool_tokens",),
+        "kv_used": ("kv_pool_tokens_used",),
+        "running": ("active_sequences",),
+        "waiting": ("queue_depth",),
+        "prefix_hits": ("prefix_cache_hits_total",),
+        "prefix_queries": ("prefix_cache_lookups_total",),
+    },
 }
 
 DEFAULT_ENGINE = "vllm"
 """Engine assumed when no namespace carries sample evidence."""
+
+ENGINE_NS: Dict[str, str] = {"rexl": "rexl3_"}
+"""Wire metric namespace per engine id, where it differs from ``f"{id}:"``.
+
+vLLM, SGLang and TensorFold name their series ``<engine>:<name>``; REXL
+instead uses an underscore and a versioned prefix (``rexl3_``), so its
+namespace cannot be derived from the engine id."""
+
+
+def _ns_prefix(engine: str) -> str:
+    """The sample-line prefix that identifies one engine's namespace."""
+    return ENGINE_NS.get(engine, f"{engine}:")
 
 
 def metrics_engine(text: str) -> Optional[str]:
@@ -305,7 +333,7 @@ def metrics_engine(text: str) -> Optional[str]:
     an endpoint's own metrics are authoritative about which engine serves it.
     """
     lines = text.splitlines()
-    counts = {engine: _ns_sample_count(lines, f"{engine}:") for engine in ENGINE_PROFILES}
+    counts = {engine: _ns_sample_count(lines, _ns_prefix(engine)) for engine in ENGINE_PROFILES}
     best = max(counts.values(), default=0)
     if not best:
         return None
@@ -330,7 +358,7 @@ never probed for SGLang's ``/v1/loads``/``/get_load``."""
 def _metric_names(engine: str, semantic: str) -> Tuple[str, ...]:
     """Namespace-qualified candidate names for one semantic on one engine."""
     profile = ENGINE_PROFILES.get(engine, ENGINE_PROFILES[DEFAULT_ENGINE])
-    return tuple(f"{engine}:{name}" for name in profile.get(semantic, ()))
+    return tuple(f"{_ns_prefix(engine)}{name}" for name in profile.get(semantic, ()))
 
 
 def _series_ladder(lines: List[str], *names: str) -> Tuple[List[float], bool]:
@@ -536,7 +564,17 @@ def _parse_engine_metrics(text: str) -> SparkUnitStats:
             for _lbl, u in used_pairs:
                 key = _replica_key(_lbl)
                 used_by_replica[key] = max(used_by_replica.get(key, 0.0), float(u))
-            s.kv_cache_used_tokens = _safe_int(_finite_sum(used_by_replica.values()))
+            used = _finite_sum(used_by_replica.values())
+            s.kv_cache_used_tokens = _safe_int(used)
+            # REXL states no usage fraction at all — only the raw used/capacity
+            # token gauges — so the fill is derived here, where the used count
+            # is already replica-collapsed and capacity-summed. A gauge that
+            # read 0 is a real 0% pool, not a missing reading, so the sentinel
+            # only stands when the derivation cannot be made at all.
+            if s.kv_cache_pct < 0 and s.kv_total_tokens > 0 and math.isfinite(used):
+                frac = used / s.kv_total_tokens
+                if 0.0 <= frac <= 1.0:
+                    s.kv_cache_pct = frac * 100
         elif have_usage and s.kv_total_tokens > 0:
             s.kv_cache_used_tokens = _safe_int(s.kv_total_tokens * val)
     elif have_usage and s.kv_total_tokens > 0:
