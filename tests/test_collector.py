@@ -3388,6 +3388,7 @@ async def test_a_straggler_is_polled_once_and_rated_at_landing(tmp_path, monkeyp
     clock[0] = 20.0  # ... and is picked up by the call at t=20
     third = await asyncio.wait_for(collector.poll_cluster(), 1.0)
     # the node starts its next poll at once instead of idling until the next call
+    await asyncio.sleep(0)  # wait_for runs the call inline on 3.12+: let that poll begin
     assert polls == {1: 3, 2: 2}
     landed = third.units[1]
     assert not landed.pending and landed.generation_tokens_total == 1000.0 + 100.0 * 12
@@ -3544,6 +3545,7 @@ async def test_a_slow_node_is_polled_every_tick_not_every_other(tmp_path, monkey
             stats = await asyncio.wait_for(collector.poll_cluster(), 2.0)
             assert not stats.units[1].pending
             # published, and its next poll is already under way: never a whole idle tick
+            await asyncio.sleep(0)  # wait_for runs the call inline on 3.12+: let that poll begin
             assert len(gates) == tick + 1
     finally:
         for gate in gates:
