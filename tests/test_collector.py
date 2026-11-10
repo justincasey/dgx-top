@@ -1063,7 +1063,7 @@ class EngineLoadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(load)
 
     async def test_malformed_load_fields_degrade_not_raise(self):
-        # poll_cluster's gather has no return_exceptions, so a non-numeric
+        # a poll_unit that raises propagates out of poll_cluster, so a non-numeric
         # field (or JSON 1e999 -> inf) must degrade to 0, never escape.
         legacy = [
             {"num_reqs": {"a": 1}, "num_waiting_reqs": [2]},
@@ -2309,8 +2309,8 @@ class ReviewHardeningTests(unittest.TestCase):
         self.assertEqual(collector._coerce_count(2.7), 2)
 
     def test_get_load_malformed_entries_degrade_not_raise(self):
-        # A non-numeric field must never raise out of the parse: poll_cluster's
-        # gather has no return_exceptions, so one bad payload would kill the
+        # A non-numeric field must never raise out of the parse: a poll_unit that
+        # raises propagates out of poll_cluster, so one bad payload would kill the
         # whole cluster poll tick.
         entries = [
             {"num_reqs": {"a": 1}, "num_waiting_reqs": [2]},
@@ -3315,3 +3315,315 @@ async def test_poll_unit_survives_a_failing_log_read_through_the_real_fetch(monk
     s = await _poll_plan(REAL_FETCH_STACK_LOG, telemetry)
     assert s.online
     assert (s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes) == (0, 0, 0)
+
+
+# ─── Soft deadline: nothing waits on a node that cannot answer ───────
+
+
+async def test_poll_cluster_publishes_landed_units_at_the_soft_deadline(tmp_path, monkeypatch):
+    import config
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[nodes]]\nlabel = "head"\nssh_target = "head"\nvllm_url = "http://192.0.2.10:8000"\n'
+        '[[nodes]]\nlabel = "worker"\nssh_target = "worker"\n'
+        'vllm_url = "http://192.0.2.11:8000"\nworker = true\n'
+    )
+    config.configure(path)
+    _isolate_rate_state(monkeypatch)
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 0.05)
+    never = asyncio.Event()
+
+    async def fake_poll_unit(uid):
+        if uid == 2:
+            await never.wait()  # a node that cannot answer
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    try:
+        # wait_for turns "waited for the dead node" into a failure, not a hang
+        stats = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+    finally:
+        never.set()
+        await asyncio.sleep(0)
+
+    landed, waiting = stats.units
+    assert landed.model_hosted and not landed.pending
+    assert waiting.pending and not waiting.online
+    assert (waiting.label, waiting.is_worker) == ("worker", True)
+
+
+async def test_a_straggler_is_polled_once_and_rated_at_landing(tmp_path, monkeypatch):
+    import types
+
+    _two_unit_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(collector, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    gate = asyncio.Event()
+    polls = {1: 0, 2: 0}
+
+    async def fake_poll_unit(uid):
+        polls[uid] += 1
+        if uid == 2 and polls[2] == 1:
+            await gate.wait()  # the first poll of unit 2 cannot answer
+        return _hosted(1000.0 + 100.0 * clock[0])  # a steady 100 tok/s
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 0.05)
+    first = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+    assert [u.pending for u in first.units] == [False, True]
+
+    # Later calls neither start the straggler again nor wait for it (the
+    # deadline is long here: waiting for it would run into the wait_for).
+    clock[0] = 10.0
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 5.0)
+    second = await asyncio.wait_for(collector.poll_cluster(), 1.0)
+    assert polls == {1: 2, 2: 1}
+    assert [u.pending for u in second.units] == [False, True]
+
+    clock[0] = 12.0
+    gate.set()
+    await asyncio.sleep(0.01)  # the straggler lands at t=12 ...
+    clock[0] = 20.0  # ... and is picked up by the call at t=20
+    third = await asyncio.wait_for(collector.poll_cluster(), 1.0)
+    # the node starts its next poll at once instead of idling until the next call
+    assert polls == {1: 3, 2: 2}
+    landed = third.units[1]
+    assert not landed.pending and landed.generation_tokens_total == 1000.0 + 100.0 * 12
+    await asyncio.sleep(0)  # that poll lands at t=20 ...
+
+    clock[0] = 30.0  # ... and is published by the call at t=30
+    fourth = await asyncio.wait_for(collector.poll_cluster(), 1.0)
+    # Each sample is rated at the time it landed (t=12, then t=20): 800 tokens
+    # over 8 s. Stamped when harvested (t=20, then t=30) it would read 80.
+    assert abs(fourth.units[1].throughput_tok_s - 100.0) < 1e-9
+
+
+async def test_a_switch_drops_the_carried_snapshot(tmp_path, monkeypatch):
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 0.05)
+    gate = asyncio.Event()
+    stuck = [False]
+    polled_urls: list[str] = []
+
+    async def fake_poll_unit(uid):
+        polled_urls.append(collector.SPARK_UNITS[uid]["vllm_url"])
+        if stuck[0]:
+            await gate.wait()
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    try:
+        first = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+        assert first.units[0].model_hosted  # landed under the old endpoint
+
+        stuck[0] = True
+        carried = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+        # the new poll is still running: the unit is shown from its last landing
+        assert carried.units[0].model_hosted and not carried.units[0].pending
+
+        collector.set_unit_endpoint(1, "http://192.0.2.10:8001", None)
+        after = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+    finally:
+        gate.set()
+        await asyncio.sleep(0)
+
+    # never the old engine's numbers under the new endpoint ...
+    assert after.units[0].pending and not after.units[0].model_hosted
+    # ... and the old endpoint's unfinished poll was abandoned, not awaited
+    assert polled_urls == [
+        "http://192.0.2.10:8000",
+        "http://192.0.2.10:8000",
+        "http://192.0.2.10:8001",
+    ]
+
+
+async def test_poll_unit_does_not_wait_on_a_slow_engine_log(monkeypatch):
+    monkeypatch.setattr(collector, "STACK_LOG_GRACE", 0.05)
+    monkeypatch.setattr(collector, "_stack_log_cache", {})
+    release = asyncio.Event()
+
+    async def slow_log(*_args):
+        await release.wait()
+        return (60 * GIB, 20 * GIB, GIB)
+
+    telemetry = {"gpu_output": _gpu_line(2190), "thrash_output": _thrash_output()}
+    try:
+        s = await asyncio.wait_for(_poll_plan(slow_log, telemetry), 2.0)
+        # the node's rows are in, the plan is simply not there yet
+        assert s.online and s.mem_total_bytes == 100 * GIB
+        assert (s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes) == (0, 0, 0)
+
+        # an earlier read, however old, stands in for the one still running
+        collector._stack_log_cache[("tester@spark.test", None, 8000)] = (
+            0.0,
+            (50 * GIB, 10 * GIB, 0),
+        )
+        s = await asyncio.wait_for(_poll_plan(slow_log, telemetry), 2.0)
+        assert (s.mem_weights_bytes, s.mem_kv_pool_bytes) == (50 * GIB, 10 * GIB)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+async def test_concurrent_stack_log_reads_share_one_ssh_session(monkeypatch):
+    monkeypatch.setattr(collector, "_stack_log_cache", {})
+    release = asyncio.Event()
+
+    async def slow_ssh(_target, _command):
+        await release.wait()
+        return VLLM_LOG
+
+    ssh = AsyncMock(side_effect=slow_ssh)
+    monkeypatch.setattr(collector, "_ssh_run", ssh)
+    reads = [
+        asyncio.ensure_future(REAL_FETCH_STACK_LOG("tester@spark.test", None, 8000))
+        for _ in range(3)
+    ]
+    await asyncio.sleep(0.01)  # all three are waiting on the one read
+    reads[0].cancel()  # one waiter leaving must not kill the read the others share
+    release.set()
+    plans = await asyncio.gather(*reads[1:])
+    with pytest.raises(asyncio.CancelledError):
+        await reads[0]
+
+    expected = collector._parse_stack_log(VLLM_LOG)
+    assert expected[0] > 0
+    assert plans == [expected] * 2
+    assert ssh.await_count == 1
+    assert collector._stack_log_cache[("tester@spark.test", None, 8000)][1] == expected
+
+
+async def test_the_engine_log_read_outlives_the_grace_and_serves_the_next_poll(monkeypatch):
+    monkeypatch.setattr(collector, "STACK_LOG_GRACE", 0.05)
+    monkeypatch.setattr(collector, "_stack_log_cache", {})
+    release = asyncio.Event()
+
+    async def slow_ssh(_target, _command):
+        await release.wait()
+        return VLLM_LOG
+
+    monkeypatch.setattr(collector, "_ssh_run", AsyncMock(side_effect=slow_ssh))
+    telemetry = {"gpu_output": _gpu_line(2190), "thrash_output": _thrash_output()}
+    try:
+        first = await asyncio.wait_for(_poll_plan(REAL_FETCH_STACK_LOG, telemetry), 2.0)
+        assert first.mem_weights_bytes == 0  # not ready within the grace
+    finally:
+        release.set()
+    await asyncio.sleep(0.01)  # the read finishes after that poll moved on
+    second = await asyncio.wait_for(_poll_plan(REAL_FETCH_STACK_LOG, telemetry), 2.0)
+    weights, kv, graphs = collector._parse_stack_log(VLLM_LOG)
+    assert (second.mem_weights_bytes, second.mem_kv_pool_bytes, second.mem_graphs_bytes) == (
+        weights,
+        kv,
+        graphs,
+    )
+
+
+async def test_a_slow_node_is_polled_every_tick_not_every_other(tmp_path, monkeypatch):
+    _two_unit_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 0.05)
+    gates: list[asyncio.Event] = []
+
+    async def fake_poll_unit(uid):
+        if uid == 2:
+            gates.append(asyncio.Event())
+            await gates[-1].wait()  # unit 2 always outlasts the deadline
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    try:
+        first = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+        assert first.units[1].pending
+        for tick in range(1, 4):
+            gates[-1].set()
+            await asyncio.sleep(0.01)  # the slow poll lands between ticks
+            stats = await asyncio.wait_for(collector.poll_cluster(), 2.0)
+            assert not stats.units[1].pending
+            # published, and its next poll is already under way: never a whole idle tick
+            assert len(gates) == tick + 1
+    finally:
+        for gate in gates:
+            gate.set()
+        await asyncio.sleep(0)
+
+
+async def test_pending_landed_reports_a_finished_poll_of_a_node_not_yet_shown(
+    tmp_path, monkeypatch
+):
+    _two_unit_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 0.05)
+    gate = asyncio.Event()
+
+    async def fake_poll_unit(uid):
+        if uid == 2 and not gate.is_set():
+            await gate.wait()
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    try:
+        await asyncio.wait_for(collector.poll_cluster(), 2.0)
+        assert collector.pending_landed() is False  # unit 2 is still polling
+        gate.set()
+        await asyncio.sleep(0.01)
+        assert collector.pending_landed() is True  # finished, not yet published
+        await asyncio.wait_for(collector.poll_cluster(), 2.0)
+        assert collector.pending_landed() is False  # published
+    finally:
+        gate.set()
+        await asyncio.sleep(0)
+
+
+async def test_a_raising_poll_does_not_strand_the_other_units(tmp_path, monkeypatch):
+    _two_unit_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    broken = [True]
+
+    async def fake_poll_unit(uid):
+        if uid == 1 and broken[0]:
+            raise RuntimeError("poll blew up")
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    with pytest.raises(RuntimeError, match="poll blew up"):
+        await collector.poll_cluster()
+    assert 2 in collector._landed  # the unit that landed was kept, not stranded behind the raise
+    assert 1 not in collector._flights  # and the raising unit is polled afresh next time
+
+    broken[0] = False
+    stats = await collector.poll_cluster()
+    assert [u.pending for u in stats.units] == [False, False]
+
+
+async def test_an_abandoned_flight_that_fails_is_not_reported_as_lost(tmp_path, monkeypatch):
+    import gc
+
+    _switch_config(tmp_path)
+    _isolate_rate_state(monkeypatch)
+    monkeypatch.setattr(collector, "POLL_SOFT_DEADLINE", 0.05)
+    reported: list[str] = []
+    asyncio.get_running_loop().set_exception_handler(
+        lambda _loop, context: reported.append(str(context.get("message")))
+    )
+    gate = asyncio.Event()
+    calls = [0]
+
+    async def fake_poll_unit(uid):
+        calls[0] += 1
+        if calls[0] == 1:
+            await gate.wait()
+            raise RuntimeError("the old endpoint went away")
+        return _hosted(1000.0)
+
+    monkeypatch.setattr(collector, "poll_unit", fake_poll_unit)
+    await asyncio.wait_for(collector.poll_cluster(), 2.0)  # the first poll cannot answer
+    collector.set_unit_endpoint(1, "http://192.0.2.10:8001", None)
+    await asyncio.wait_for(collector.poll_cluster(), 2.0)  # abandons it, polls the new endpoint
+    gate.set()
+    await asyncio.sleep(0.01)  # the abandoned poll now fails with nobody waiting
+    gc.collect()
+    assert reported == []

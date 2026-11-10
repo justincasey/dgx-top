@@ -687,6 +687,111 @@ async def test_offline_node_dashes_and_glyph(tmp_path: Path, monkeypatch):
         assert top.startswith("╭─") and lines[-1].startswith("╰")
 
 
+# ─── pending: a node whose first poll has not landed ─────────────────
+
+
+async def test_pending_node_renders_connecting_not_offline(tmp_path: Path, monkeypatch):
+    from app import DGXTop, NodeBox, Waybar, _palette_for
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    waiting = SparkUnitStats(label="worker", is_worker=True, pending=True)
+    _stub(monkeypatch, units=[_unit("head"), waiting])
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        node = app.query_one("#node-1", NodeBox)
+        top = node.render().plain.split("\n")[0]
+        assert "…" in top and "worker" in top and "✗" not in top  # not known yet, not failed
+        row = node._table_row(waiting, _palette_for(app), 40).plain
+        assert row.startswith("… ") and "✗" not in row
+        wb = app.query_one("#waybar", Waybar).render().plain
+        assert " ! " not in wb  # nothing has failed
+        assert "1/2" in wb  # and only the node that landed counts as online
+
+
+async def test_node_tile_before_the_first_poll_is_pending_not_offline(tmp_path: Path, monkeypatch):
+    import asyncio
+
+    import app as app_module
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+
+    async def never_lands():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(app_module, "poll_cluster", never_lands)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        top = app.query_one("#node-0", app_module.NodeBox).render().plain.split("\n")[0]
+        assert "…" in top and "✗" not in top  # the first frame the user sees
+
+
+async def test_clock_menu_calls_a_pending_node_waiting_not_offline(tmp_path: Path, monkeypatch):
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml", ceiling=2100)
+    configure(tmp_path / "c.toml")
+    waiting = SparkUnitStats(label="worker", is_worker=True, pending=True)
+    _stub(monkeypatch, units=[_unit("head"), waiting])
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        rows, _hint = _clock_text(app)
+        nodes = [text for text, _disabled, oid in rows if oid is None]
+        assert "waiting for a poll" in nodes[1] and "offline" not in nodes[1]
+
+
+async def test_app_watches_a_pending_node_without_repolling_the_others(tmp_path: Path, monkeypatch):
+    import app as app_module
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    waiting = SparkUnitStats(label="worker", is_worker=True, pending=True)
+
+    async def outstanding():
+        return _cluster([_unit("head"), waiting])
+
+    async def all_landed():
+        return _cluster([_unit("head"), _unit("worker", worker=True)])
+
+    landed = [False]
+    requested: list[int] = []
+    monkeypatch.setattr(app_module, "poll_cluster", outstanding)
+    monkeypatch.setattr(app_module, "pending_landed", lambda: landed[0])
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(app, "_request_poll", lambda: requested.append(1))
+        armed: list[tuple[float, object]] = []
+        real_set_timer = app.set_timer
+
+        def spy(delay, callback=None, **kwargs):
+            armed.append((delay, callback))
+            return real_set_timer(delay, callback, **kwargs)
+
+        monkeypatch.setattr(app, "set_timer", spy)
+        await app._poll()  # a node is still outstanding: a watch is armed
+        assert (app_module.PENDING_RECHECK_S, app._watch_pending) in armed
+
+        before = len(armed)
+        app._watch_pending()  # nothing has landed: no poll, and keep watching
+        assert requested == [] and len(armed) == before + 1
+
+        landed[0] = True
+        app._watch_pending()  # one has landed: ask for exactly one poll
+        assert requested == [1]
+
+        monkeypatch.setattr(app_module, "poll_cluster", all_landed)
+        armed.clear()
+        await app._poll()  # nothing outstanding: no watch at all
+        assert armed == [] and app._pending_timer is None
+
+
 # ─── AC11: non-finite gating + theme repaint ─────────────────────────
 
 

@@ -227,7 +227,7 @@ several models are served), and every window border is dim grey. The
 **waybar** rides the top and is the **only chrome**: one row with the controls
 left — single-word labels, each hotkey underlined (`s scan`, `+/- poll`,
 `r refresh`, `c clock`, `t theme`, `q quit`) — and the working stats right:
-a warn marker when a node is unreachable or hot, gen `tok/s`, the clock-lock
+a warn marker when a node is unreachable or hot (not while a node's first poll is still pending), gen `tok/s`, the clock-lock
 chip and the `● online/total` fleet chip. The legend gives way first, shedding
 entries from its tail, then the stats drop in order (the rate, then the lock
 chip); the fleet chip is the last thing kept. The model names itself in the
@@ -266,7 +266,7 @@ Utilization meters are btop gradient bars — each `█` cell ramps
 green → yellow → orange → red by fill position; identity metrics (KV) keep a
 single hue over a dim `▓` track, and the SERVING `kv%` row is that same plain
 bar. The area chart footer ramps the same way by column height. Alarm state
-never depends on color alone: `✗` marks an unreachable node, `!!` a TTFT p95
+never depends on color alone: `✗` marks an unreachable node, `…` a node whose first poll is still pending, `!!` a TTFT p95
 past 8s and `!` past 2s, and the value is bold. `tokyo-night` is the default;
 `dgx-aeon` carries the reference design's own hues.
 
@@ -545,6 +545,10 @@ Check the engine bind address, firewall rules, and `vllm_url` (the key keeps its
 ### A node appears offline
 
 Run `dgx-top check`, then verify `nvidia-smi` and the Linux telemetry files using the same SSH target. An engine failure alone does not mark hardware offline.
+
+### A node shows `…` instead of its numbers
+
+`…` means that node's first poll has not come back yet; it is not a failure. `dgx-top` never waits for a slow or unreachable node: the reachable nodes fill in within a second or two, and the others keep `…` until their own poll settles — up to about 20 seconds for a node that does not answer at all (SSH's 5 s connect timeout, the engine's `/metrics` 10 s, then SGLang's two load-API probes at 5 s each) — and then show their data, or `✗`. A node that stays `✗`: run `dgx-top check`.
 
 ## Development
 

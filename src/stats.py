@@ -38,6 +38,9 @@ class TopologyInfo:
 class SparkUnitStats:
     label: str = ""
     is_worker: bool = False
+    # Placeholder for a node whose first poll has not landed yet (the dashboard
+    # does not wait for a slow or unreachable node): "not known yet", not "offline".
+    pending: bool = False
     model_hosted: bool = False
     model_name: str = ""
     model_source: str = "vllm"  # engine family: "vllm" / "sglang" / "tensorfold" / "rexl"

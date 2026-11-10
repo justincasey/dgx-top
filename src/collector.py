@@ -1025,28 +1025,61 @@ def _stack_log_command(log: str | None, port: int) -> str | None:
     return f"{grep} {shlex.quote(log)} | {tail}"
 
 
-_stack_log_cache: dict[tuple[str, str | None, int], tuple[float, tuple[int, int, int]]] = {}
+_StackKey = tuple[str, str | None, int]
+_StackPlan = tuple[int, int, int]
+_NO_PLAN: _StackPlan = (0, 0, 0)
+
+_stack_log_cache: dict[_StackKey, tuple[float, _StackPlan]] = {}
 """(ssh target, log setting, port) -> (monotonic time fetched, plan). Failed
 reads are cached too, so a broken log costs one SSH per TTL, not one per poll."""
+
+_stack_log_inflight: dict[_StackKey, asyncio.Task[_StackPlan]] = {}
+"""key -> the read in progress. A poll that arrives while a slow read (``docker
+logs`` over a big log) is still running joins it instead of opening another SSH
+session, and the read finishes into the cache after the poll that started it has
+stopped waiting (``STACK_LOG_GRACE``)."""
+
+STACK_LOG_GRACE = 0.25
+"""Seconds ``poll_unit`` waits for a node's memory plan once its hardware
+telemetry is in hand. After that the plan comes from the cache (a stale plan
+beats none): a slow log never holds a node's gpu/mem rows."""
+
+
+def _stack_plan_now(ssh_target: str, log: str | None, port: int) -> _StackPlan:
+    """The last plan read for this node, however old, else the zero plan."""
+    cached = _stack_log_cache.get((ssh_target, log, port))
+    return cached[1] if cached is not None else _NO_PLAN
+
+
+async def _read_stack_log(key: _StackKey, ssh_target: str, command: str) -> _StackPlan:
+    """One SSH read of the engine log, written to the cache. Total: any failure
+    is the zero plan."""
+    try:
+        plan = _parse_stack_log(await _ssh_run(ssh_target, command))
+    except Exception:
+        plan = _NO_PLAN
+    _stack_log_cache[key] = (time.monotonic(), plan)
+    return plan
 
 
 async def _fetch_stack_log(ssh_target: str, log: str | None, port: int) -> tuple[int, int, int]:
     """(weights, kv, graphs) bytes read from the node's engine log over SSH,
-    cached for ``STACK_LOG_TTL``. Total: any failure is the zero plan."""
+    cached for ``STACK_LOG_TTL``. Total: any failure is the zero plan. Callers
+    that arrive during a read share it: one SSH session per node."""
     command = _stack_log_command(log, port)
     if command is None:
-        return (0, 0, 0)
+        return _NO_PLAN
     key = (ssh_target, log, port)
-    now = time.monotonic()
     cached = _stack_log_cache.get(key)
-    if cached is not None and now - cached[0] < STACK_LOG_TTL:
+    if cached is not None and time.monotonic() - cached[0] < STACK_LOG_TTL:
         return cached[1]
-    try:
-        plan = _parse_stack_log(await _ssh_run(ssh_target, command))
-    except Exception:
-        plan = (0, 0, 0)
-    _stack_log_cache[key] = (time.monotonic(), plan)
-    return plan
+    read = _stack_log_inflight.get(key)
+    if read is None:
+        read = _stack_log_inflight[key] = asyncio.ensure_future(
+            _read_stack_log(key, ssh_target, command)
+        )
+        read.add_done_callback(lambda _task: _stack_log_inflight.pop(key, None))
+    return await asyncio.shield(read)
 
 
 def clock_lock_command(max_mhz: int) -> str:
@@ -1167,7 +1200,7 @@ def _coerce_count(v: object) -> int:
     """Best-effort int for a remote load field. A malformed value (dict, list,
     garbage string) degrades to 0 for that field — it must never raise out
     of the parse, or one bad payload kills the whole cluster poll tick
-    (``poll_cluster``'s gather has no ``return_exceptions``). JSON ``1e999``
+    (a ``poll_unit`` that raises propagates out of ``poll_cluster``). JSON ``1e999``
     parses to float inf, so OverflowError is part of the contract too.
 
     Exact big integers are part of that contract: a JSON integer literal with
@@ -1725,7 +1758,8 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
     metrics_task = asyncio.create_task(_fetch_metrics(vllm_url))
     telemetry_task = asyncio.create_task(_fetch_telemetry(ssh_target))
     # The engine's startup log (memory plan) rides alongside; it is cached and
-    # total, so it never raises and never outlives the SSH timeout.
+    # total, so it never raises. poll_unit waits only STACK_LOG_GRACE for it: a
+    # slow read finishes into the cache and the next poll takes the plan from there.
     stack_task = asyncio.create_task(
         _fetch_stack_log(ssh_target, cfg.get("log"), _endpoint_port(vllm_url))
     )
@@ -1857,7 +1891,14 @@ async def poll_unit(unit_id: int) -> SparkUnitStats:
         except Exception:
             pass  # thrash fields stay at defaults
 
-    plan = await stack_task
+    # The memory plan rides along only if it is ready: a slow `docker logs` must
+    # not hold the node's gpu/mem rows. The read finishes into the cache and the
+    # next poll takes it from there.
+    done, _ = await asyncio.wait({stack_task}, timeout=STACK_LOG_GRACE)
+    if done:
+        plan = stack_task.result()
+    else:
+        plan = _stack_plan_now(ssh_target, cfg.get("log"), _endpoint_port(vllm_url))
     if s.mem_total_bytes > 0:
         s.mem_weights_bytes, s.mem_kv_pool_bytes, s.mem_graphs_bytes = plan
         s.mem_phys_bytes = int(cfg.get("phys_gib", 128)) * _GIB
@@ -2109,9 +2150,33 @@ def _update_thrash_rates(host: str, data: dict, now: float) -> dict:
 
 _endpoint_epoch: dict[int, int] = {}
 """Per-unit endpoint generation, bumped by ``set_unit_endpoint``. Work that
-started before a switch describes the old endpoint: ``poll_cluster`` re-polls
-a unit whose generation moved during its gather, and a model-name fetch keeps
-its result only when the generation it started under is still current."""
+started before a switch describes the old endpoint: ``poll_cluster`` abandons a
+poll begun under an older generation and polls the unit again, and a model-name
+fetch keeps its result only when the generation it started under is still current."""
+
+
+POLL_SOFT_DEADLINE = 1.5
+"""Seconds ``poll_cluster`` waits for the polls it starts before publishing what
+has landed. A node that cannot answer (SSH ``ConnectTimeout`` 5 s, a hung
+engine's ``/metrics`` 10 s) keeps its poll running in the background and shows
+up in a later call; it never holds the healthy nodes back."""
+
+
+@dataclass
+class _Flight:
+    """One unit's poll in progress. It may outlive the ``poll_cluster`` call that
+    started it, and is never started twice."""
+
+    task: asyncio.Task[SparkUnitStats]
+    epoch: int  # the unit's endpoint generation when the poll started
+    landed: float | None = None  # monotonic time the poll finished; rate samples carry it
+
+
+_flights: dict[int, _Flight] = {}
+_landed: dict[int, SparkUnitStats] = {}
+"""unit -> the last poll that landed, its rates already applied. A unit whose
+next poll is still running is shown from here (never re-rated). An endpoint
+switch drops it: it describes the old endpoint."""
 
 
 def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> int:
@@ -2129,6 +2194,7 @@ def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> int:
     _prev_prompt_tokens.pop(unit_id, None)
     _prev_prefix.pop(unit_id, None)
     _model_names.pop(unit_id, None)
+    _landed.pop(unit_id, None)
     for key in [k for k in _stack_log_cache if k[0] == str(SPARK_UNITS[unit_id]["ssh_target"])]:
         del _stack_log_cache[key]
     epoch = _endpoint_epoch.get(unit_id, 0) + 1
@@ -2145,42 +2211,105 @@ async def refresh_unit_model_name(unit_id: int, epoch: int) -> bool:
         return await _store_model_name(client, unit_id, epoch)
 
 
+def _pending_unit(unit_id: int) -> SparkUnitStats:
+    """Placeholder for a unit whose first poll has not landed."""
+    cfg = SPARK_UNITS[unit_id]
+    return SparkUnitStats(
+        label=str(cfg["label"]), is_worker=bool(cfg.get("worker", False)), pending=True
+    )
+
+
+def _retrieved(task: asyncio.Future) -> None:
+    """Done-callback: mark a poll's exception as seen. A flight abandoned by an
+    endpoint switch is never harvested; without this asyncio would log its
+    failure as lost. A harvested flight still raises from ``result()``."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _start_flight(unit_id: int) -> _Flight:
+    """Begin polling one unit under its current endpoint generation."""
+    flight = _Flight(
+        task=asyncio.ensure_future(poll_unit(unit_id)), epoch=_endpoint_epoch.get(unit_id, 0)
+    )
+
+    def stamp(_task: asyncio.Future) -> None:
+        flight.landed = time.monotonic()
+
+    # Registered before any waiter's callback, so the stamp exists whenever a
+    # wait on this task returns.
+    flight.task.add_done_callback(stamp)
+    flight.task.add_done_callback(_retrieved)
+    _flights[unit_id] = flight
+    return flight
+
+
+def pending_landed() -> bool:
+    """True when a node still shown as pending has a finished poll waiting to be
+    published: the one thing that makes another ``poll_cluster`` call worth it."""
+    return any(uid not in _landed and flight.task.done() for uid, flight in _flights.items())
+
+
 async def poll_cluster() -> ClusterStats:
-    """Poll N Spark units in parallel."""
+    """Poll every unit and publish what has landed.
+
+    The call waits up to ``POLL_SOFT_DEADLINE`` for the polls it started, then
+    returns: a unit still polling keeps its poll (a flight) for later calls and
+    meanwhile shows its last landed snapshot, or a ``pending`` placeholder if it
+    has never landed. A poll that landed between calls is published by the next
+    call, which starts that node's next poll at once. A flight begun under an
+    endpoint generation the unit has since left is abandoned and the unit polled
+    again, so the published unit always describes the endpoint it monitors now.
+    Each landed poll is rated once, with the time it landed.
+    """
     if config.SIMULATION_NODES:
         return simulate_cluster(config.SIMULATION_NODES)
+    loop = asyncio.get_running_loop()
     unit_ids = sorted(SPARK_UNITS.keys())
-    epochs = {uid: _endpoint_epoch.get(uid, 0) for uid in unit_ids}
-    tasks = [poll_unit(uid) for uid in unit_ids]
-    results = list(await asyncio.gather(*tasks))
-    # Each sample is stamped when its gather finished: a re-poll below takes
-    # time, and stamping the untouched units later would shrink their rates.
-    stamps = [time.monotonic()] * len(unit_ids)
-    # A unit switched while it was being polled returned the endpoint it no
-    # longer monitors. Poll it again (until no switch lands mid-poll), so its
-    # tile, its history samples and its new rate baseline all describe the
-    # endpoint it monitors now.
-    while stale := [
-        i for i, uid in enumerate(unit_ids) if _endpoint_epoch.get(uid, 0) != epochs[uid]
-    ]:
-        for i in stale:
-            epochs[unit_ids[i]] = _endpoint_epoch.get(unit_ids[i], 0)
-        fresh = await asyncio.gather(*(poll_unit(unit_ids[i]) for i in stale))
-        landed = time.monotonic()
-        for i, s in zip(stale, fresh):
-            results[i] = s
-            stamps[i] = landed
+    deadline = loop.time() + POLL_SOFT_DEADLINE
+    started: set[int] = set()  # units this call began polling; carried flights never extend it
+    while True:
+        for uid in unit_ids:
+            flight = _flights.get(uid)
+            if flight is None or flight.epoch != _endpoint_epoch.get(uid, 0):
+                _start_flight(uid)
+                started.add(uid)
+        waiting = [_flights[uid].task for uid in started if not _flights[uid].task.done()]
+        remaining = deadline - loop.time()
+        if not waiting or remaining <= 0:
+            break
+        await asyncio.wait(waiting, timeout=remaining)
 
-    for unit_id, s, now in zip(unit_ids, results, stamps):
-        _update_throughput(unit_id, s, now)
-        _update_prompt_throughput(unit_id, s, now)
-        _update_prefix_hit_rate(unit_id, s)
-        # Compute prompt:generated ratio (Spark Monitor insight)
-        if s.prompt_throughput_tok_s > 0 and s.throughput_tok_s > 0:
-            ratio = s.prompt_throughput_tok_s / s.throughput_tok_s
-            # finite/finite can still overflow to inf with extreme rates.
-            if math.isfinite(ratio):
-                s.prompt_gen_ratio = ratio
+    results: list[SparkUnitStats] = []
+    failure: Exception | None = None
+    for uid in unit_ids:
+        flight = _flights.get(uid)
+        if flight is not None and flight.task.done():
+            del _flights[uid]  # harvested once
+            try:
+                s = flight.task.result()
+            except Exception as exc:
+                # A poll that raises propagates out of the call, as it did out of
+                # gather, but only after every unit that landed has been kept.
+                failure = failure or exc
+                continue
+            now = flight.landed if flight.landed is not None else time.monotonic()
+            _update_throughput(uid, s, now)
+            _update_prompt_throughput(uid, s, now)
+            _update_prefix_hit_rate(uid, s)
+            # Compute prompt:generated ratio (Spark Monitor insight)
+            if s.prompt_throughput_tok_s > 0 and s.throughput_tok_s > 0:
+                ratio = s.prompt_throughput_tok_s / s.throughput_tok_s
+                # finite/finite can still overflow to inf with extreme rates.
+                if math.isfinite(ratio):
+                    s.prompt_gen_ratio = ratio
+            _landed[uid] = s
+            if uid not in started:
+                # Landed between calls: the node is not left idle until the next one.
+                _start_flight(uid)
+        results.append(_landed[uid] if uid in _landed else _pending_unit(uid))
+    if failure is not None:
+        raise failure
 
     # Derive cluster topology from per-node topology data
     node_topos: dict[int, dict] = {}

@@ -20,6 +20,7 @@ from textual.widgets.option_list import Option
 import discovery
 from collector import (
     _init_model_names,
+    pending_landed,
     poll_cluster,
     refresh_unit_model_name,
     set_clock_lock,
@@ -60,6 +61,7 @@ NODE_CARD_MIN = 22  # a usable card (text) shows gpu/mem/cpu; below this -> tabl
 NODE_FULL_MIN = 26  # a tile at/above this keeps the meter/core/RoCE grammar
 NODE_FLOOR_MAX = 20  # condensed table rows prefer this width (keeps gpu/mem/cpu)
 FLOOR_GAP = 3  # blank cells that separate two condensed nodes packed side by side
+PENDING_RECHECK_S = 0.5  # how often to look for an outstanding first poll having landed
 GIB = 1024**3
 SERVING_NARROW_WIDTH = 52  # below this the SERVING hero uses the fused grammar
 
@@ -924,7 +926,7 @@ class Waybar(Static):
             return _fit(Text("…"), width)
         online = sum(1 for u in c.units if u.online)
         total = len(c.units)
-        risky = any((not u.online) or (u.temp_c >= TEMP_ALERT) for u in c.units)
+        risky = any((not u.online and not u.pending) or (u.temp_c >= TEMP_ALERT) for u in c.units)
         # A cluster with no counter-bearing unit stated no rate; "0 tok/s" would
         # be a manufactured reading of a live server, so the segment says so.
         gen = Text(
@@ -1654,7 +1656,9 @@ class NodeBox(Static):
         s = self._stats
         if s is None:
             node_cfg = self.app.settings.nodes[self.idx]
-            s = SparkUnitStats(label=node_cfg.label, is_worker=getattr(node_cfg, "worker", False))
+            s = SparkUnitStats(
+                label=node_cfg.label, is_worker=getattr(node_cfg, "worker", False), pending=True
+            )
         pal = _palette_for(self.app)
         width = max(1, self.content_size.width)
         if getattr(self.app, "node_mode", "") == "table":
@@ -1669,9 +1673,9 @@ class NodeBox(Static):
             rows = self._text_rows(s, pal, width)
         role = "host" if not s.is_worker else "worker"
         role_style = pal.cyan if not s.is_worker else pal.warn
-        caret_style = role_style if s.online else pal.warn
+        caret_style = role_style if s.online or s.pending else pal.warn
         title = [
-            ("^" if s.online else "✗", f"bold {caret_style}"),
+            ("^" if s.online else "…" if s.pending else "✗", f"bold {caret_style}"),
             (" ", ""),
             (s.label, f"bold {pal.fg}"),
             (" ", ""),
@@ -1695,7 +1699,10 @@ class NodeBox(Static):
         else:
             gpu = mem = cpu = "—"
         parts = [
-            Text("● " if s.online else "✗ ", style=pal.ok if s.online else pal.warn),
+            Text(
+                "● " if s.online else "… " if s.pending else "✗ ",
+                style=pal.ok if s.online else pal.dim if s.pending else pal.warn,
+            ),
             Text(_short_label(s.label), style=f"bold {pal.fg}"),
             Text("   ", style=""),
             Text(f"{gpu:>4}", style=f"bold {pal.blue}"),
@@ -2346,7 +2353,7 @@ class ClockScreen(ModalScreen[None]):
 
     def _node_row(self, pal: Palette, label: str, unit: SparkUnitStats | None) -> Text:
         row = Text(label, style=f"bold {pal.fg}")
-        if unit is None:
+        if unit is None or unit.pending:
             row.append("  waiting for a poll", style=pal.dim)
         elif not unit.online:
             row.append("  offline", style=pal.warn)
@@ -2511,6 +2518,7 @@ class DGXTop(App):
         self._repoll = False
         self._poll_speed_idx = self.poll_speeds.index(self.settings.poll_interval)
         self._poll_timer = None
+        self._pending_timer = None
         self.history: dict[str, collections.deque] = {}
         self._current_topology: str = ""
         self._host_model: str = ""
@@ -2695,6 +2703,7 @@ class DGXTop(App):
         finally:
             self._polling = False
         self._update_ui()
+        self._recheck_while_pending(stats)
         if self._repoll:
             self._repoll = False
             self.run_worker(self._poll())
@@ -2706,6 +2715,26 @@ class DGXTop(App):
             self._repoll = True
         else:
             self.run_worker(self._poll())
+
+    def _recheck_while_pending(self, stats: ClusterStats) -> None:
+        """A node whose first poll is still outstanding appears as soon as it
+        lands, not a poll interval later. Waiting is cheap: ``_watch_pending``
+        polls again only once such a node has landed, so the nodes already on
+        screen are neither re-polled nor re-sampled into the history meanwhile."""
+        if self._pending_timer is not None:
+            self._pending_timer.stop()
+            self._pending_timer = None
+        if any(u.pending for u in stats.units):
+            self._pending_timer = self.set_timer(PENDING_RECHECK_S, self._watch_pending)
+
+    def _watch_pending(self) -> None:
+        self._pending_timer = None
+        if self.cluster is None or not any(u.pending for u in self.cluster.units):
+            return
+        if pending_landed():
+            self._request_poll()  # _poll arms the next watch if a node is still outstanding
+        else:
+            self._pending_timer = self.set_timer(PENDING_RECHECK_S, self._watch_pending)
 
     def _update_ui(self):
         stats = self.cluster
