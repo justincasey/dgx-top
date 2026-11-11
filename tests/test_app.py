@@ -6,6 +6,8 @@ import contextlib
 import re
 from pathlib import Path
 
+import pytest
+
 from config import configure, load_config
 from stats import ClusterStats, SparkUnitStats, TopologyInfo
 
@@ -872,6 +874,31 @@ async def test_hotkeys_answer_with_caps_lock_on(tmp_path: Path, monkeypatch):
         await pilot.pause()
         assert not isinstance(app.screen, app_module.ClockScreen)
         assert calls == [2100]
+
+
+@pytest.mark.parametrize("n, width", [(2, 51), (2, 52), (3, 77), (3, 78)])
+async def test_every_node_tile_is_the_same_width_and_grammar(tmp_path: Path, monkeypatch, n, width):
+    """``1fr`` columns hand the width%cols remainder to the trailing tiles (51
+    cells over two nodes is 25 + 26), so tiles differed by a cell and each chose
+    its grammar from its own width: a 3-row text card beside a 7-row full card.
+    Every tile is now the same whole number of cells (the remainder stays blank
+    at the right edge), on both sides of the width where the full card starts."""
+    from app import NODE_FULL_MIN, DGXTop, NodeBox
+
+    _config_cluster(tmp_path / "c.toml", n)
+    configure(tmp_path / "c.toml")
+    _stub_n(monkeypatch, n)
+    app = DGXTop()
+    async with app.run_test(size=(80, 50)) as pilot:
+        await _resize(pilot, width, 50)
+        assert not app.tiled and app.cols == n and app.density == "roomy"
+        tiles = list(app.query(NodeBox))
+        assert {tile.size.width for tile in tiles} == {width // n}
+        full = width // n >= NODE_FULL_MIN
+        cards = [tile.render().plain.split("\n") for tile in tiles]
+        assert len({len(rows) for rows in cards}) == 1  # one height for every node
+        assert len({tile.size.height for tile in tiles}) == 1
+        assert all(any(ln.startswith("│ roce") for ln in rows) == full for rows in cards)
 
 
 # ─── AC11: non-finite gating + theme repaint ─────────────────────────
