@@ -30,6 +30,7 @@ async def _check_ssh(node: NodeConfig) -> CheckResult:
             "ConnectTimeout=5",
             node.ssh_target,
             command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

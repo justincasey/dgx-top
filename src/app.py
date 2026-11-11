@@ -2149,8 +2149,8 @@ class ScanScreen(ModalScreen[None]):
     """
     BINDINGS = [
         Binding("escape", "close", "Close"),
-        Binding("y", "confirm", "Yes", show=False),
-        Binding("n", "decline", "No", show=False),
+        Binding("y,Y", "confirm", "Yes", show=False),
+        Binding("n,N", "decline", "No", show=False),
     ]
 
     def __init__(self, nodes) -> None:
@@ -2316,8 +2316,8 @@ class ClockScreen(ModalScreen[None]):
     """
     BINDINGS = [
         Binding("escape", "close", "Close"),
-        Binding("y", "confirm", "Yes", show=False),
-        Binding("n", "decline", "No", show=False),
+        Binding("y,Y", "confirm", "Yes", show=False),
+        Binding("n,N", "decline", "No", show=False),
         # Screen bindings outrank the app's `+`/`-` (poll speed) while open.
         Binding("right,plus", "ceiling(1)", "Ceiling up", show=False),
         Binding("left,minus", "ceiling(-1)", "Ceiling down", show=False),
@@ -2498,11 +2498,11 @@ class DGXTop(App):
     BINDINGS = [
         Binding("plus", "poll_faster", "Faster"),
         Binding("minus", "poll_slower", "Slower"),
-        Binding("t", "change_theme", "Theme"),
-        Binding("q", "quit", "Quit"),
-        Binding("r", "refresh", "Refresh"),
-        Binding("s", "scan", "Scan"),
-        Binding("c", "clocks", "Clocks"),
+        Binding("t,T", "change_theme", "Theme"),
+        Binding("q,Q", "quit", "Quit"),
+        Binding("r,R", "refresh", "Refresh"),
+        Binding("s,S", "scan", "Scan"),
+        Binding("c,C", "clocks", "Clocks"),
     ]
 
     cluster: reactive[ClusterStats | None] = reactive(None)
@@ -2958,7 +2958,10 @@ class DGXTop(App):
         self._restart_polling()
 
     def action_refresh(self):
-        self.run_worker(self._poll())
+        # Not ``run_worker(self._poll())``: ``_poll`` drops a call that lands
+        # while a poll is in flight, so `r` would do nothing for as long as the
+        # SSH round trip takes. ``_request_poll`` re-polls the moment it lands.
+        self._request_poll()
 
     def action_scan(self):
         """Open the one-shot endpoint scan (never stacks on an app modal)."""

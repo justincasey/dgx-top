@@ -880,9 +880,13 @@ def _ssh_base_args(target: str) -> list[str]:
 
 async def _ssh_run(target: str, cmd: str) -> str:
     """Run a remote command via SSH, return stdout or raise on failure."""
+    # stdin=DEVNULL is load-bearing: left inherited, every ssh child shares the
+    # TTY Textual reads keys from, reads typed bytes to forward to the remote
+    # command, and so swallows keypresses for as long as the call runs.
     proc = await asyncio.create_subprocess_exec(
         *_ssh_base_args(target),
         cmd,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

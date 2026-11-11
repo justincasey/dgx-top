@@ -2153,6 +2153,26 @@ class SSHRunTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    async def test_child_never_reads_the_terminals_input(self):
+        """ssh reads its stdin to forward it to the remote command. Inherited,
+        that is the TTY the TUI takes keys from, so each poll's ssh children
+        raced the input thread for typed bytes and swallowed keypresses."""
+        read_fd, write_fd = os.pipe()
+        saved_stdin = os.dup(0)
+        try:
+            os.dup2(read_fd, 0)
+            os.write(write_fd, b"k")  # a keypress waiting on the terminal
+            with patch.object(collector, "_ssh_base_args", lambda target: ["/bin/sh", "-c"]):
+                seen = await collector._ssh_run("host", "dd bs=1 count=1 2>/dev/null")
+            os.set_blocking(read_fd, False)
+            left_for_the_tui = os.read(read_fd, 1)
+        finally:
+            os.dup2(saved_stdin, 0)
+            for fd in (saved_stdin, read_fd, write_fd):
+                os.close(fd)
+        self.assertEqual(seen, "")
+        self.assertEqual(left_for_the_tui, b"k")
+
 
 class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
     """Tests for the _SSH_ batch command and end-to-end fetch wiring."""

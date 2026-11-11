@@ -190,7 +190,7 @@ def test_app_uses_configured_poll_interval_and_node_count(tmp_path: Path):
     assert app._current_interval() == 5
     assert len(app.settings.nodes) == 2
     # bindings intact (AC12)
-    keys = {b.key for b in app.BINDINGS}
+    keys = {key for b in app.BINDINGS for key in b.key.split(",")}
     assert {"plus", "minus", "t", "q", "r"} <= keys
 
 
@@ -790,6 +790,88 @@ async def test_app_watches_a_pending_node_without_repolling_the_others(tmp_path:
         armed.clear()
         await app._poll()  # nothing outstanding: no watch at all
         assert armed == [] and app._pending_timer is None
+
+
+async def test_refresh_pressed_during_a_poll_polls_again_when_it_lands(tmp_path: Path, monkeypatch):
+    """`r` while a poll is in flight (an SSH round trip is seconds, the interval
+    is 1-5 s: nearly always) was a silent no-op, because ``_poll`` drops an
+    overlapping call. The refresh is owed: one more poll the moment it lands."""
+    import asyncio
+
+    import app as app_module
+
+    _config(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    started: list[int] = []
+    gate = asyncio.Event()
+
+    async def slow_first_poll():
+        started.append(1)
+        if len(started) == 1:
+            await gate.wait()
+        return _cluster()
+
+    async def no_model_names():
+        return None
+
+    monkeypatch.setattr(app_module, "poll_cluster", slow_first_poll)
+    monkeypatch.setattr(app_module, "_init_model_names", no_model_names)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        assert started == [1]  # mount's poll is still in flight
+
+        await pilot.press("r")
+        await pilot.press("r")  # a second press while waiting adds nothing
+        await pilot.pause()
+        assert started == [1]  # never an overlapping poll
+
+        gate.set()
+        for _ in range(10):
+            await pilot.pause()
+        assert started == [1, 1]  # exactly one refresh, run as the first landed
+
+
+async def test_hotkeys_answer_with_caps_lock_on(tmp_path: Path, monkeypatch):
+    """Textual bindings are case-sensitive: with Caps Lock (or Shift) on, `R`
+    arrives as the key "R" and every lowercase-only hotkey silently did nothing,
+    including the `[y/n]` confirmation of a GPU clock change."""
+    import app as app_module
+
+    _clock_config(tmp_path / "c.toml", ceiling=2100)
+    configure(tmp_path / "c.toml")
+    polls: list[int] = []
+
+    async def fake_poll():
+        polls.append(1)
+        return _cluster()
+
+    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
+    calls = _clock_stub(monkeypatch)
+    app = app_module.DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await pilot.pause()
+        polled = len(polls)
+        await pilot.press("R")
+        await pilot.pause()
+        assert len(polls) == polled + 1
+
+        await pilot.press("C")
+        await pilot.pause()
+        assert isinstance(app.screen, app_module.ClockScreen)
+
+        await pilot.press("enter")
+        await pilot.press("N")
+        await pilot.pause()
+        assert "Run" not in _clock_text(app)[1]
+        assert calls == []
+
+        await pilot.press("enter")
+        await pilot.press("Y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert not isinstance(app.screen, app_module.ClockScreen)
+        assert calls == [2100]
 
 
 # ─── AC11: non-finite gating + theme repaint ─────────────────────────
