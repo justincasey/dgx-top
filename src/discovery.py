@@ -239,6 +239,7 @@ async def _ssh_hostname(target: str) -> Optional[str]:
             "ssh",
             "-G",
             target,
+            stdin=asyncio.subprocess.DEVNULL,  # never share the TUI's TTY
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
