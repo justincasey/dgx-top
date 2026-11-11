@@ -89,7 +89,7 @@ CHART_MAX = {"roomy": 16, "compact": 6, "rail": 0, "floor": 0}
 # gpu / meter / mem / stack-or-meter / legend-or-nothing / cpu / cores / roce.
 # A full card keeps the meter, legend and RoCE; the compact card drops the
 # meter, legend and RoCE, keeping the headlines, the stack bar and the cores.
-NODE_ROWS_FULL = 8  # gpu,meter,mem,stack,legend,cpu,cores,roce (7 without stack)
+NODE_ROWS_FULL = 8  # gpu,meter,mem,bar|meter,legend|blank,cpu,cores,roce: always all eight
 NODE_ROWS_METER = 5  # gpu, mem, stack|meter, cpu, cores
 NODE_ROWS_TEXT = 3  # text card interior (gpu, mem, cpu)
 
@@ -1620,7 +1620,7 @@ def _short_label(label: str) -> str:
 class NodeBox(Static):
     """A per-node window: light border, caret title (host=cyan, worker=orange)
     inset in the top rule, the configured host as the right meta tab. The tile
-    grammar is width-driven: a roomy card keeps the configurable meters,
+    grammar is width-driven, one for every node: a roomy card keeps the configurable meters,
     ramped core grid and RoCE row; the compact card keeps the headlines, the
     bar and the core grid but drops the meters, legend and RoCE; a narrow card
     runs gpu/mem/cpu text only; the floor table mode collapses the node to a
@@ -1664,10 +1664,13 @@ class NodeBox(Static):
         if getattr(self.app, "node_mode", "") == "table":
             return self._table_row(s, pal, width)
         density = _density(self)
-        tier = "rail" if getattr(self.app, "rail", False) else density
-        if width >= NODE_FULL_MIN and tier == "roomy":
+        # One grammar for the whole grid (``_node_grammar``) and a MEM block
+        # always sized for the densest card: what a node reports (a plan, none,
+        # offline) never changes its tile, so no tile differs from its neighbours.
+        grammar = getattr(self.app, "node_grammar", "text")
+        if grammar == "full":
             rows = self._interior_rows(s, pal, width, density, roce=True)
-        elif width >= NODE_FULL_MIN and tier == "compact":
+        elif grammar == "meter":
             rows = self._interior_rows(s, pal, width, density, roce=False)
         else:
             rows = self._text_rows(s, pal, width)
@@ -1822,6 +1825,7 @@ class NodeBox(Static):
         # MEM: used/total + pct, swap, then the modelled total. The bar (or the
         # meter when the engine printed no plan) follows; the legend row is a
         # roomy-only entry so the compact card stops at the bar.
+        mem_start = len(rows)
         mlabel = "mem " if not short else "m "
         if s.online and s.mem_total_bytes > 0:
             used_gb = s.mem_used_bytes // (1024**3)
@@ -1870,6 +1874,12 @@ class NodeBox(Static):
             rows.append(Text.assemble(Text(mlabel, style=pal.dim), dash))
             if not compact:
                 rows.append(_meter_line(_treatment(self), 0, mw, pal, pal.ok, self._mem_history))
+        # Pad the MEM block to the densest card's (bar + legend at roomy,
+        # headline + bar at compact) whatever this node reports: no plan, a
+        # stale one, or offline keep the same rows, so inference being detected
+        # or not never moves a tile, and the rows below line up tile to tile.
+        mem_rows = 2 if compact else 3
+        rows.extend(Text("") for _ in range(mem_rows - (len(rows) - mem_start)))
         # CPU: util + temp; ramped core grid beneath (the card's last graph).
         clabel = "cpu " if not short else "c "
         if s.online and s.cpu_cores_util:
@@ -1958,22 +1968,43 @@ def _serving_base(
     return base + 2 * max(0, models - 1)
 
 
-def _node_tile_rows(tier: str, tile_w: int, stack: bool = False) -> int:
-    """Rendered height of one node tile (borders included): a 1-row condensed
-    table row at floor; a framed full card (gpu+meter, mem, stack+legend, cpu,
-    cores, RoCE) when the tile is wide enough and the tier is roomy; a framed
-    compact card (headlines + bar + cores, no meters/legend/RoCE); else a
-    framed text card (gpu/mem/cpu only). The estimator passes the *widest*
-    grid column (ceil of the column width) so the full/compact/text decision
-    matches what NodeBox.render actually does. A full card without a memory
-    stack carries one fewer row (the bar and its legend fold into one meter)."""
-    if tier == "floor":
-        return 1
+def _tile_width(grid_w: int, cols: int) -> int:
+    """Cells in EVERY node tile: equal columns of ``grid_w // cols``. The
+    remainder stays blank at the right edge, so no tile is a cell wider than
+    its neighbours (``1fr`` columns would hand the remainder to the trailing
+    ones). The fit estimator and the layout both take the width from here."""
+    return max(1, grid_w // cols)
+
+
+def _node_grammar(tier: str, tile_w: int) -> str:
+    """The card grammar every node tile shares: ``full`` (meters, stack legend,
+    RoCE), ``meter`` (headlines, bar, cores) or ``text`` (gpu/mem/cpu only).
+    Decided once from the one width every tile has (``_tile_width``), never
+    per tile."""
     if tile_w >= NODE_FULL_MIN:
         if tier == "roomy":
-            return (NODE_ROWS_FULL if stack else NODE_ROWS_FULL - 1) + 2
+            return "full"
         if tier == "compact":
-            return NODE_ROWS_METER + 2
+            return "meter"
+    return "text"
+
+
+def _node_tile_rows(tier: str, tile_w: int) -> int:
+    """Rendered height of EVERY node tile (borders included): a 1-row condensed
+    table row at floor; a framed full card (gpu+meter, mem, bar+legend, cpu,
+    cores, RoCE) when the tile is wide enough and the tier is roomy; a framed
+    compact card (headlines + bar + cores, no meters/legend/RoCE); else a
+    framed text card (gpu/mem/cpu only). Always the densest card of its
+    grammar: the memory block reserves its bar and legend whether or not any
+    node reports a plan, so the layout never depends on inference being
+    detected. NodeBox pads every card to this height."""
+    if tier == "floor":
+        return 1
+    grammar = _node_grammar(tier, tile_w)
+    if grammar == "full":
+        return NODE_ROWS_FULL + 2
+    if grammar == "meter":
+        return NODE_ROWS_METER + 2
     return NODE_ROWS_TEXT + 2
 
 
@@ -2059,14 +2090,13 @@ def _tier_fit(
     tiled: bool,
     models: int = 1,
     chart_mode: str = "area",
-    stack: bool = False,
 ) -> tuple[bool, int, int, int, int]:
     """(fits, cols, node_h, serv_h, chart) for one tier in one arrangement.
     Mirrors the CSS row grammar exactly (estimate/layout duality): the stacked
     body is serv_h + GRID_GUTTER + node_h (no gutter at floor); the tiled body
-    is max(serv_h, node_h). Textual distributes the width%cols remainder to
-    the trailing 1fr columns, so the *widest* column is always reserved (ceil)
-    and the floor rows are bare (no +2 window frame)."""
+    is max(serv_h, node_h). Node tiles are equal cells wide (``_tile_width``,
+    the remainder left blank) and all as tall as the densest card; the floor
+    rows are bare (no +2 window frame)."""
     if tiled:
         sw = _serving_tiled_width(width)
         nw = width - sw - TILING_GUTTER
@@ -2074,7 +2104,7 @@ def _tier_fit(
             cols = _floor_cols(nw, n, avail - SERVING_ROWS_FLOOR)
         else:
             cols = _node_grid_columns(n, nw, tiled)
-        tile = _node_tile_rows(tier, -(-nw // cols), stack)
+        tile = _node_tile_rows(tier, _tile_width(nw, cols))
         node_h = _grid_height(n, cols, tile, tier)
         base = _serving_base(tier, sw, models)
         if tier == "floor":
@@ -2093,7 +2123,7 @@ def _tier_fit(
         cols = _floor_cols(width, n, avail - SERVING_ROWS_FLOOR)
     else:
         cols = _node_grid_columns(n, width, tiled)
-    tile = _node_tile_rows(tier, -(-width // cols), stack)
+    tile = _node_tile_rows(tier, _tile_width(width, cols))
     node_h = _grid_height(n, cols, tile, tier)
     base = _serving_base(tier, width, models)
     if tier == "floor":
@@ -2117,13 +2147,12 @@ def _tier_for(
     tiled: bool,
     models: int = 1,
     chart_mode: str = "area",
-    stack: bool = False,
 ) -> str:
     """Densest tier whose estimated body fits (loosest first) for one
     arrangement; the floor is the unconditional fallback."""
     avail = height - WAYBAR_HEIGHT
     for tier in ("roomy", "compact", "rail"):
-        if _tier_fit(n, width, avail, tier, tiled, models, chart_mode, stack)[0]:
+        if _tier_fit(n, width, avail, tier, tiled, models, chart_mode)[0]:
             return tier
     return "floor"
 
@@ -2523,7 +2552,6 @@ class DGXTop(App):
         self._current_topology: str = ""
         self._host_model: str = ""
         self._models_n = 1
-        self._has_stack = False  # some node has a memory stack (adds a legend row)
         self._in_kpis = False  # _update_kpis is re-entered by _apply_tier
         self._model_hue: dict[str, int] = {}
         self._model_hue_miss: dict[str, int] = {}
@@ -2531,9 +2559,12 @@ class DGXTop(App):
         self.density = ""
         self.cols = 0
         self.node_mode = ""
+        self.node_grammar = "text"  # card grammar shared by every node tile
         self.tiled = False
         self._serv_h = 0
         self._node_h = 0
+        self._tile_h = 0  # rows of EVERY node tile: the densest card's
+        self._tile_w = 0  # cells of EVERY node tile: equal columns
         self._chart_rows = 0
         self._pad = 0
         self._sw = 0
@@ -2568,12 +2599,8 @@ class DGXTop(App):
         right column must never densify the serving surface (the hero chart is
         the priority). Ties prefer the tiled layout the request asks for."""
         tiled = _arrangement(width)
-        tier_t = _tier_for(
-            n, width, height, True, self._models_n, self.settings.chart, self._has_stack
-        )
-        tier_s = _tier_for(
-            n, width, height, False, self._models_n, self.settings.chart, self._has_stack
-        )
+        tier_t = _tier_for(n, width, height, True, self._models_n, self.settings.chart)
+        tier_s = _tier_for(n, width, height, False, self._models_n, self.settings.chart)
         if tiled and _TIER_RANK[tier_t] <= _TIER_RANK[tier_s]:
             return True, tier_t
         return False, tier_s
@@ -2583,7 +2610,7 @@ class DGXTop(App):
         avail = height - WAYBAR_HEIGHT
         tiled, tier = self._choose_layout(n, width, height)
         _fits, cols, node_h, serv_h, chart = _tier_fit(
-            n, width, avail, tier, tiled, self._models_n, self.settings.chart, self._has_stack
+            n, width, avail, tier, tiled, self._models_n, self.settings.chart
         )
         node_mode = "table" if tier == "floor" else "card"
         rail = tier == "rail"
@@ -2592,6 +2619,9 @@ class DGXTop(App):
         pad = self._body_pad(avail, tier, tiled, node_h, serv_h)
         sw = _serving_tiled_width(width) if tiled else 0
         nw = width - sw - TILING_GUTTER if tiled else 0
+        tile_w = _tile_width(nw if tiled else width, cols)
+        grammar = _node_grammar(tier, tile_w)
+        tile_h = _node_tile_rows(tier, tile_w)
         if tiled and sw >= SERVING_NARROW_WIDTH:
             # The stretched frame hands every interior row it has left to the
             # chart, whatever tier fitted: the desk column (not the fit
@@ -2613,6 +2643,9 @@ class DGXTop(App):
             and pad == self._pad
             and sw == self._sw
             and nw == self._nw
+            and grammar == self.node_grammar
+            and tile_h == self._tile_h
+            and tile_w == self._tile_w
         ):
             return
         self.density = density
@@ -2627,6 +2660,9 @@ class DGXTop(App):
         self._pad = pad
         self._sw = sw
         self._nw = nw
+        self.node_grammar = grammar
+        self._tile_h = tile_h
+        self._tile_w = tile_w
 
         for name in ("compact", "roomy"):
             self.screen.set_class(name == density, name)
@@ -2637,7 +2673,9 @@ class DGXTop(App):
         body.styles.layout = "horizontal" if tiled else "vertical"
         node_col = self.query_one("#node-col", Vertical)
         node_col.styles.grid_size_columns = cols
-        node_col.styles.grid_columns = " ".join(["1fr"] * cols)
+        # Equal cell columns, not 1fr: the remainder stays blank at the right
+        # edge, so every tile is exactly as wide as the widest (the same grammar).
+        node_col.styles.grid_columns = " ".join([str(tile_w)] * cols)
         serving = self.query_one("#serving", ServingBox)
         if tiled:
             sw = _serving_tiled_width(width)
@@ -2657,7 +2695,7 @@ class DGXTop(App):
         return 0
 
     def _apply_fill(self, pad: int) -> None:
-        """Auto-size every window and centre the body with a top pad."""
+        """Size every window and centre the body with a top pad."""
         body = self.query_one("#body", Vertical)
         body.styles.margin = (pad, 0, 0, 0) if pad else 0
         # The reference desk stretches its columns (``align-items: stretch``):
@@ -2667,8 +2705,12 @@ class DGXTop(App):
         serving = self.query_one("#serving", ServingBox)
         serving.expected_height = max(self._serv_h, self._node_h) if self.tiled else 0
         serving.styles.height = serving.expected_height or "auto"
+        # One explicit height for every node tile: the densest card's, as the
+        # fit estimator reserved it. ``auto`` follows each tile's own content,
+        # and Textual never re-measures a tile whose content grew without a
+        # resize, so a plan arriving mid-run clipped the card that gained a row.
         for node in self.query(NodeBox):
-            node.styles.height = "auto"
+            node.styles.height = self._tile_h
 
     def watch_theme(self, theme_name: str) -> None:
         if not self.is_running:
@@ -2899,10 +2941,6 @@ class DGXTop(App):
             self._models_n = n_models
             # Each extra model claims 4 serving rows; re-check the tier fit
             # at the current viewport so the grammar never clips.
-            self._apply_tier(*self._last_size)
-        has_stack = any(mem_stack(u) for u in units)
-        if has_stack != self._has_stack:
-            self._has_stack = has_stack
             self._apply_tier(*self._last_size)
 
         self._host_model = " · ".join(m["name"] for m in models_payload)

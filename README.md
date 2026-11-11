@@ -299,6 +299,12 @@ always keeps the most detail it can carry:
 | Narrow, few nodes | SERVING hero on top, full **card** tiles in one row |
 | Narrow, many nodes | SERVING hero on top, node **cards tile into rows** below, each held at a minimum width; when no usable card fits, every node collapses to a **condensed table row** |
 
+**Every node card is the same size.** The cards share one width — equal columns
+of `grid width ÷ columns` cells, the remainder left blank at the right edge — and
+one height, the densest card's. The memory block always reserves its bar and
+legend, so a node that reports no engine plan, sits idle, or drops offline for a
+poll never changes its tile: what a node reports never moves the layout.
+
 Height picks how tight it gets. Every candidate tier — `roomy` → `compact` →
 `rail` → `floor` — has an exact total height for the current width, node count
 and arrangement (calibrated to the real rendered heights), and the densest tier
@@ -354,9 +360,10 @@ SGLang (`Load weight end`, `KV Cache is allocated`, `Capture cuda graph end`) an
 TensorFold's startup plan line are recognised; the latest launch in the log wins,
 and the log is re-read at most once a minute. A node whose log yields no plan —
 or whose plan is larger than what is measured in use (a stale log) — keeps the
-plain MEM meter; nothing else changes. Only some ranks log a plan (a TensorFold
-worker rank, for instance, prints none); point `log` at a file that has one, or
-leave that node on the plain meter.
+plain MEM meter and a blank row where the legend would be, so its card is as
+tall as one with a plan and nothing else moves. Only some ranks log a plan (a
+TensorFold worker rank, for instance, prints none); point `log` at a file that
+has one, or leave that node on the plain meter.
 
 Full node cards add a colour-key row under the bar (`■wts 26 ■gfx 1.0 ■kv 11
 ■oth 5.5*`, the `*` marking the one derived figure); `compact` cards draw the

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from config import configure
 from stats import ClusterStats, SparkUnitStats, TopologyInfo, mem_stack
 
@@ -197,6 +199,17 @@ def _stub(monkeypatch, units):
     monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
 
 
+def _tile_heights(app) -> list[tuple[int, int]]:
+    """(laid-out height, rendered rows) of every node tile."""
+    from app import NodeBox
+
+    return [(n.size.height, len(n.render().plain.split("\n"))) for n in app.query(NodeBox)]
+
+
+def _tier(app) -> str:
+    return "floor" if app.floor else "rail" if app.rail else app.density
+
+
 async def test_node_card_replaces_mem_meter_with_stack_bar_and_legend(tmp_path: Path, monkeypatch):
     from app import DGXTop, NodeBox, _node_tile_rows
 
@@ -214,12 +227,8 @@ async def test_node_card_replaces_mem_meter_with_stack_bar_and_legend(tmp_path: 
         mem = next(i for i, ln in enumerate(lines) if ln.startswith("│ mem "))
         assert "╱" in lines[mem + 1]  # the bar (with its reserved slice) sits under the headline
         assert "■wts" in lines[mem + 2]  # the legend row follows the bar
-        assert len(lines) <= _node_tile_rows(app.density, node.size.width, True)
-        # The one invariant this feature changes: a stacked full card reserves
-        # exactly one more row than the same card without the legend.
-        assert _node_tile_rows(app.density, node.size.width, True) == (
-            _node_tile_rows(app.density, node.size.width, False) + 1
-        )
+        assert len(lines) == _node_tile_rows(app.density, node.size.width)
+        assert node.size.height == len(lines)  # the tile is as tall as its card: never clipped
 
 
 async def test_node_card_without_a_plan_keeps_the_plain_mem_meter(tmp_path: Path, monkeypatch):
@@ -234,9 +243,12 @@ async def test_node_card_without_a_plan_keeps_the_plain_mem_meter(tmp_path: Path
         lines = app.query_one("#node-0", NodeBox).render().plain.split("\n")
         text = "\n".join(lines)
         assert "wts" not in text and "╱" not in text
-        mem = next(i for i, ln in enumerate(lines) if ln.startswith("│ mem "))
-        assert lines[mem + 2].startswith("│ cpu ")  # no legend row: the old two-row MEM block
-        assert not app._has_stack
+        mem = next(i for i, ln in enumerate(lines) if ln.strip("│ ").startswith("mem "))
+        assert lines[mem + 1].strip("│ ")  # the plain meter sits under the headline
+        # The legend's slot stays reserved (blank), so this card is as tall as a
+        # card with a plan and its cpu row lines up with one.
+        assert lines[mem + 2].strip("│ ") == ""
+        assert lines[mem + 3].startswith("│ cpu ")
 
 
 async def test_serving_pane_does_not_duplicate_the_node_bars(tmp_path: Path, monkeypatch):
@@ -250,51 +262,98 @@ async def test_serving_pane_does_not_duplicate_the_node_bars(tmp_path: Path, mon
     app = DGXTop()
     async with app.run_test(size=(132, 44)) as pilot:
         await pilot.pause()
-        assert app._has_stack
         text = app.query_one("#serving", ServingBox).render().plain
         assert "deploy" not in text and "rank " not in text
         assert "╱" not in text and "wts" not in text and "Σ" not in text
 
 
-async def test_plan_arriving_late_grows_the_node_card_without_clipping(tmp_path: Path, monkeypatch):
-    """Row estimate and render agree: a node card rendered with a legend never
-    exceeds the tile height the fit estimator reserved for it."""
-    from app import DGXTop, NodeBox, _node_tile_rows
+@pytest.mark.parametrize("height", [44, 20])
+async def test_what_a_node_reports_about_inference_never_moves_its_tiles(
+    tmp_path: Path, monkeypatch, height
+):
+    """A plan appearing, a plan going away, a node dropping offline for one poll
+    and a stale log (``mem_stack`` is None for all of them) must leave every
+    tile exactly as it was: same height, same rows, same tier. Deriving the tile
+    height from whether some node had a plan flipped the whole display between
+    roomy and compact (132x20 here) with no resize."""
+    from app import DGXTop, _node_tile_rows
 
     _config(tmp_path / "c.toml")
     configure(tmp_path / "c.toml")
-    _stub(monkeypatch, [_unit("head", plan=None), _unit("worker", worker=True, plan=None)])
+    idle = [_unit("head", plan=None), _unit("worker", worker=True, plan=None)]
+    serving = [_unit("head"), _unit("worker", worker=True, plan=None)]  # only head has a plan
+    dropped = [_unit("head"), _unit("worker", worker=True, plan=None)]
+    dropped[0].online = False  # one failed poll: the node serving the model is unreachable
+    stale = [_unit("head", plan=(90, 20, 2), used=60), _unit("worker", worker=True, plan=None)]
+    assert all(mem_stack(unit) is None for unit in (*idle, dropped[0], stale[0]))
+    _stub(monkeypatch, idle)
     app = DGXTop()
     async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.resize_terminal(132, height)
         await pilot.pause()
-        assert not app._has_stack
-        app.cluster = ClusterStats(
-            units=[_unit("head"), _unit("worker", worker=True, plan=(58, 12, 1), used=98)],
-            topology=TopologyInfo(topology_type="DUAL"),
-        )
-        app._update_ui()
-        await pilot.pause()
-        assert app._has_stack
-        node = app.query_one("#node-0", NodeBox)
-        rendered = len(node.render().plain.split("\n"))
-        assert rendered <= _node_tile_rows(app.density, node.size.width, True)
-        assert _node_tile_rows(app.density, node.size.width, True) == (
-            _node_tile_rows(app.density, node.size.width, False) + 1
-        )
+        seen = []
+        for units in (idle, serving, dropped, stale, serving, idle):
+            app.cluster = ClusterStats(units=units, topology=TopologyInfo(topology_type="DUAL"))
+            app._update_ui()
+            await pilot.pause()
+            tiles = _tile_heights(app)
+            assert len(set(tiles)) == 1, tiles  # one height and one row count for every node
+            assert tiles[0][0] == tiles[0][1]  # laid out as tall as its card: never clipped
+            seen.append((_tier(app), tiles[0]))
+        assert len(set(seen)) == 1, seen
+        width = max(node.size.width for node in app.query("NodeBox"))
+        assert seen[0] == (_tier(app), (_node_tile_rows(_tier(app), width),) * 2)
 
 
-async def test_stack_flip_records_one_history_sample_per_poll(tmp_path: Path, monkeypatch):
-    """The legend row arriving re-runs the tier fit; the re-entrant KPI pass
-    must not append the same poll's samples twice."""
+@pytest.mark.parametrize("height", [44, 18, 16])  # roomy, compact, rail
+async def test_node_tiles_are_laid_out_alike_when_only_one_node_has_a_plan(
+    tmp_path: Path, monkeypatch, height
+):
+    """The node serving a model carries the stack bar and legend; its idle
+    neighbour has no plan. The densest card sets the height for both, and the
+    rows below the MEM block line up from tile to tile."""
+    from app import DGXTop, _node_tile_rows
+
+    _config(tmp_path / "c.toml")
+    configure(tmp_path / "c.toml")
+    units = [_unit("head"), _unit("worker", worker=True, plan=None)]
+    assert mem_stack(units[0]) is not None and mem_stack(units[1]) is None
+    _stub(monkeypatch, units)
+    app = DGXTop()
+    async with app.run_test(size=(132, 44)) as pilot:
+        await pilot.resize_terminal(132, height)
+        await pilot.pause()
+        await pilot.pause()
+        tier = "floor" if app.floor else "rail" if app.rail else app.density
+        tiles = _tile_heights(app)
+        assert len(set(tiles)) == 1, tiles  # same laid-out height, same rows, every node
+        widest = max(node.size.width for node in app.query("NodeBox"))
+        assert tiles[0] == (_node_tile_rows(tier, widest),) * 2
+        cpu_row = {
+            next(
+                i
+                for i, ln in enumerate(node.render().plain.split("\n"))
+                if ln.startswith(("│ cpu ", "│ c "))
+            )
+            for node in app.query("NodeBox")
+        }
+        assert len(cpu_row) == 1, cpu_row
+
+
+async def test_a_second_model_records_one_history_sample_per_poll(tmp_path: Path, monkeypatch):
+    """A second model arriving re-runs the tier fit (each claims serving rows);
+    the re-entrant KPI pass must not append the same poll's samples twice."""
     from app import DGXTop
 
     _config(tmp_path / "c.toml")
     configure(tmp_path / "c.toml")
-    _stub(monkeypatch, [_unit("head")])
+    other = _unit("worker")  # hosts a different model than head
+    other.model_name = "other-model"
+    _stub(monkeypatch, [_unit("head"), other])
     app = DGXTop()
     async with app.run_test(size=(132, 44)) as pilot:
         await pilot.pause()
-        assert app._has_stack
+        assert app._models_n == 2
         assert len(app.history["mem-head"]) == 1
 
 
