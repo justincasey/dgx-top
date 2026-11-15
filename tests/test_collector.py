@@ -2147,21 +2147,70 @@ class RoceParseTests(unittest.TestCase):
 class SSHRunTests(unittest.IsolatedAsyncioTestCase):
     """The transport must not inherit wedged multiplexing, nor leak clients."""
 
-    def test_control_socket_is_scoped_to_this_process(self):
+    def test_control_socket_lives_in_a_private_temp_dir(self):
         """A socket inherited from an earlier run can be wedged behind a node
         that rebooted under it; every call then burns ConnectTimeout in the
-        mux hello before falling back to a fresh connection. The socket must
-        also live in a per-user 0700 dir, not world-writable /tmp, so a local
-        user cannot pre-plant a rogue mux master."""
+        mux hello before falling back to a fresh connection. The dir must also
+        be private and unpredictable, and on a local filesystem: a unix socket
+        cannot be bound on NFS, and a guessable name under a world-writable
+        /tmp lets a local user pre-plant a rogue mux master."""
         args = collector._ssh_base_args("host")
         ctrl = next(a for a in args if a.startswith("ControlPath=")).removeprefix("ControlPath=")
-        self.assertIn(str(Path.home() / ".cache" / "dgx-top"), ctrl)
-        self.assertIn(str(os.getpid()), ctrl)
-        self.assertTrue(ctrl.endswith("-%C"))
-        self.assertNotIn("/tmp/", ctrl)
         ctrl_dir = Path(ctrl).parent
+        self.assertIn(ctrl_dir.parent, {Path(tempfile.gettempdir()), Path("/tmp")})
+        self.assertTrue(ctrl_dir.name.startswith("dgx-top-ssh-"))
+        self.assertTrue(ctrl.endswith("/ssh-%C"))
+        # sun_path is 104 bytes with the NUL, and ssh expands %C to 40 hex chars
+        self.assertLessEqual(len(ctrl) - len("%C") + 40, 103)
         self.assertEqual(stat.S_IMODE(os.stat(ctrl_dir).st_mode), 0o700)
         self.assertEqual(os.stat(ctrl_dir).st_uid, os.getuid())
+
+    def test_control_dir_avoids_a_path_a_socket_cannot_use(self):
+        """A unix socket path is bounded by sun_path (104 bytes on macOS), and
+        %C spends 40 of them: macOS $TMPDIR is long enough that the socket
+        cannot be created there, and ssh then answers "ControlPath too long"
+        and fails instead of falling back to a direct connection."""
+        long_root = Path(tempfile.gettempdir()) / ("x" * 60)
+        long_root.mkdir(exist_ok=True)
+        try:
+            with patch.object(tempfile, "gettempdir", lambda: str(long_root)):
+                path = collector._make_control_dir()
+            try:
+                self.assertTrue(collector._socket_path_fits(path))
+                self.assertNotEqual(path.parent, long_root)
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+        finally:
+            long_root.rmdir()
+
+    def test_control_dirs_are_unpredictable_and_private(self):
+        """``mkdtemp``, not a name derived from the pid: two runs cannot share
+        a socket, and no other process can guess the name in advance."""
+        dirs = {collector._make_control_dir() for _ in range(3)}
+        try:
+            self.assertEqual(len(dirs), 3)
+            for path in dirs:
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700)
+                self.assertEqual(os.stat(path).st_uid, os.getuid())
+        finally:
+            for path in dirs:
+                self.assertTrue(path.name.startswith("dgx-top-ssh-"))
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_control_dir_is_removed_when_the_process_exits(self):
+        """The socket dir is per-process scratch, not a cache: a killed or
+        exited run must not leave one behind for every launch."""
+        probe = "import collector; print(collector._SSH_CTRL_DIR); print(collector._SSH_CTRL)"
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=str(Path(collector.__file__).parent.parent),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        dir_line, ctrl = proc.stdout.split()
+        self.assertTrue(ctrl.startswith(dir_line + os.sep))
+        self.assertFalse(Path(dir_line).exists())
 
     def test_master_liveness_is_probed(self):
         """Without ServerAlive* a master outliving a node reboot never exits."""

@@ -148,7 +148,7 @@ worker = true
 | Setting          | Meaning                                                                     |
 | ---------------- | --------------------------------------------------------------------------- |
 | `label`          | Short unique name shown in the dashboard                                    |
-| `ssh_target`     | Any target accepted by `ssh`, such as `user@host` or an SSH alias           |
+| `ssh_target`     | Any target accepted by `ssh`, such as `user@host` or an SSH alias; it must not start with `-` (that would be read as an `ssh` option) |
 | `vllm_url`       | Inference-engine base URL reachable from the control machine; do not include `/metrics` |
 | `worker`         | Marks a worker node in a tensor-parallel deployment                         |
 | `engine`         | Optional `"vllm"`, `"sglang"` or `"tensorfold"`. Absent: inferred from the endpoint's own metrics (authoritative). Set to `"vllm"` or `"tensorfold"` to skip SGLang's load-API probes entirely |
