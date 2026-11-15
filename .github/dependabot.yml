@@ -1,0 +1,9 @@
+# Workflow actions are pinned to commit SHAs (see .github/workflows/ci.yml), so
+# a pinned action cannot advance on its own: this updater is what keeps the
+# pins from silently going stale.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

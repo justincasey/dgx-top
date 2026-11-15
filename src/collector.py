@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import math
-import os
 import re
 import shlex
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -873,19 +874,43 @@ def _parse_memory_thrash_output(output: str) -> dict:
 # connections but never answers, so EVERY call first burns the mux hello
 # timeout (ConnectTimeout, 5 s) before ssh falls back to a fresh connection —
 # a 5.4 s poll instead of 0.2 s, for as long as the stale master lives.
-# The socket lives in a per-user 0700 dir, not /tmp: a world-writable
-# ControlPath lets a local user pre-plant a rogue mux master for a predictable
-# pid and feed spoofed connections or a dead socket (ssh_config(5) advice).
-_SSH_CTRL_DIR = Path.home() / ".cache" / "dgx-top"
-try:
-    _SSH_CTRL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _SSH_CTRL_DIR.chmod(0o700)
-    _SSH_CTRL = str(_SSH_CTRL_DIR / f"ssh-{os.getpid()}-%C")
-except OSError:
-    # Fail closed: a world-writable ControlPath lets a local user pre-plant a
-    # rogue mux master for a predictable pid. Fall back to a private,
-    # unpredictable 0700 temp dir instead of /tmp.
-    _SSH_CTRL = str(Path(tempfile.mkdtemp(prefix="dgx-top-ssh-")) / "%C")
+# The socket lives in a ``mkdtemp`` dir, not a fixed path under a shared
+# location: an unpredictable 0700 name in a world-writable /tmp cannot be
+# pre-planted by a local user, and a local filesystem is required — a unix
+# socket cannot be bound on NFS, so $HOME is the wrong home for it (ssh then
+# silently drops multiplexing and every call pays a fresh handshake).
+# A socket path is bounded by sun_path (104 bytes on macOS, 108 on Linux) and
+# %C alone spends 40 of them, so a long $TMPDIR (/var/folders/… on macOS) cannot
+# host it: ssh answers "ControlPath too long" and the connection fails.
+_CTRL_NAME = "ssh-%C"
+_CONNECTION_HASH_LEN = 40  # ssh expands %C to a 40-char hex hash
+_CTRL_PATH_LIMIT = 103  # sun_path: 104 bytes on macOS (108 on Linux), NUL included
+
+
+def _socket_path_fits(directory: Path) -> bool:
+    """Whether ``ssh``'s expanded control-socket path fits in ``sun_path``."""
+    expanded = len(str(directory / _CTRL_NAME)) - len("%C") + _CONNECTION_HASH_LEN
+    return expanded <= _CTRL_PATH_LIMIT
+
+
+def _make_control_dir() -> Path:
+    """A private directory for this process's mux sockets: ``mkdtemp`` (0700,
+    a name no other process can predict or reuse), on the first temp root
+    whose path leaves room for the socket name."""
+    for root in (Path(tempfile.gettempdir()), Path("/tmp")):
+        try:
+            path = Path(tempfile.mkdtemp(prefix="dgx-top-ssh-", dir=root))
+        except OSError:
+            continue
+        if _socket_path_fits(path):
+            return path
+        shutil.rmtree(path, ignore_errors=True)
+    raise RuntimeError("no temp directory short enough for an ssh control socket")
+
+
+_SSH_CTRL_DIR = _make_control_dir()
+_SSH_CTRL = str(_SSH_CTRL_DIR / _CTRL_NAME)
+atexit.register(shutil.rmtree, _SSH_CTRL_DIR, True)
 
 SSH_TIMEOUT = 10
 
