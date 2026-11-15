@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import re
 import shlex
+import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -47,15 +50,36 @@ def _short_model_name(raw: str) -> str:
     return s.split("/")[-1]
 
 
+# Cap on buffered remote response bodies: a foreign listener on any monitored
+# port can stream an arbitrarily large body; anything over this is treated as
+# a failed fetch rather than loaded whole into memory.
+HTTP_BODY_LIMIT = 16 * 1024 * 1024
+
+
+async def _read_capped(client: httpx.AsyncClient, url: str) -> bytes:
+    """GET ``url`` and return the body, aborting past HTTP_BODY_LIMIT.
+
+    Raises an httpx.HTTPError subclass on transport, status or size problems;
+    every caller already treats any exception as a failed fetch."""
+    async with client.stream("GET", url) as resp:
+        resp.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > HTTP_BODY_LIMIT:
+                raise httpx.HTTPError(f"response body exceeds {HTTP_BODY_LIMIT} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
 async def _fetch_model_name(client: httpx.AsyncClient, engine_url: str) -> str:
     """Short name of the first model ``/v1/models`` serves, or ``""``.
 
     Total over remote input: a dead port, a non-JSON body or an empty model
     list all read as no name (the renderer paints a dash), never a raise."""
     try:
-        resp = await client.get(f"{engine_url}/v1/models")
-        resp.raise_for_status()
-        models = resp.json().get("data", [])
+        models = json.loads(await _read_capped(client, f"{engine_url}/v1/models")).get("data", [])
         if models:
             return _short_model_name(models[0].get("id") or models[0].get("model", ""))
     except Exception:
@@ -849,7 +873,19 @@ def _parse_memory_thrash_output(output: str) -> dict:
 # connections but never answers, so EVERY call first burns the mux hello
 # timeout (ConnectTimeout, 5 s) before ssh falls back to a fresh connection —
 # a 5.4 s poll instead of 0.2 s, for as long as the stale master lives.
-_SSH_CTRL = f"/tmp/dgx-top-ssh-{os.getpid()}-%C"
+# The socket lives in a per-user 0700 dir, not /tmp: a world-writable
+# ControlPath lets a local user pre-plant a rogue mux master for a predictable
+# pid and feed spoofed connections or a dead socket (ssh_config(5) advice).
+_SSH_CTRL_DIR = Path.home() / ".cache" / "dgx-top"
+try:
+    _SSH_CTRL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _SSH_CTRL_DIR.chmod(0o700)
+    _SSH_CTRL = str(_SSH_CTRL_DIR / f"ssh-{os.getpid()}-%C")
+except OSError:
+    # Fail closed: a world-writable ControlPath lets a local user pre-plant a
+    # rogue mux master for a predictable pid. Fall back to a private,
+    # unpredictable 0700 temp dir instead of /tmp.
+    _SSH_CTRL = str(Path(tempfile.mkdtemp(prefix="dgx-top-ssh-")) / "%C")
 
 SSH_TIMEOUT = 10
 
@@ -1141,9 +1177,8 @@ async def _fetch_metrics(engine_url: str) -> str:
     """Fetch engine Prometheus metrics via HTTP."""
     url = f"{engine_url}/metrics"
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.text
+        text = (await _read_capped(client, url)).decode("utf-8", errors="replace")
+        return text
 
 
 _MAX_COUNT = 1 << 62  # 4.6e18 tokens: past any real pool, safe in float math
@@ -1384,11 +1419,9 @@ async def fetch_engine_load_with(client: httpx.AsyncClient, engine_url: str) -> 
     port of a node through one). Total in the same way."""
     for path, parse in (("/v1/loads", _load_from_v1), ("/get_load", _load_from_get_load)):
         try:
-            resp = await client.get(f"{engine_url}{path}")
-            resp.raise_for_status()
             # Inside the try on purpose: the probe must not be able to raise
             # past poll_unit, whose awaited call sits outside its own try.
-            load = parse(resp.json())
+            load = parse(json.loads(await _read_capped(client, f"{engine_url}{path}")))
         except Exception:
             continue
         if load is not None:

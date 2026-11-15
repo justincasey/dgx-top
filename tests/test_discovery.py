@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
+
 import pytest
 
 import collector
@@ -71,6 +74,14 @@ class _Resp:
             return self._payload
         raise ValueError("not JSON")
 
+    async def aiter_bytes(self):
+        if isinstance(self._payload, Exception):
+            return
+        if isinstance(self._payload, str):
+            yield self._payload.encode()
+        else:
+            yield json.dumps(self._payload).encode()
+
 
 def _patch_http(monkeypatch, routes: dict[str, object]) -> list[str]:
     """Serve canned bodies keyed by full URL to both discovery's and the
@@ -93,6 +104,10 @@ def _patch_http(monkeypatch, routes: dict[str, object]) -> list[str]:
             if url in routes:
                 return _Resp(routes[url])
             raise ConnectionError(f"connection refused: {url}")
+
+        @contextlib.asynccontextmanager
+        async def stream(self, method: str, url: str):
+            yield await self.get(url)
 
     monkeypatch.setattr(discovery.httpx, "AsyncClient", FakeClient)
     monkeypatch.setattr(collector.httpx, "AsyncClient", FakeClient)
@@ -324,6 +339,10 @@ def _patch_client(monkeypatch, handler) -> list[object]:
 
         async def get(self, url: str):
             return await handler(url)
+
+        @contextlib.asynccontextmanager
+        async def stream(self, method: str, url: str):
+            yield await self.get(url)
 
     monkeypatch.setattr(discovery.httpx, "AsyncClient", FakeClient)
     return built

@@ -1,7 +1,10 @@
 import asyncio
+import contextlib
+import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -10,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 import collector
@@ -391,6 +395,14 @@ def _patch_http(routes: dict[str, object]):
         def json(self):
             return self._payload
 
+        async def aiter_bytes(self):
+            if isinstance(self._payload, Exception):
+                return
+            if isinstance(self._payload, str):
+                yield self._payload.encode()
+            else:
+                yield json.dumps(self._payload).encode()
+
     class FakeClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -407,6 +419,10 @@ def _patch_http(routes: dict[str, object]):
                 if url.endswith(path):
                     return FakeResp(payload)
             return FakeResp(RuntimeError(f"404 Not Found for url '{url}'"))
+
+        @contextlib.asynccontextmanager
+        async def stream(self, method: str, url: str):
+            yield await self.get(url)
 
     return patch.object(collector.httpx, "AsyncClient", FakeClient), requested
 
@@ -1158,6 +1174,9 @@ class EngineLoadTests(unittest.IsolatedAsyncioTestCase):
             def json(self):
                 raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
+            async def aiter_bytes(self):
+                yield b"not json"
+
         class FakeClient:
             def __init__(self, *a, **k):
                 pass
@@ -1170,6 +1189,10 @@ class EngineLoadTests(unittest.IsolatedAsyncioTestCase):
 
             async def get(self, url):
                 return FakeResp()
+
+            @contextlib.asynccontextmanager
+            async def stream(self, method: str, url: str):
+                yield await self.get(url)
 
         with patch.object(collector.httpx, "AsyncClient", FakeClient):
             load = await collector.fetch_engine_load("http://x:1")
@@ -2127,9 +2150,18 @@ class SSHRunTests(unittest.IsolatedAsyncioTestCase):
     def test_control_socket_is_scoped_to_this_process(self):
         """A socket inherited from an earlier run can be wedged behind a node
         that rebooted under it; every call then burns ConnectTimeout in the
-        mux hello before falling back to a fresh connection."""
+        mux hello before falling back to a fresh connection. The socket must
+        also live in a per-user 0700 dir, not world-writable /tmp, so a local
+        user cannot pre-plant a rogue mux master."""
         args = collector._ssh_base_args("host")
-        self.assertIn(f"ControlPath=/tmp/dgx-top-ssh-{os.getpid()}-%C", args)
+        ctrl = next(a for a in args if a.startswith("ControlPath=")).removeprefix("ControlPath=")
+        self.assertIn(str(Path.home() / ".cache" / "dgx-top"), ctrl)
+        self.assertIn(str(os.getpid()), ctrl)
+        self.assertTrue(ctrl.endswith("-%C"))
+        self.assertNotIn("/tmp/", ctrl)
+        ctrl_dir = Path(ctrl).parent
+        self.assertEqual(stat.S_IMODE(os.stat(ctrl_dir).st_mode), 0o700)
+        self.assertEqual(os.stat(ctrl_dir).st_uid, os.getuid())
 
     def test_master_liveness_is_probed(self):
         """Without ServerAlive* a master outliving a node reboot never exits."""
@@ -2172,6 +2204,30 @@ class SSHRunTests(unittest.IsolatedAsyncioTestCase):
                 os.close(fd)
         self.assertEqual(seen, "")
         self.assertEqual(left_for_the_tui, b"k")
+
+
+class CappedBodyTests(unittest.IsolatedAsyncioTestCase):
+    """Remote bodies are read through a size cap: a foreign listener can
+    stream an arbitrarily large body; anything past the cap is a failed fetch,
+    never an unbounded buffer."""
+
+    async def test_body_past_the_limit_is_rejected(self):
+        async def handler(request):
+            return httpx.Response(200, content=b"x" * 17)
+
+        with patch.object(collector, "HTTP_BODY_LIMIT", 16):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with self.assertRaises(httpx.HTTPError):
+                    await collector._read_capped(client, "http://x/metrics")
+
+    async def test_body_within_the_limit_is_returned(self):
+        async def handler(request):
+            return httpx.Response(200, content=b"vllm:x 1\n")
+
+        with patch.object(collector, "HTTP_BODY_LIMIT", 16):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                body = await collector._read_capped(client, "http://x/metrics")
+                self.assertEqual(body, b"vllm:x 1\n")
 
 
 class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):
@@ -2261,6 +2317,10 @@ class CpuStatParseTests(unittest.TestCase):
         self.assertEqual(len(utils), 1)
 
 
+async def _canned_body(payload: dict):
+    yield json.dumps(payload).encode()
+
+
 class InitModelNamesTests(unittest.IsolatedAsyncioTestCase):
     """Tests for one-shot startup model-name discovery."""
 
@@ -2268,12 +2328,23 @@ class InitModelNamesTests(unittest.IsolatedAsyncioTestCase):
         collector._model_names.clear()
 
     async def test_populates_cache_with_one_shared_client(self):
-        first_response = MagicMock()
-        first_response.json.return_value = {"data": [{"id": "model-a"}]}
-        second_response = MagicMock()
-        second_response.json.return_value = {"data": [{"model": "model-b"}]}
+        bodies = [
+            {"data": [{"id": "model-a"}]},
+            {"data": [{"model": "model-b"}]},
+        ]
+        requested: list[str] = []
+
+        @contextlib.asynccontextmanager
+        async def stream(method: str, url: str):
+            requested.append(url)
+            body = bodies.pop(0)
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.aiter_bytes = lambda: _canned_body(body)
+            yield resp
+
         client = MagicMock()
-        client.get = AsyncMock(side_effect=[first_response, second_response])
+        client.stream = stream
         client_context = MagicMock()
         client_context.__aenter__ = AsyncMock(return_value=client)
         client_context.__aexit__ = AsyncMock(return_value=False)
@@ -2290,13 +2361,20 @@ class InitModelNamesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(collector._model_names, {1: "model-a", 2: "model-b"})
         async_client.assert_called_once_with(timeout=10)
-        self.assertEqual(client.get.await_count, 2)
+        self.assertEqual(len(requested), 2)
 
     async def test_failed_lookup_does_not_block_other_cache_entries(self):
-        response = MagicMock()
-        response.json.return_value = {"data": [{"id": "model-a"}]}
+        @contextlib.asynccontextmanager
+        async def stream(method: str, url: str):
+            if url.startswith("http://two.test"):
+                raise RuntimeError("unavailable")
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.aiter_bytes = lambda: _canned_body({"data": [{"id": "model-a"}]})
+            yield resp
+
         client = MagicMock()
-        client.get = AsyncMock(side_effect=[response, RuntimeError("unavailable")])
+        client.stream = stream
         client_context = MagicMock()
         client_context.__aenter__ = AsyncMock(return_value=client)
         client_context.__aexit__ = AsyncMock(return_value=False)

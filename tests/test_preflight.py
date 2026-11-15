@@ -1,3 +1,4 @@
+import contextlib
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -46,6 +47,9 @@ class _Resp:
         if self._status_error is not None:
             raise self._status_error
 
+    async def aiter_bytes(self):
+        yield self.text.encode()
+
 
 class _Client:
     """Fake httpx client returning ``response`` for /metrics."""
@@ -64,6 +68,10 @@ class _Client:
 
     async def get(self, url):
         return self._response
+
+    @contextlib.asynccontextmanager
+    async def stream(self, method: str, url: str):
+        yield await self.get(url)
 
 
 SGLANG_METRICS = (
