@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from collector import LOAD_API_ENGINES, fetch_engine_load, metrics_engine
+from collector import LOAD_API_ENGINES, _read_capped, fetch_engine_load, metrics_engine
 from config import NodeConfig, Settings
 
 
@@ -76,8 +76,9 @@ async def _check_engine(node: NodeConfig) -> CheckResult:
     """
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(f"{node.vllm_url}/metrics")
-            response.raise_for_status()
+            text = (await _read_capped(client, f"{node.vllm_url}/metrics")).decode(
+                "utf-8", errors="replace"
+            )
     except Exception as exc:
         detail = await _load_probe_detail(node, "metrics disabled")
         if detail is not None:
@@ -87,7 +88,7 @@ async def _check_engine(node: NodeConfig) -> CheckResult:
                 node.label, "engine", False, f"no metrics and no load endpoint: {exc}"
             )
         return CheckResult(node.label, "engine", False, f"no metrics endpoint: {exc}")
-    engine = metrics_engine(response.text)
+    engine = metrics_engine(text)
     if engine is None:
         detail = await _load_probe_detail(node, "no engine metrics")
         if detail is not None:

@@ -278,9 +278,10 @@ async def probe(client: httpx.AsyncClient, base_url: str) -> Optional[tuple[str,
     simply not an engine."""
     engine: Optional[str] = None
     try:
-        resp = await client.get(f"{base_url}/metrics")
-        resp.raise_for_status()
-        engine = collector.metrics_engine(resp.text)
+        text = (await collector._read_capped(client, f"{base_url}/metrics")).decode(
+            "utf-8", errors="replace"
+        )
+        engine = collector.metrics_engine(text)
     except (httpx.ConnectError, httpx.ConnectTimeout):
         return None  # nothing accepts at this address: the load routes cannot answer either
     except Exception:

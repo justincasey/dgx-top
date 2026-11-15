@@ -151,6 +151,10 @@ def _parse_node(raw: object, node_number: int) -> NodeConfig:
         raise ConfigError(f"nodes[{node_number}] must be a TOML table")
     label = _require_text(raw, "label", node_number)
     ssh_target = _require_text(raw, "ssh_target", node_number)
+    # A target starting with '-' would be parsed as an ssh option, so
+    # "-oProxyCommand=..." would run locally. Reject it at load time.
+    if ssh_target.startswith("-"):
+        raise ConfigError(f"nodes[{node_number}].ssh_target must not start with '-'")
     vllm_url = _require_text(raw, "vllm_url", node_number).rstrip("/")
     parsed = urlparse(vllm_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:

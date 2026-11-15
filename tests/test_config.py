@@ -32,6 +32,14 @@ def test_load_config_supports_ssh_alias_and_separate_vllm_url(tmp_path: Path):
     assert settings.nodes[0].vllm_url == "http://spark-primary.example.com:8000"
 
 
+def test_ssh_target_starting_with_dash_is_rejected(tmp_path: Path):
+    """A target starting with '-' would be parsed as an ssh option, so
+    "-oProxyCommand=..." would run a local command instead of reaching a node."""
+    path = _write(tmp_path, VALID_CONFIG.replace("spark-primary", "-oProxyCommand=x"))
+    with pytest.raises(ConfigError, match="must not start with '-'"):
+        load_config(path)
+
+
 def test_missing_config_has_actionable_error(tmp_path: Path):
     with pytest.raises(ConfigError, match="dgx-top init"):
         load_config(tmp_path / "missing.toml")
