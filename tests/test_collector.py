@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2160,8 +2161,8 @@ class SSHRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(ctrl_dir.parent, {Path(tempfile.gettempdir()), Path("/tmp")})
         self.assertTrue(ctrl_dir.name.startswith("dgx-top-ssh-"))
         self.assertTrue(ctrl.endswith("/ssh-%C"))
-        # sun_path is 104 bytes with the NUL, and ssh expands %C to 40 hex chars
-        self.assertLessEqual(len(ctrl) - len("%C") + 40, 103)
+        # sun_path is 104 bytes with the NUL: measure the encoded expansion
+        self.assertLessEqual(len(os.fsencode(ctrl.replace("%C", "0" * 40))), 103)
         self.assertEqual(stat.S_IMODE(os.stat(ctrl_dir).st_mode), 0o700)
         self.assertEqual(os.stat(ctrl_dir).st_uid, os.getuid())
 
@@ -2182,6 +2183,24 @@ class SSHRunTests(unittest.IsolatedAsyncioTestCase):
                 shutil.rmtree(path, ignore_errors=True)
         finally:
             long_root.rmdir()
+
+    def test_socket_path_bound_is_measured_in_bytes(self):
+        """sun_path is a byte bound and a path is not one byte per character: a
+        UTF-8 root can fit by character count and overflow by 20 % on disk, so
+        the check would pick a root whose socket ssh then refuses to create."""
+        utf8_root = Path("/tmp") / ("\u4e2d" * 39)  # 39 characters, 117 bytes
+        utf8_name = str(utf8_root / ("ssh-" + "0" * 40))
+        self.assertLessEqual(len(utf8_name), 103)
+        self.assertGreater(len(os.fsencode(utf8_name)), 103)
+        self.assertFalse(collector._socket_path_fits(utf8_root))
+
+        ascii_root = Path("/tmp") / ("y" * 48)
+        self.assertTrue(collector._socket_path_fits(ascii_root))
+
+    def test_socket_path_rejects_a_root_ssh_would_expand(self):
+        """ControlPath is a token string, so a ``%`` in the root is expanded by
+        ssh and its literal length says nothing about the socket path."""
+        self.assertFalse(collector._socket_path_fits(Path("/tmp/%C")))
 
     def test_control_dirs_are_unpredictable_and_private(self):
         """``mkdtemp``, not a name derived from the pid: two runs cannot share
@@ -2211,6 +2230,61 @@ class SSHRunTests(unittest.IsolatedAsyncioTestCase):
         dir_line, ctrl = proc.stdout.split()
         self.assertTrue(ctrl.startswith(dir_line + os.sep))
         self.assertFalse(Path(dir_line).exists())
+
+    def test_import_survives_a_host_with_no_usable_temp_root(self):
+        """The init runs at import, so a host whose temp roots cannot host a
+        socket must still start — multiplexing off, the reason kept — instead
+        of raising through every entry point's import chain. ``-W
+        error::RuntimeWarning`` pins that the announcement cannot restore the
+        abort on a warnings-as-errors host."""
+        probe = (
+            "import tempfile\n"
+            "def boom(*a, **k):\n"
+            "    raise OSError(30, 'read-only')\n"
+            "tempfile.mkdtemp = boom\n"
+            "import collector\n"
+            "print(collector._SSH_CTRL is None)\n"
+            "print(bool(collector._CONTROL_DIR_ERROR))\n"
+            "print('ControlPath=' not in ' '.join(collector._ssh_base_args('host')))\n"
+        )
+        cwd = str(Path(collector.__file__).parent.parent)
+        announced = subprocess.run(
+            [sys.executable, "-c", probe], cwd=cwd, capture_output=True, text=True
+        )
+        self.assertEqual(announced.returncode, 0, announced.stderr)
+        self.assertEqual(announced.stdout.split(), ["True", "True", "True"])
+        self.assertIn("RuntimeWarning", announced.stderr)
+        strict = subprocess.run(
+            [sys.executable, "-W", "error::RuntimeWarning", "-c", probe],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(strict.returncode, 0, strict.stderr)
+        self.assertEqual(strict.stdout.split(), ["True", "True", "True"])
+
+    def test_no_usable_temp_root_degrades_instead_of_aborting(self):
+        """An entry point that never opens an ssh connection (``--simulate``)
+        must still start without a usable temp root, so the init reports the
+        cause instead of raising through the import."""
+        with patch.object(collector, "_make_control_dir", side_effect=RuntimeError("read-only")):
+            with self.assertWarns(RuntimeWarning):
+                directory, error = collector._init_control_dir()
+        self.assertIsNone(directory)
+        self.assertIn("read-only", str(error))
+
+    def test_mux_options_are_absent_when_no_control_dir_exists(self):
+        """Without a socket no mux option may be passed: ``ControlPath=None``
+        is not an argument ssh accepts, and the missing directory is precisely
+        what disables multiplexing."""
+        with patch.object(collector, "_SSH_CTRL", None):
+            args = collector._ssh_base_args("host")
+        mux = [
+            a for a in args if a.startswith(("ControlMaster=", "ControlPath=", "ControlPersist="))
+        ]
+        self.assertEqual(mux, [])
+        self.assertIn("ServerAliveInterval=5", args)
+        self.assertEqual(args[-1], "host")
 
     def test_master_liveness_is_probed(self):
         """Without ServerAlive* a master outliving a node reboot never exits."""
@@ -2277,6 +2351,60 @@ class CappedBodyTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 body = await collector._read_capped(client, "http://x/metrics")
                 self.assertEqual(body, b"vllm:x 1\n")
+
+    async def test_one_byte_chunks_are_joined_exactly(self):
+        """The cap counts bytes across chunks, so an exact-limit body split
+        into single bytes must come back whole and untruncated."""
+
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                for _ in range(16):
+                    yield b"x"
+
+        class Client:
+            @contextlib.asynccontextmanager
+            async def stream(self, method, url):
+                yield Resp()
+
+        with patch.object(collector, "HTTP_BODY_LIMIT", 16):
+            body = await collector._read_capped(Client(), "http://x/metrics")
+        self.assertEqual(body, b"x" * 16)
+
+    async def test_many_small_chunks_do_not_amplify_memory(self):
+        """The cap bounds memory, not payload: 200 000 one-byte chunks held as
+        separate ``bytes`` objects spend ~6.8 MB of headers alone."""
+
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                for _ in range(200_000):
+                    yield b"x"
+
+        class Client:
+            @contextlib.asynccontextmanager
+            async def stream(self, method, url):
+                yield Resp()
+
+        already_tracing = tracemalloc.is_tracing()
+        tracemalloc.start()
+        try:
+            # A process-wide peak would count everything traced before this
+            # test (PYTHONTRACEMALLOC, an earlier peak in the same run): reset
+            # it and measure only this call's growth.
+            tracemalloc.reset_peak()
+            baseline, _ = tracemalloc.get_traced_memory()
+            body = await collector._read_capped(Client(), "http://x/metrics")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            if not already_tracing:
+                tracemalloc.stop()
+        self.assertEqual(len(body), 200_000)
+        self.assertLess(peak - baseline, 3 * 1024 * 1024)
 
 
 class TelemetryFetchTests(unittest.IsolatedAsyncioTestCase):

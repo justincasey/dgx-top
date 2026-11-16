@@ -4,11 +4,13 @@ import asyncio
 import atexit
 import json
 import math
+import os
 import re
 import shlex
 import shutil
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -64,14 +66,15 @@ async def _read_capped(client: httpx.AsyncClient, url: str) -> bytes:
     every caller already treats any exception as a failed fetch."""
     async with client.stream("GET", url) as resp:
         resp.raise_for_status()
-        chunks: list[bytes] = []
-        total = 0
+        # One buffer, not one object per chunk: a server that dribbles single
+        # bytes would otherwise spend ~34 bytes of header per payload byte, so
+        # the object overhead would dwarf the cap long before the cap tripped.
+        body = bytearray()
         async for chunk in resp.aiter_bytes():
-            total += len(chunk)
-            if total > HTTP_BODY_LIMIT:
+            body += chunk
+            if len(body) > HTTP_BODY_LIMIT:
                 raise httpx.HTTPError(f"response body exceeds {HTTP_BODY_LIMIT} bytes")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return bytes(body)
 
 
 async def _fetch_model_name(client: httpx.AsyncClient, engine_url: str) -> str:
@@ -888,55 +891,91 @@ _CTRL_PATH_LIMIT = 103  # sun_path: 104 bytes on macOS (108 on Linux), NUL inclu
 
 
 def _socket_path_fits(directory: Path) -> bool:
-    """Whether ``ssh``'s expanded control-socket path fits in ``sun_path``."""
-    expanded = len(str(directory / _CTRL_NAME)) - len("%C") + _CONNECTION_HASH_LEN
-    return expanded <= _CTRL_PATH_LIMIT
+    """Whether ``ssh``'s expanded control-socket path fits in ``sun_path``.
+
+    ``sun_path`` is measured in bytes of the encoded path, so the check builds
+    the concrete name ssh will create (``%C`` expanded to its 40-char hash) and
+    measures that. A directory containing ``%`` never fits: ``ControlPath`` is
+    a token string ssh expands, so such a path has no fixed expanded length."""
+    if "%" in str(directory):
+        return False
+    expanded = str(directory / _CTRL_NAME.replace("%C", "0" * _CONNECTION_HASH_LEN))
+    return len(os.fsencode(expanded)) <= _CTRL_PATH_LIMIT
 
 
 def _make_control_dir() -> Path:
     """A private directory for this process's mux sockets: ``mkdtemp`` (0700,
     a name no other process can predict or reuse), on the first temp root
     whose path leaves room for the socket name."""
+    failure: Optional[OSError] = None
     for root in (Path(tempfile.gettempdir()), Path("/tmp")):
         try:
             path = Path(tempfile.mkdtemp(prefix="dgx-top-ssh-", dir=root))
-        except OSError:
+        except OSError as exc:
+            failure = exc
             continue
         if _socket_path_fits(path):
             return path
         shutil.rmtree(path, ignore_errors=True)
-    raise RuntimeError("no temp directory short enough for an ssh control socket")
+    detail = "" if failure is None else f": {failure}"
+    raise RuntimeError(f"no temp directory usable for an ssh control socket{detail}")
 
 
-_SSH_CTRL_DIR = _make_control_dir()
-_SSH_CTRL = str(_SSH_CTRL_DIR / _CTRL_NAME)
-atexit.register(shutil.rmtree, _SSH_CTRL_DIR, True)
+def _init_control_dir() -> Tuple[Optional[Path], Optional[str]]:
+    """This process's mux-socket directory, or ``(None, reason)``.
+
+    A host with no usable temp root keeps working — one connection per call,
+    the pre-multiplexing behaviour — and must not fail to start over an ssh
+    transport concern, so the failure is announced once and remembered rather
+    than raised. ``_ssh_base_args`` drops the mux options when it is absent.
+
+    The announcement cannot itself be fatal: under a warnings-as-errors filter
+    ``warnings.warn`` raises the category it was given, which would put the
+    import-time abort back."""
+    try:
+        return _make_control_dir(), None
+    except RuntimeError as exc:
+        try:
+            warnings.warn(f"ssh multiplexing disabled: {exc}", RuntimeWarning, stacklevel=2)
+        except RuntimeWarning:
+            pass
+        return None, str(exc)
+
+
+_SSH_CTRL_DIR, _CONTROL_DIR_ERROR = _init_control_dir()
+_SSH_CTRL: Optional[str] = None if _SSH_CTRL_DIR is None else str(_SSH_CTRL_DIR / _CTRL_NAME)
+if _SSH_CTRL_DIR is not None:
+    atexit.register(shutil.rmtree, _SSH_CTRL_DIR, True)
 
 SSH_TIMEOUT = 10
 
 
 def _ssh_base_args(target: str) -> list[str]:
-    """Common SSH args with ControlMaster multiplexing."""
-    return [
-        "ssh",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        f"ControlPath={_SSH_CTRL}",
-        "-o",
-        "ControlPersist=300",
-        # Probe the far end: a master that outlives a node reboot must die
-        # (~15 s) instead of pinning a half-open session for the whole run.
+    """Common SSH args, multiplexed when this process owns a mux socket.
+
+    ``_SSH_CTRL`` is ``None`` on a host whose temp roots cannot host a socket
+    (``_CONTROL_DIR_ERROR`` says why); every call then opens its own
+    connection rather than failing."""
+    args = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+    if _SSH_CTRL is not None:
+        args += [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={_SSH_CTRL}",
+            "-o",
+            "ControlPersist=300",
+        ]
+    # Probe the far end: a master that outlives a node reboot must die (~15 s)
+    # instead of pinning a half-open session for the whole run.
+    args += [
         "-o",
         "ServerAliveInterval=5",
         "-o",
         "ServerAliveCountMax=3",
         target,
     ]
+    return args
 
 
 async def _ssh_run(target: str, cmd: str) -> str:
