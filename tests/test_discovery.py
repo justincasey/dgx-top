@@ -63,16 +63,10 @@ def _by_port(listeners):
 class _Resp:
     def __init__(self, payload):
         self._payload = payload
-        self.text = payload if isinstance(payload, str) else ""
 
     def raise_for_status(self):
         if isinstance(self._payload, Exception):
             raise self._payload
-
-    def json(self):
-        if isinstance(self._payload, (dict, list)):
-            return self._payload
-        raise ValueError("not JSON")
 
     async def aiter_bytes(self):
         if isinstance(self._payload, Exception):
@@ -100,14 +94,15 @@ def _patch_http(monkeypatch, routes: dict[str, object]) -> list[str]:
             return False
 
         async def get(self, url: str):
-            requested.append(url)
-            if url in routes:
-                return _Resp(routes[url])
-            raise ConnectionError(f"connection refused: {url}")
+            raise AssertionError("bodies are read through collector._read_capped")
 
         @contextlib.asynccontextmanager
         async def stream(self, method: str, url: str):
-            yield await self.get(url)
+            requested.append(url)
+            if url in routes:
+                yield _Resp(routes[url])
+            else:
+                raise ConnectionError(f"connection refused: {url}")
 
     monkeypatch.setattr(discovery.httpx, "AsyncClient", FakeClient)
     monkeypatch.setattr(collector.httpx, "AsyncClient", FakeClient)
@@ -338,11 +333,11 @@ def _patch_client(monkeypatch, handler) -> list[object]:
             return False
 
         async def get(self, url: str):
-            return await handler(url)
+            raise AssertionError("bodies are read through collector._read_capped")
 
         @contextlib.asynccontextmanager
         async def stream(self, method: str, url: str):
-            yield await self.get(url)
+            yield await handler(url)
 
     monkeypatch.setattr(discovery.httpx, "AsyncClient", FakeClient)
     return built

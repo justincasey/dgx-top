@@ -67,11 +67,11 @@ class _Client:
         return False
 
     async def get(self, url):
-        return self._response
+        raise AssertionError("bodies are read through collector._read_capped")
 
     @contextlib.asynccontextmanager
     async def stream(self, method: str, url: str):
-        yield await self.get(url)
+        yield self._response
 
 
 SGLANG_METRICS = (
