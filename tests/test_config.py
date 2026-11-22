@@ -491,3 +491,107 @@ def test_packaging_ships_every_src_module_and_tomlkit():
 
     assert modules <= shipped, f"unshipped modules: {sorted(modules - shipped)}"
     assert any(dep.startswith("tomlkit") for dep in project["project"]["dependencies"])
+
+
+# ─── [[switches]] ─────────────────────────────────────────────────────
+
+SWITCH = """
+[[switches]]
+label = "fabric"
+url = "https://192.0.2.10/"
+user = "monitor"
+"""
+
+
+def test_switch_parses_with_defaults_and_ordered_ports(tmp_path: Path):
+    text = (
+        VALID_CONFIG + SWITCH + '[switches.ports]\n"qsfp56-dd-2-1" = "b"\n"qsfp56-dd-1-1" = "a"\n'
+    )
+    (switch,) = load_config(_write(tmp_path, text)).switches
+    assert switch.label == "fabric"
+    assert switch.url == "https://192.0.2.10"
+    assert (switch.password_env, switch.kind, switch.ca_file) == (
+        "DGX_TOP_SWITCH_PASSWORD",
+        "routeros",
+        None,
+    )
+    assert switch.ports == (("qsfp56-dd-2-1", "b"), ("qsfp56-dd-1-1", "a"))
+
+
+def test_config_without_switches_has_none(tmp_path: Path):
+    assert load_config(_write(tmp_path)).switches == ()
+
+
+@pytest.mark.parametrize("label", ["primary", "PRIMARY"])
+def test_switch_label_may_not_repeat_a_node_label(tmp_path: Path, label: str):
+    text = VALID_CONFIG + SWITCH.replace('"fabric"', f'"{label}"')
+    with pytest.raises(ConfigError, match="switch labels must be unique"):
+        load_config(_write(tmp_path, text))
+
+
+def test_two_switches_may_not_share_a_label(tmp_path: Path):
+    with pytest.raises(ConfigError, match="switch labels must be unique"):
+        load_config(_write(tmp_path, VALID_CONFIG + SWITCH + SWITCH))
+
+
+def test_more_than_four_switches_is_rejected(tmp_path: Path):
+    text = VALID_CONFIG + "".join(SWITCH.replace("fabric", f"sw{i}") for i in range(5))
+    with pytest.raises(ConfigError, match="up to 4 switches"):
+        load_config(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "ports",
+    [
+        '"ether1" = "much-too-long"',
+        '"ether1" = ""',
+        '"ether1" = "a"\n"ether2" = "A"',
+        '"ether1" = 3',
+    ],
+)
+def test_bad_port_labels_are_rejected(tmp_path: Path, ports: str):
+    text = VALID_CONFIG + SWITCH + "[switches.ports]\n" + ports + "\n"
+    with pytest.raises(ConfigError, match=r"switches\[1\]\.ports"):
+        load_config(_write(tmp_path, text))
+
+
+def test_ca_file_on_http_is_rejected(tmp_path: Path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("synthetic")
+    text = VALID_CONFIG + SWITCH.replace("https", "http") + f'ca_file = "{ca}"\n'
+    with pytest.raises(ConfigError, match="only applies to an https url"):
+        load_config(_write(tmp_path, text))
+
+
+def test_missing_ca_file_is_rejected(tmp_path: Path):
+    text = VALID_CONFIG + SWITCH + f'ca_file = "{tmp_path / "absent.pem"}"\n'
+    with pytest.raises(ConfigError, match="ca_file not found"):
+        load_config(_write(tmp_path, text))
+
+
+def test_existing_ca_file_is_resolved(tmp_path: Path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("synthetic")
+    (switch,) = load_config(
+        _write(tmp_path, VALID_CONFIG + SWITCH + f'ca_file = "{ca}"\n')
+    ).switches
+    assert switch.ca_file == str(ca)
+
+
+@pytest.mark.parametrize(
+    ("line", "match"),
+    [
+        ('url = "https://admin:pw@192.0.2.10"', "must not carry credentials"),
+        ('url = "https://192.0.2.10/rest"', "no path"),
+        ('url = "ftp://192.0.2.10"', "http"),
+        ('url = "https://192.0.2.10:abc"', "invalid port"),
+        ('url = "https://192.0.2.10:99999"', "invalid port"),
+        ('password_env = "1BAD"', "environment variable name"),
+        ('kind = "snmp"', "kind must be one of"),
+    ],
+)
+def test_invalid_switch_fields_are_rejected(tmp_path: Path, line: str, match: str):
+    key = line.split(" =")[0]
+    body = "\n".join(row for row in SWITCH.splitlines() if not row.startswith(f"{key} ="))
+    with pytest.raises(ConfigError, match=match):
+        load_config(_write(tmp_path, VALID_CONFIG + body + "\n" + line + "\n"))

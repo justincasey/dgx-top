@@ -119,10 +119,87 @@ class SparkUnitStats:
     mem_phys_bytes: int = 0
 
 
+SWITCH_TEMP_ALERT = 80.0
+"""°C at which a switch sensor becomes a critical finding (the node tiles'
+``TEMP_ALERT``; duplicated here because the collector cannot import the app)."""
+
+
+@dataclass
+class SwitchPort:
+    """One switch interface as the fabric rail shows it."""
+
+    name: str  # RouterOS interface name, e.g. "qsfp56-dd-1-1"
+    label: str  # display label: the config's override, else a derived short name
+    running: bool = False
+    rate: str = ""  # negotiated link rate as reported ("200Gbps"); "" = unknown
+    rate_bps: float = 0.0  # ``rate`` in bits/s; 0 = unknown
+    rx_bps: float = 0.0  # bits/s over the last poll interval
+    tx_bps: float = 0.0
+    rx_pps: float = 0.0
+    tx_pps: float = 0.0
+    queue_drops: int = 0  # tx-queue-drop increase over the last poll interval
+    measured: bool = False  # True once a rate delta exists (second poll onward)
+
+
+@dataclass
+class SwitchPsu:
+    name: str  # "psu1"
+    state: str = ""  # RouterOS psuN-state: "ok", "no-input", ...; "" = not reported
+    watts: float = -1.0  # -1 = not reported
+    volts: float = -1.0  # input voltage; -1 = not reported
+
+
+@dataclass
+class SwitchStats:
+    """One monitored network switch. Readings the switch does not report keep
+    their unknown sentinel (-1, "", empty) and render as ``—``, never 0."""
+
+    label: str
+    host: str = ""  # host part of the configured URL (the tile's meta tab)
+    online: bool = False
+    pending: bool = False  # first poll not landed yet
+    error: str = ""  # why the last poll failed (offline only)
+    board: str = ""  # RouterBOARD model name, e.g. "CRS326-24G-2S+"
+    version: str = ""  # RouterOS version without the channel, e.g. "7.20.1"
+    uptime: str = ""  # RouterOS duration string, e.g. "2d4h10m3s"
+    cpu_pct: float = -1.0
+    cpu_mhz: float = 0.0
+    cpu_count: int = 0
+    mem_used_bytes: int = 0
+    mem_total_bytes: int = 0
+    # Sensor name (RouterOS ``<name>-temperature`` with the suffix stripped:
+    # "cpu", "switch", "phy", "board1", "psu1", ...) -> °C, in report order.
+    temps: dict[str, float] = field(default_factory=dict)
+    # Fan name (``<name>-speed`` stripped: "fan1", "psu2-fan") -> RPM.
+    fans: dict[str, float] = field(default_factory=dict)
+    fan_state: str = ""  # "ok" or the reported fault; "" = not reported
+    psus: list[SwitchPsu] = field(default_factory=list)
+    ports: list[SwitchPort] = field(default_factory=list)
+    # (level, text) with level "crit" or "warn", most severe first:
+    # ("crit", "dd3 link down"), ("warn", "psu1 no-input").
+    findings: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def alarm(self) -> bool:
+        """True when the switch needs attention: a finding, or unreachable
+        once its first poll has landed."""
+        return bool(self.findings) or (not self.online and not self.pending)
+
+    @property
+    def critical(self) -> bool:
+        return any(level == "crit" for level, _ in self.findings)
+
+    @property
+    def hottest(self) -> float:
+        """Highest sensor reading in °C, or -1 when none was reported."""
+        return max(self.temps.values(), default=-1.0)
+
+
 @dataclass
 class ClusterStats:
     units: list[SparkUnitStats] = field(default_factory=list)
     topology: TopologyInfo = field(default_factory=TopologyInfo)
+    switches: list[SwitchStats] = field(default_factory=list)
 
     @property
     def total_throughput(self) -> float:

@@ -36,7 +36,7 @@ from config import (
     save_node_endpoint,
 )
 from input_driver import ResilientLinuxDriver
-from stats import ClusterStats, MemStack, SparkUnitStats, mem_stack
+from stats import ClusterStats, MemStack, SparkUnitStats, SwitchPort, SwitchStats, mem_stack
 from themes import CUSTOM_THEMES, SERIES_HUES, Palette, blend_toward, build_palette, series_hue
 
 log = logging.getLogger("dgx-top")
@@ -92,6 +92,15 @@ CHART_MAX = {"roomy": 16, "compact": 6, "rail": 0, "floor": 0}
 NODE_ROWS_FULL = 8  # gpu,meter,mem,bar|meter,legend|blank,cpu,cores,roce: always all eight
 NODE_ROWS_METER = 5  # gpu, mem, stack|meter, cpu, cores
 NODE_ROWS_TEXT = 3  # text card interior (gpu, mem, cpu)
+
+# Network switches ([[switches]]). In the node grid a switch is one more cell,
+# exactly as tall as a node tile at every tier (full 8 / meter 5 / text 3
+# interior rows, 1 at floor), so the fit engine counts it as a node. Its port
+# (link) rows exist only in the fabric rail, the widest layout: they are the
+# first detail shed when space is constrained. Alarms are never shed.
+FABRIC_RAIL_W = 34  # fabric rail column width, borders included
+FABRIC_RAIL_MIN_WIDTH = 160  # viewport width from which the rail may appear
+SWITCH_ROWS_HEALTH = 8  # rail: host, cpu/mem, meter, temps x2, fan, psu, status
 
 # Natural interior rows per SERVING window by density (borders excluded).
 # Reference grammar labels every metric row with a 9-cell gutter, a 22-cell
@@ -926,7 +935,9 @@ class Waybar(Static):
             return _fit(Text("…"), width)
         online = sum(1 for u in c.units if u.online)
         total = len(c.units)
-        risky = any((not u.online and not u.pending) or (u.temp_c >= TEMP_ALERT) for u in c.units)
+        risky = any(
+            (not u.online and not u.pending) or (u.temp_c >= TEMP_ALERT) for u in c.units
+        ) or any(sw.alarm for sw in c.switches)
         # A cluster with no counter-bearing unit stated no rate; "0 tok/s" would
         # be a manufactured reading of a live server, so the segment says so.
         gen = Text(
@@ -1918,6 +1929,471 @@ class NodeBox(Static):
         return rows
 
 
+# ─── Network switches ────────────────────────────────────────────────
+
+
+def _any_pending(stats: ClusterStats) -> bool:
+    """True while any node or switch still waits for its first poll."""
+    return any(u.pending for u in stats.units) or any(sw.pending for sw in stats.switches)
+
+
+def _uptime_short(uptime: str) -> str:
+    """The two largest units of a RouterOS duration: ``2d4h10m3s`` -> ``2d4h``."""
+    units = re.findall(r"\d+[wdhms]", uptime)
+    return "".join(units[:2]) or uptime
+
+
+def _fmt_bits(bps: float) -> str:
+    """A bit rate with an SI suffix, ``850``, ``12K``, ``3.2M``, ``180G``: one
+    decimal below 10 of a unit. A fixed Gb/s scale would print a light but
+    live link as ``0.00``."""
+    for div, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "K")):
+        if bps >= div:
+            value = bps / div
+            return f"{value:.1f}{suffix}" if value < 10 else f"{value:.0f}{suffix}"
+    return f"{bps:.0f}"
+
+
+def _fmt_pps(pps: float) -> str:
+    """A packet rate: ``850/s``, ``16.3k/s``, ``1.2M/s``."""
+    if pps < 1_000:
+        return f"{pps:.0f}/s"
+    if pps < 1_000_000:
+        return f"{pps / 1_000:.1f}k/s"
+    return f"{pps / 1_000_000:.1f}M/s"
+
+
+def _link_speed(rate: str) -> str:
+    """``200Gbps`` -> ``200G``, ``2.5Gbps`` -> ``2.5G``; ``""`` stays unknown."""
+    return rate[:-3] if rate.endswith("bps") else rate
+
+
+def _dot(pal: Palette) -> Text:
+    return Text(" · ", style=pal.dim)
+
+
+def _temp_text(value: float, pal: Palette) -> Text:
+    return Text(f"{value:.0f}°", style=_temp_style(value, pal))
+
+
+def _switch_temps(sw: SwitchStats, pal: Palette) -> tuple[Text, Text]:
+    """(chip, groups): the switch's own sensors, switch chip first
+    (``sw 61° · cpu 47° · phy 38°``), then the board and PSU groups
+    (``brd 33°/44° · psu 35°/36°``). Every reported sensor appears."""
+    chip_keys = sorted(
+        (k for k in sw.temps if not k.startswith(("board", "psu"))),
+        key=lambda k: k != "switch",  # stable: the rest keep report order
+    )
+    chip = Text()
+    for key in chip_keys:
+        if chip:
+            chip.append_text(_dot(pal))
+        chip.append(("sw" if key == "switch" else key) + " ", style=pal.dim)
+        chip.append_text(_temp_text(sw.temps[key], pal))
+    groups = Text()
+    for prefix, name in (("board", "brd"), ("psu", "psu")):
+        values = [v for k, v in sw.temps.items() if k.startswith(prefix)]
+        if not values:
+            continue
+        if groups:
+            groups.append_text(_dot(pal))
+        groups.append(name + " ", style=pal.dim)
+        for i, value in enumerate(values):
+            if i:
+                groups.append("/", style=pal.dim)
+            groups.append_text(_temp_text(value, pal))
+    return chip, groups
+
+
+def _switch_fans(sw: SwitchStats, pal: Palette) -> Text:
+    """``4800/4900 · psu2 5100 rpm``; a fan fault rides the row as ``! <state>``."""
+    out = Text()
+    system = [v for k, v in sw.fans.items() if k.startswith("fan")]
+    if system:
+        out.append("/".join(f"{v:.0f}" for v in system), style=f"bold {pal.fg}")
+    for key, value in sw.fans.items():
+        if key.startswith("fan"):
+            continue
+        if out:
+            out.append_text(_dot(pal))
+        out.append(key.removesuffix("-fan") + " ", style=pal.dim)
+        out.append(f"{value:.0f}", style=f"bold {pal.fg}")
+    if out:
+        out.append(" rpm", style=pal.dim)
+    if sw.fan_state and sw.fan_state != "ok":
+        if out:
+            out.append_text(_dot(pal))
+        out.append(f"! {sw.fan_state}", style=f"bold {pal.warn}")
+    return out or Text("—", style=pal.dim)
+
+
+def _switch_psus(sw: SwitchStats, pal: Palette, short: bool = False) -> Text:
+    """``psu1 ! no-input · psu2 38.0W 230V``: a supply that is not ok reads as
+    its state, never as a power figure."""
+    out = Text()
+    for psu in sw.psus:
+        if out:
+            out.append_text(_dot(pal))
+        out.append(psu.name + " ", style=pal.dim)
+        if psu.state and psu.state != "ok":
+            out.append(f"! {psu.state}", style=f"bold {pal.warn}")
+            continue
+        if psu.watts >= 0:
+            out.append(f"{psu.watts:.0f}W" if short else f"{psu.watts:.1f}W", style=pal.accent)
+            if psu.volts >= 0 and not short:
+                out.append(f" {psu.volts:.0f}V", style=pal.dim)
+        else:
+            out.append(psu.state or "—", style=pal.ok if psu.state else pal.dim)
+    return out or Text("—", style=pal.dim)
+
+
+def _switch_status(sw: SwitchStats, pal: Palette) -> Text:
+    """The row that never sheds: the worst finding (``!!`` crit, ``!`` warn)
+    with a count of the rest, else the RouterOS version and uptime. It holds
+    the only trace of a link alarm once the port rows are gone."""
+    if sw.pending:
+        return Text("…", style=pal.dim)
+    if not sw.online:
+        return Text(f"✗ {sw.error or 'unreachable'}", style=f"bold {pal.warn}")
+    if sw.findings:
+        level, text = sw.findings[0]
+        out = Text(("!! " if level == "crit" else "! ") + text, style=f"bold {pal.warn}")
+        if len(sw.findings) > 1:
+            out.append(f"  +{len(sw.findings) - 1}", style=pal.dim)
+        return out
+    out = Text()
+    if sw.version:
+        out.append(f"ros {sw.version}", style=pal.dim)
+    if sw.uptime:
+        if out:
+            out.append_text(_dot(pal))
+        out.append("up ", style=pal.dim)
+        out.append(_uptime_short(sw.uptime), style=pal.fg)
+    return out or Text("ok", style=pal.ok)
+
+
+def _switch_mem(sw: SwitchStats, pal: Palette) -> tuple[Text, float]:
+    """(``1.0G/4.0G 25%``, percent) — ``—`` and -1 when unreported."""
+    if not sw.online or sw.mem_total_bytes <= 0:
+        return Text("—", style=pal.dim), -1.0
+    pct = sw.mem_used_bytes / sw.mem_total_bytes * 100
+    return (
+        Text.assemble(
+            Text(f"{_fmt_gib(sw.mem_used_bytes)}G", style=f"bold {pal.fg}"),
+            Text(f"/{_fmt_gib(sw.mem_total_bytes)}G ", style=pal.dim),
+            Text(f"{pct:.0f}%", style=f"bold {pal.ok}"),
+        ),
+        pct,
+    )
+
+
+def _switch_cpu(sw: SwitchStats, pal: Palette) -> Text:
+    if not sw.online or sw.cpu_pct < 0:
+        return Text("—", style=pal.dim)
+    return Text(f"{sw.cpu_pct:.0f}%", style=f"bold {pal.warn}")
+
+
+def _switch_title(sw: SwitchStats, pal: Palette) -> list[tuple[str, str]]:
+    """``^ fabric-core switch``: the fabric identity hue (accent, as RoCE and
+    KV); ``…`` before the first poll, ``✗`` in warn once unreachable."""
+    caret = "^" if sw.online else "…" if sw.pending else "✗"
+    caret_style = pal.accent if sw.online or sw.pending else pal.warn
+    return [
+        (caret, f"bold {caret_style}"),
+        (" ", ""),
+        (sw.label, f"bold {pal.fg}"),
+        (" ", ""),
+        ("switch", pal.accent),
+    ]
+
+
+def _switch_rows(
+    sw: SwitchStats, pal: Palette, iw: int, grammar: str, treatment: str, mem_history: list[float]
+) -> list[Text]:
+    """Interior rows of a grid tile, exactly as many as a node tile of the
+    same grammar (NODE_ROWS_FULL / METER / TEXT): health only, no port rows.
+
+    full   cpu · mem · meter · chip temps · board/psu temps · fan · psu · status
+    meter  cpu+mem · all temps · fan · psu · status
+    text   cpu+mem · hottest temp · status"""
+    dash = Text("—", style=pal.dim)
+    live = sw.online
+
+    def row(label: str, value: Text) -> Text:
+        return Text.assemble(Text(label, style=pal.dim), value)
+
+    chip, groups = _switch_temps(sw, pal) if live else (dash, Text(""))
+    mem, mem_pct = _switch_mem(sw, pal)
+    cpu = _switch_cpu(sw, pal)
+    pct = Text(f"{mem_pct:.0f}%", style=f"bold {pal.ok}") if mem_pct >= 0 else dash
+    if grammar == "full":
+        head = row("cpu ", cpu)
+        if live and sw.cpu_mhz > 0:
+            head.append_text(_dot(pal))
+            head.append(_fmt_freq(sw.cpu_mhz), style=pal.dim)
+        if live and sw.cpu_count > 0:
+            head.append_text(_dot(pal))
+            head.append(f"{sw.cpu_count} cores", style=pal.dim)
+        return [
+            head,
+            row("mem ", mem),
+            _meter_line(treatment, max(0.0, mem_pct), iw, pal, pal.ok, mem_history),
+            row("tmp ", chip),
+            row("    ", groups),
+            row("fan ", _switch_fans(sw, pal) if live else dash),
+            row("psu ", _switch_psus(sw, pal) if live else dash),
+            _switch_status(sw, pal),
+        ]
+    if grammar == "meter":
+        temps = chip.copy()
+        if groups:
+            temps.append_text(_dot(pal))
+            temps.append_text(groups)
+        return [
+            Text.assemble(row("cpu ", cpu), _dot(pal), Text("mem ", style=pal.dim), pct),
+            row("tmp ", temps),
+            row("fan ", _switch_fans(sw, pal) if live else dash),
+            row("psu ", _switch_psus(sw, pal, short=True) if live else dash),
+            _switch_status(sw, pal),
+        ]
+    hot = _temp_text(sw.hottest, pal) if live and sw.hottest >= 0 else dash
+    return [
+        Text.assemble(row("c ", cpu), _dot(pal), Text("m ", style=pal.dim), pct),
+        row("t ", hot),
+        _switch_status(sw, pal),
+    ]
+
+
+def _switch_table_row(sw: SwitchStats, pal: Palette, width: int) -> Text:
+    """Floor tier: one condensed row like ``NodeBox._table_row`` —
+    glyph, short label, the alarm marker (kept before the readings so the
+    truncation that drops trailing fields never drops it), cpu, mem, hottest."""
+    if sw.online:
+        cpu = f"{sw.cpu_pct:.0f}%" if sw.cpu_pct >= 0 else "—"
+        mem = f"{sw.mem_used_bytes / sw.mem_total_bytes * 100:.0f}%" if sw.mem_total_bytes else "—"
+        hot = f"{sw.hottest:.0f}°" if sw.hottest >= 0 else "—"
+    else:
+        cpu = mem = hot = "—"
+    marker = "!!" if sw.critical else "!" if sw.findings else ""
+    parts = [
+        Text(
+            "● " if sw.online else "… " if sw.pending else "✗ ",
+            style=pal.accent if sw.online else pal.dim if sw.pending else pal.warn,
+        ),
+        Text(_short_label(sw.label), style=f"bold {pal.fg}"),
+        Text(f" {marker}" if marker else "", style=f"bold {pal.warn}"),
+        Text("   "),
+        Text(f"{cpu:>4}", style=f"bold {pal.warn}" if sw.online else pal.dim),
+        Text(" "),
+        Text(f"{mem:>4}", style=f"bold {pal.ok}" if sw.online else pal.dim),
+        Text(" "),
+        Text(
+            f"{hot:>4}",
+            style=_temp_style(sw.hottest, pal) if sw.online and sw.hottest >= 0 else pal.dim,
+        ),
+    ]
+    avail = max(1, width - FLOOR_GAP)
+    out = Text()
+    for part in parts:
+        if out.cell_len + part.cell_len > avail:
+            break
+        out.append_text(part)
+    return _fit(out, width)
+
+
+def _switch_placeholder(app: "DGXTop", idx: int) -> SwitchStats:
+    cfg = app.settings.switches[idx]
+    return SwitchStats(label=cfg.label, host=urlparse(cfg.url).hostname or "", pending=True)
+
+
+class SwitchBox(Static):
+    """A network switch as one cell of the node grid: the NodeBox frame and
+    exactly a node tile's height at every grammar, so the fit engine counts
+    it as one more node. Health only — port rows belong to the fabric rail
+    and are the first thing shed outside it."""
+
+    def __init__(self, idx: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.idx = idx
+        self._stats: SwitchStats | None = None
+        self._mem_history: list[float] = []
+
+    def update_switch(self, sw: SwitchStats, mem_history: list[float] | None = None) -> None:
+        self._stats = sw
+        self._mem_history = list(mem_history or [])
+        self.refresh()
+
+    def render(self) -> Text:
+        sw = self._stats or _switch_placeholder(self.app, self.idx)
+        pal = _palette_for(self.app)
+        width = max(1, self.content_size.width)
+        if getattr(self.app, "node_mode", "") == "table":
+            return _switch_table_row(sw, pal, width)
+        grammar = getattr(self.app, "node_grammar", "text")
+        rows = _switch_rows(
+            sw, pal, max(1, width - 4), grammar, _treatment(self), self._mem_history
+        )
+        rtab = [(sw.host, pal.dim)] if sw.host else None
+        return Text("\n").join(_box_lines(width, _switch_title(sw, pal), rtab, rows, False, pal))
+
+
+def _fabric_rail_need(switches: list[SwitchStats]) -> int:
+    """Rows the fabric rail wants: per switch a frame, the health block and,
+    when it has ports, a spacer plus two rows per port; one blank row
+    between switches."""
+    rows = 0
+    for i, sw in enumerate(switches):
+        rows += (1 if i else 0) + 2 + SWITCH_ROWS_HEALTH
+        if sw.ports:
+            rows += 1 + 2 * len(sw.ports)
+    return rows
+
+
+def _fabric_rail_floor(switches: int) -> int:
+    """Rows the rail needs at the least: every switch's frame and health
+    block, with no port rows. Below this the rail would clip a switch's
+    status row — its alarms — so the switches stay in the grid instead."""
+    return switches * (2 + SWITCH_ROWS_HEALTH) + max(0, switches - 1)
+
+
+def _rail_port_rows(
+    sw: SwitchStats, pal: Palette, iw: int, room: int, history: dict[tuple[str, str], list[float]]
+) -> list[Text]:
+    """Port rows within ``room`` rows. Two per port (link + rates, then
+    activity sparkline + packet rate); when that does not fit the sparkline
+    rows go first, then trailing ports fold into ``+N ports``."""
+    ports = sw.ports
+    if not ports or room <= 0:
+        return []
+    gutter = max(len(p.label) for p in ports) + 1
+
+    def link(p: SwitchPort) -> Text:
+        out = Text(p.label.ljust(gutter), style=pal.dim)
+        if not p.running:
+            out.append("✗ down", style=f"bold {pal.warn}")
+            return out
+        out.append(f"{_link_speed(p.rate) or '—':>4} ", style=pal.fg)
+        if p.measured:
+            out.append(f"↓{_fmt_bits(p.rx_bps)} ↑{_fmt_bits(p.tx_bps)}", style=f"bold {pal.accent}")
+            out.append(" b/s", style=pal.dim)
+        else:
+            out.append("↓— ↑—", style=pal.dim)
+        return out
+
+    def activity(p: SwitchPort) -> Text:
+        if not p.running or not p.measured:
+            return Text("")
+        pps = _fmt_pps(p.rx_pps + p.tx_pps)
+        w = max(1, iw - gutter - 1 - len(pps))
+        data = history.get((sw.label, p.name), [])
+        # Scaled to the link's full-duplex capacity, not the series' own peak:
+        # a steady trickle on a 200G link must read as idle, not saturated.
+        ceiling = 2 * p.rate_bps if p.rate_bps > 0 else None
+        spark = (
+            _spark_line(_stretch(data, w), pal.accent, w, ceiling=ceiling)
+            if data
+            else Text(" " * w)
+        )
+        return Text.assemble(Text(" " * gutter), spark, Text(" "), Text(pps, style=pal.dim))
+
+    if 2 * len(ports) <= room:
+        rows: list[Text] = []
+        for p in ports:
+            rows += [link(p), activity(p)]
+        return rows
+    if len(ports) <= room:
+        return [link(p) for p in ports]
+    keep = max(0, room - 1)
+    return [link(p) for p in ports[:keep]] + [Text(f"+{len(ports) - keep} ports", style=pal.dim)]
+
+
+class FabricRail(Static):
+    """The fabric rail: every configured switch stacked in one column at the
+    right edge of the widest layout (``FABRIC_RAIL_MIN_WIDTH`` and the roomy
+    tier). The only view with port (link) rows. ``expected_height`` is set by
+    the fit engine: the rail matches the desk's height and sheds port detail
+    when its rows run out."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._switches: list[SwitchStats] = []
+        self._mem_history: dict[str, list[float]] = {}
+        self._port_history: dict[tuple[str, str], list[float]] = {}
+        self.expected_height = 0
+
+    def update_switches(
+        self,
+        switches: list[SwitchStats],
+        mem_history: dict[str, list[float]],
+        port_history: dict[tuple[str, str], list[float]],
+    ) -> None:
+        self._switches = list(switches)
+        self._mem_history = mem_history
+        self._port_history = port_history
+        self.refresh()
+
+    def render(self) -> Text:
+        pal = _palette_for(self.app)
+        width = max(1, self.content_size.width)
+        iw = max(1, width - 4)
+        height = self.expected_height or self.content_size.height
+        switches = self._switches or [
+            _switch_placeholder(self.app, i) for i in range(len(self.app.settings.switches))
+        ]
+        lines: list[Text] = []
+        for i, sw in enumerate(switches):
+            if i:
+                lines.append(Text(""))
+            health = self._health(sw, pal, iw)
+            # Port rows are the first detail shed: they never take the rows
+            # the switches below need for their own frame and health block.
+            reserve = (len(switches) - 1 - i) * (1 + 2 + SWITCH_ROWS_HEALTH)
+            room = height - len(lines) - 2 - len(health) - 1 - reserve  # frame, spacer
+            ports = _rail_port_rows(sw, pal, iw, room, self._port_history)
+            rows = health + ([Text("")] + ports if ports else [])
+            if i == len(switches) - 1:
+                # The last frame reaches the desk's bottom, as SERVING does:
+                # slack stays inside the border, never below it.
+                rows += [Text("")] * max(0, height - len(lines) - 2 - len(rows))
+            lines.extend(_box_lines(width, _switch_title(sw, pal), None, rows, False, pal))
+        return Text("\n").join(lines[:height] if height else lines)
+
+    def _health(self, sw: SwitchStats, pal: Palette, iw: int) -> list[Text]:
+        """SWITCH_ROWS_HEALTH rows: the rail's meta tab has no room in the top
+        rule at this width, so the host leads the block."""
+        dash = Text("—", style=pal.dim)
+        live = sw.online
+        host = Text(sw.host, style=pal.cyan)
+        if live and sw.board:
+            host.append_text(_dot(pal))
+            host.append(sw.board, style=pal.dim)
+        mem, mem_pct = _switch_mem(sw, pal)
+        chip, groups = _switch_temps(sw, pal) if live else (dash, Text(""))
+        return [
+            host,
+            Text.assemble(
+                Text("cpu ", style=pal.dim),
+                _switch_cpu(sw, pal),
+                _dot(pal),
+                Text("mem ", style=pal.dim),
+                mem,
+            ),
+            _meter_line(
+                _treatment(self),
+                max(0.0, mem_pct),
+                iw,
+                pal,
+                pal.ok,
+                self._mem_history.get(sw.label, []),
+            ),
+            chip,
+            groups,
+            Text.assemble(Text("fan ", style=pal.dim), _switch_fans(sw, pal) if live else dash),
+            _switch_psus(sw, pal, short=True) if live else dash,
+            _switch_status(sw, pal),
+        ]
+
+
 # ─── Theme palette cache ─────────────────────────────────────────────
 
 _palette_cache: dict[tuple[str, bool], Palette] = {}
@@ -2497,7 +2973,7 @@ class DGXTop(App):
     /* Windows paint exact-width lines; never let Textual reflow/wrap them
        (a measurement-pass width mismatch would otherwise double a box's
        height). */
-    ServingBox, NodeBox { text-wrap: nowrap; text-overflow: clip; }
+    ServingBox, NodeBox, SwitchBox, FabricRail { text-wrap: nowrap; text-overflow: clip; }
 
     #body {
         layout: vertical;
@@ -2519,7 +2995,9 @@ class DGXTop(App):
     }
     /* The floor packs bare table lines flush (margin and gutter reset). */
     #body.floor #node-col { margin: 0; grid-gutter: 0; }
-    #node-col > NodeBox { height: auto; margin: 0; }
+    #node-col > NodeBox, #node-col > SwitchBox { height: auto; margin: 0; }
+    /* The fabric rail exists only in the widest layout; _apply_tier shows it. */
+    #fabric-rail { display: none; height: auto; }
 
     /* The waybar is the only chrome and stays visible in every tier (it is a
        sibling of #body, so a descendant selector could not reach it). */
@@ -2570,6 +3048,11 @@ class DGXTop(App):
         self._sw = 0
         self._nw = 0
         self._clock_busy = False  # a clock lock/reset is running on the nodes
+        self.fabric_rail = False  # switches in the right-edge rail, not the grid
+        self._fabric_h = 0  # rail rows (0 outside the rail layout)
+        self._fabric_need = _fabric_rail_need(
+            [SwitchStats(label=s.label, pending=True) for s in self.settings.switches]
+        )
 
     def get_driver_class(self):
         """Use resilient input unless Textual selected an explicit driver."""
@@ -2583,6 +3066,10 @@ class DGXTop(App):
             with Vertical(id="node-col"):
                 for index, _node in enumerate(self.settings.nodes):
                     yield NodeBox(index, id=f"node-{index}")
+                for index, _switch in enumerate(self.settings.switches):
+                    yield SwitchBox(index, id=f"switch-{index}")
+            if self.settings.switches:
+                yield FabricRail(id="fabric-rail")
 
     def on_mount(self):
         self._poll_timer = self.set_interval(self._current_interval(), self._poll)
@@ -2605,13 +3092,35 @@ class DGXTop(App):
             return True, tier_t
         return False, tier_s
 
+    def _switch_layout(self, width: int, height: int) -> tuple[bool, int, int, bool, str]:
+        """(fabric_rail, desk_width, tiles, tiled, tier). The rail is the
+        widest form: it takes FABRIC_RAIL_W plus a gutter off the right edge,
+        and is chosen only when the desk left beside it, laid out without the
+        switches, still tiles at the roomy tier. Anywhere else every switch is
+        one more equal cell of the node grid (a node tile's height at every
+        tier), so the fit engine simply counts it as a node."""
+        nodes = len(self.settings.nodes)
+        switches = len(self.settings.switches)
+        if switches and width >= FABRIC_RAIL_MIN_WIDTH:
+            desk = width - FABRIC_RAIL_W - TILING_GUTTER
+            tiled, tier = self._choose_layout(nodes, desk, height)
+            if tiled and tier == "roomy" and _fabric_rail_floor(switches) <= height - WAYBAR_HEIGHT:
+                return True, desk, nodes, tiled, tier
+        tiles = nodes + switches
+        tiled, tier = self._choose_layout(tiles, width, height)
+        return False, width, tiles, tiled, tier
+
     def _apply_tier(self, width: int, height: int) -> None:
-        n = len(self.settings.nodes)
         avail = height - WAYBAR_HEIGHT
-        tiled, tier = self._choose_layout(n, width, height)
+        # From here on ``width`` is the desk (SERVING + node grid): the full
+        # viewport, or what the fabric rail leaves of it.
+        fabric, width, n, tiled, tier = self._switch_layout(width, height)
         _fits, cols, node_h, serv_h, chart = _tier_fit(
             n, width, avail, tier, tiled, self._models_n, self.settings.chart
         )
+        # The rail matches the desk, growing (up to the viewport) only for
+        # port rows the desk is too short to carry.
+        fabric_h = min(avail, max(serv_h, node_h, self._fabric_need)) if fabric else 0
         node_mode = "table" if tier == "floor" else "card"
         rail = tier == "rail"
         floor = tier == "floor"
@@ -2629,7 +3138,7 @@ class DGXTop(App):
             # difference and gains the resolution for it.
             base = _serving_base(tier, sw, self._models_n)
             foot = 1 if self.settings.chart == "oscilloscope" else 0
-            chart = max(chart, max(serv_h, node_h) - 2 - base - 1 - foot)
+            chart = max(chart, max(serv_h, node_h, fabric_h) - 2 - base - 1 - foot)
         if (
             density == self.density
             and cols == self.cols
@@ -2646,6 +3155,8 @@ class DGXTop(App):
             and grammar == self.node_grammar
             and tile_h == self._tile_h
             and tile_w == self._tile_w
+            and fabric == self.fabric_rail
+            and fabric_h == self._fabric_h
         ):
             return
         self.density = density
@@ -2663,6 +3174,8 @@ class DGXTop(App):
         self.node_grammar = grammar
         self._tile_h = tile_h
         self._tile_w = tile_w
+        self.fabric_rail = fabric
+        self._fabric_h = fabric_h
 
         for name in ("compact", "roomy"):
             self.screen.set_class(name == density, name)
@@ -2686,6 +3199,13 @@ class DGXTop(App):
             serving.styles.width = "1fr"
             node_col.styles.width = "1fr"
             node_col.styles.margin = (0, 0, 0, 0) if floor else (1, 0, 0, 0)
+        if self.settings.switches:
+            fabric_col = self.query_one("#fabric-rail", FabricRail)
+            fabric_col.display = fabric
+            fabric_col.styles.width = FABRIC_RAIL_W
+            fabric_col.styles.margin = (0, 0, 0, TILING_GUTTER)
+            for box in self.query(SwitchBox):
+                box.display = not fabric
         self._apply_fill(pad)
         self._update_ui()
 
@@ -2703,7 +3223,9 @@ class DGXTop(App):
         # node stack and keeps its slack inside the frame, so trimming rows
         # from the pane never punches a hole in the column.
         serving = self.query_one("#serving", ServingBox)
-        serving.expected_height = max(self._serv_h, self._node_h) if self.tiled else 0
+        serving.expected_height = (
+            max(self._serv_h, self._node_h, self._fabric_h) if self.tiled else 0
+        )
         serving.styles.height = serving.expected_height or "auto"
         # One explicit height for every node tile: the densest card's, as the
         # fit estimator reserved it. ``auto`` follows each tile's own content,
@@ -2711,6 +3233,13 @@ class DGXTop(App):
         # resize, so a plan arriving mid-run clipped the card that gained a row.
         for node in self.query(NodeBox):
             node.styles.height = self._tile_h
+        # A grid switch is a node-sized cell; the rail is as tall as the desk.
+        for box in self.query(SwitchBox):
+            box.styles.height = self._tile_h
+        if self.settings.switches:
+            fabric_col = self.query_one("#fabric-rail", FabricRail)
+            fabric_col.expected_height = self._fabric_h
+            fabric_col.styles.height = self._fabric_h or "auto"
 
     def watch_theme(self, theme_name: str) -> None:
         if not self.is_running:
@@ -2759,22 +3288,23 @@ class DGXTop(App):
             self.run_worker(self._poll())
 
     def _recheck_while_pending(self, stats: ClusterStats) -> None:
-        """A node whose first poll is still outstanding appears as soon as it
-        lands, not a poll interval later. Waiting is cheap: ``_watch_pending``
-        polls again only once such a node has landed, so the nodes already on
-        screen are neither re-polled nor re-sampled into the history meanwhile."""
+        """A node or switch whose first poll is still outstanding appears as
+        soon as it lands, not a poll interval later. Waiting is cheap:
+        ``_watch_pending`` polls again only once such a poll has landed, so the
+        tiles already on screen are neither re-polled nor re-sampled into the
+        history meanwhile."""
         if self._pending_timer is not None:
             self._pending_timer.stop()
             self._pending_timer = None
-        if any(u.pending for u in stats.units):
+        if _any_pending(stats):
             self._pending_timer = self.set_timer(PENDING_RECHECK_S, self._watch_pending)
 
     def _watch_pending(self) -> None:
         self._pending_timer = None
-        if self.cluster is None or not any(u.pending for u in self.cluster.units):
+        if self.cluster is None or not _any_pending(self.cluster):
             return
         if pending_landed():
-            self._request_poll()  # _poll arms the next watch if a node is still outstanding
+            self._request_poll()  # _poll arms the next watch if a poll is still outstanding
         else:
             self._pending_timer = self.set_timer(PENDING_RECHECK_S, self._watch_pending)
 
@@ -2986,6 +3516,55 @@ class DGXTop(App):
                 gpu_history=list(self.history.get(f"gpu-{s.label}", [])),
                 mem_history=list(self.history.get(f"mem-{s.label}", [])),
             )
+        # A failed poll publishes no switches; keep the last frame rather than
+        # read an empty list as "every switch is gone".
+        if self.settings.switches and len(stats.switches) == len(self.settings.switches):
+            self._update_switches(stats.switches)
+
+    def _update_switches(self, switches: list[SwitchStats]) -> None:
+        """Switch histories (memory meter, per-port activity) and widgets. A
+        change in the rows the rail wants (ports appearing with the first
+        poll, a link added) re-fits the layout, as a change in the number of
+        served models does."""
+
+        def port_key(label: str, name: str) -> str:
+            return f"swport-{label}\x1f{name}"
+
+        live: set[str] = set()
+        for sw in switches:
+            if not sw.online:
+                continue
+            readings = []
+            if sw.mem_total_bytes > 0:
+                readings.append((f"swmem-{sw.label}", sw.mem_used_bytes / sw.mem_total_bytes * 100))
+            for p in sw.ports:
+                if p.running and p.measured:
+                    readings.append((port_key(sw.label, p.name), p.rx_bps + p.tx_bps))
+            for key, value in readings:
+                if not math.isfinite(value):
+                    continue
+                live.add(key)
+                self.history.setdefault(
+                    key, collections.deque(maxlen=self.settings.history_length)
+                ).append(value)
+        for key in [k for k in self.history if k.startswith(("swmem-", "swport-"))]:
+            if key not in live:
+                self.history.pop(key)
+        mem_history = {sw.label: list(self.history.get(f"swmem-{sw.label}", [])) for sw in switches}
+        port_history = {
+            (sw.label, p.name): list(self.history.get(port_key(sw.label, p.name), []))
+            for sw in switches
+            for p in sw.ports
+        }
+        for idx, sw in enumerate(switches):
+            self.query_one(f"#switch-{idx}", SwitchBox).update_switch(sw, mem_history[sw.label])
+        self.query_one("#fabric-rail", FabricRail).update_switches(
+            switches, mem_history, port_history
+        )
+        need = _fabric_rail_need(switches)
+        if need != self._fabric_need:
+            self._fabric_need = need
+            self._apply_tier(*self._last_size)
 
     def action_poll_faster(self):
         self._poll_speed_idx = max(0, self._poll_speed_idx - 1)

@@ -25,10 +25,12 @@ from simulation import simulate_cluster
 from stats import (
     ClusterStats,
     SparkUnitStats,
+    SwitchStats,
     TopologyInfo,
     TopologyInterface,
     TopologyPort,
 )
+from switches import poll_switch
 
 # Cache model names fetched once at startup — they don't change between polls.
 _model_names: dict[int, str] = {}
@@ -2279,6 +2281,13 @@ _landed: dict[int, SparkUnitStats] = {}
 next poll is still running is shown from here (never re-rated). An endpoint
 switch drops it: it describes the old endpoint."""
 
+_switch_flights: dict[int, asyncio.Task[SwitchStats]] = {}
+_switch_landed: dict[int, SwitchStats] = {}
+"""Switch index (position in ``config.SWITCHES``) -> its poll in progress, and
+the last poll that landed. The same flight model as the units: a switch that
+cannot answer never holds the nodes back. Rates are computed inside
+``switches.poll_switch`` (its own baselines), so landing needs no rating here."""
+
 
 def set_unit_endpoint(unit_id: int, url: str, engine: str | None) -> int:
     """Point one unit at a different engine endpoint while the app runs.
@@ -2345,10 +2354,28 @@ def _start_flight(unit_id: int) -> _Flight:
     return flight
 
 
+def _start_switch_flight(index: int) -> None:
+    task = asyncio.ensure_future(poll_switch(index, config.SWITCHES[index]))
+    task.add_done_callback(_retrieved)
+    _switch_flights[index] = task
+
+
+def _pending_switch(index: int) -> SwitchStats:
+    """Placeholder for a switch whose first poll has not landed."""
+    cfg = config.SWITCHES[index]
+    return SwitchStats(cfg.label, urlparse(cfg.url).hostname or "", pending=True)
+
+
 def pending_landed() -> bool:
-    """True when a node still shown as pending has a finished poll waiting to be
-    published: the one thing that makes another ``poll_cluster`` call worth it."""
-    return any(uid not in _landed and flight.task.done() for uid, flight in _flights.items())
+    """True when a node or switch still shown as pending has a finished poll
+    waiting to be published: the one thing that makes another ``poll_cluster``
+    call worth it."""
+    if any(uid not in _landed and flight.task.done() for uid, flight in _flights.items()):
+        return True
+    return any(
+        index < len(config.SWITCHES) and index not in _switch_landed and task.done()
+        for index, task in _switch_flights.items()
+    )
 
 
 async def poll_cluster() -> ClusterStats:
@@ -2361,25 +2388,56 @@ async def poll_cluster() -> ClusterStats:
     call, which starts that node's next poll at once. A flight begun under an
     endpoint generation the unit has since left is abandoned and the unit polled
     again, so the published unit always describes the endpoint it monitors now.
-    Each landed poll is rated once, with the time it landed.
+    Each landed poll is rated once, with the time it landed. Configured
+    switches fly the same way (``SwitchStats(pending=True)`` until the first
+    lands) and are published in config order; simulation has none.
     """
     if config.SIMULATION_NODES:
         return simulate_cluster(config.SIMULATION_NODES)
     loop = asyncio.get_running_loop()
     unit_ids = sorted(SPARK_UNITS.keys())
+    switch_ids = range(len(config.SWITCHES))
     deadline = loop.time() + POLL_SOFT_DEADLINE
     started: set[int] = set()  # units this call began polling; carried flights never extend it
+    started_switches: set[int] = set()  # likewise for switches
     while True:
         for uid in unit_ids:
             flight = _flights.get(uid)
             if flight is None or flight.epoch != _endpoint_epoch.get(uid, 0):
                 _start_flight(uid)
                 started.add(uid)
+        for index in switch_ids:
+            if index not in _switch_flights:
+                _start_switch_flight(index)
+                started_switches.add(index)
         waiting = [_flights[uid].task for uid in started if not _flights[uid].task.done()]
+        waiting += [
+            _switch_flights[index]
+            for index in started_switches
+            if not _switch_flights[index].done()
+        ]
         remaining = deadline - loop.time()
         if not waiting or remaining <= 0:
             break
         await asyncio.wait(waiting, timeout=remaining)
+
+    switches: list[SwitchStats] = []
+    for index in switch_ids:
+        task = _switch_flights.get(index)
+        if task is not None and task.done():
+            del _switch_flights[index]  # harvested once
+            try:
+                _switch_landed[index] = task.result()
+            except Exception as exc:  # poll_switch never raises; belt and braces
+                cfg = config.SWITCHES[index]
+                _switch_landed[index] = SwitchStats(
+                    cfg.label, urlparse(cfg.url).hostname or "", error=type(exc).__name__
+                )
+            if index not in started_switches:
+                _start_switch_flight(index)  # landed between calls: poll again at once
+        switches.append(
+            _switch_landed[index] if index in _switch_landed else _pending_switch(index)
+        )
 
     results: list[SparkUnitStats] = []
     failure: Exception | None = None
@@ -2438,4 +2496,4 @@ async def poll_cluster() -> ClusterStats:
 
     topology = _derive_topology(node_topos)
 
-    return ClusterStats(units=results, topology=topology)
+    return ClusterStats(units=results, topology=topology, switches=switches)

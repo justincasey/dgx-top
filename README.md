@@ -64,7 +64,7 @@ and KV percentage read like vLLM's. It states no block pool, no token
 capacity, no prefix-cache hit rate and no inter-token latency, so those rows
 paint `—` rather than a zero nobody measured.
 
-`dgx-top` never needs an SSH password, private key contents, sudo credentials, or an API token in its configuration. Monitoring is read-only; the one action that changes a node — locking or resetting the GPU clock ceiling from the `c` menu — runs `sudo -n nvidia-smi` and so needs passwordless sudo for `nvidia-smi` on the nodes (see [GPU clock ceiling](#gpu-clock-ceiling)).
+`dgx-top` never needs an SSH password, private key contents, sudo credentials, a switch password, or an API token in its configuration: a monitored switch's password is read from an environment variable at run time, never from the file (see [Fabric switches](#fabric-switches)). Monitoring is read-only; the one action that changes a node — locking or resetting the GPU clock ceiling from the `c` menu — runs `sudo -n nvidia-smi` and so needs passwordless sudo for `nvidia-smi` on the nodes (see [GPU clock ceiling](#gpu-clock-ceiling)).
 
 ## Quick start
 
@@ -161,6 +161,8 @@ worker = true
 | `quiet`          | Calm the whole UI: identity hues render neutral; colour appears only on caution/critical |
 | `clock_ceiling_mhz` | Default GPU clock ceiling in MHz for the `c` menu, applied as `nvidia-smi -lgc 0,<ceiling>`, from 1500 to 2400 (default 2200); the menu opens on the recorded lock instead when the nodes have one |
 | `phys_gib`       | Physical memory per node in GiB, from 16 to 4096 (default 128); the part Linux's `MemTotal` does not show counts as reserved |
+
+Optional `[[switches]]` tables (up to 4) add network switches; their keys are listed under [Fabric switches](#fabric-switches).
 
 The SSH target and engine URL are intentionally separate. An SSH alias can resolve through `~/.ssh/config`, while HTTP clients generally cannot use that alias.
 
@@ -272,11 +274,12 @@ past 8s and `!` past 2s, and the value is bold. `tokyo-night` is the default;
 
 ## Preflight checks
 
-`dgx-top check` tests every node concurrently:
+`dgx-top check` tests every node and switch concurrently:
 
 1. The SSH target accepts key-based, non-interactive authentication.
 2. `nvidia-smi` is available and `/proc/stat` is readable.
 3. The configured engine's `/metrics` endpoint (or its SGLang load API) is reachable and carries engine metrics.
+4. For each switch: its password environment variable is set and `GET /rest/system/identity` answers with the switch's name. A plain `http` url passes with a `[WARN]`: the password crosses the network in cleartext.
 
 No collected telemetry or endpoint response body is written to disk.
 
@@ -491,6 +494,86 @@ node shows `no lock recorded` until you apply it from the menu. The lock and
 reset run `sudo -n`, which never prompts. A node without passwordless sudo for
 `nvidia-smi` reports the sudo error and is left unchanged. Under
 `--simulate`, the menu locks the simulated cluster and no SSH is used.
+
+## Fabric switches
+
+dgx-top can show the network switch the Sparks hang off: CPU, memory, every
+temperature sensor, fans, PSUs, and per port the link state, negotiated rate,
+rx/tx throughput, packet rates and transmit-queue drops. Today it reads MikroTik
+RouterOS v7 through its REST API, and only reads: `GET` requests to
+`/rest/system/resource`, `/rest/system/health` and `/rest/interface`, plus one
+`POST /rest/interface/ethernet/monitor` with `once` (RouterOS exposes that
+read-only command as a POST). Nothing is ever written to the switch. A switch
+that cannot answer is polled in the background like a slow node and never
+holds the node tiles back. Switches are not simulated: `--simulate` shows none.
+
+```toml
+[[switches]]
+label = "fabric"
+url = "https://192.0.2.10"
+user = "dgx-top"
+password_env = "DGX_TOP_SWITCH_PASSWORD"  # the default
+# ca_file = "~/.config/dgx-top/switch-ca.pem"
+[switches.ports]                           # optional
+"qsfp56-dd-1-1" = "spark-1"
+"qsfp56-dd-2-1" = "spark-2"
+```
+
+```bash
+export DGX_TOP_SWITCH_PASSWORD='…'   # from your password manager, never the file
+dgx-top check
+```
+
+| Setting        | Meaning |
+| -------------- | ------- |
+| `label`        | Short name shown on the tile; unique across nodes and switches |
+| `url`          | REST base URL, `http(s)://host[:port]` with no path and no credentials |
+| `user`         | RouterOS user dgx-top logs in as (HTTP Basic auth) |
+| `password_env` | Name of the environment variable holding that user's password (default `DGX_TOP_SWITCH_PASSWORD`); a missing variable shows the switch offline with `$NAME is not set` |
+| `kind`         | Switch operating system; only `"routeros"` (the default) today |
+| `ca_file`      | Optional PEM bundle that verifies an `https` switch signed by a private CA; only valid with an `https` url, and the file must exist |
+| `ports`        | Optional table of `interface = "label"` (labels up to 8 characters) in display order. Absent: every enabled running ethernet port, labelled by a short name (`qsfp56-dd-1-1` → `dd1`, `qsfp28-3-1` → `q3`, `sfp28-2` → `sfp2`, `ether1` → `eth1`); a port that was running and drops stays listed so the drop shows |
+
+How much of a switch is drawn depends on the room. Port (link) rows are the
+first detail dropped:
+
+- **The fabric rail** — at 160 columns or wider, when the dashboard beside it
+  still fits the roomy tier, every switch moves into a 34-column rail at the
+  right edge. Only the rail shows ports: per port the negotiated speed and
+  ↓/↑ bits per second, then an activity sparkline (scaled to the link's
+  capacity, so an idle 200G link reads idle) and the packet rate. A short rail
+  drops the sparklines first, then folds trailing ports into `+N ports`.
+- **A node-sized tile** — everywhere else the switch is one more cell of the
+  node grid, exactly a node tile's width and height at every tier: CPU,
+  memory, every temperature sensor, fans and PSUs, no port rows. Narrower
+  tiers shed detail the way node tiles do.
+- **The floor** — one condensed row like a node's: CPU, memory, the hottest
+  sensor, with the alarm marker kept ahead of the readings.
+
+Alarms are never shed at any size: a temperature at or above 80 °C, a selected
+port whose link is down, a PSU or fan fault, or transmit-queue drops always
+show on the switch's status row and raise the waybar `!` badge, as does a
+switch that stops answering.
+
+### A read-only RouterOS user
+
+RouterOS serves REST through its web services: `www-ssl` for HTTPS (needs a
+certificate) and `www` for plain HTTP. Prefer `www-ssl`: Basic auth sends the
+password with every request, in cleartext over `www`. The REST API logs in
+through the API on the user's behalf, so the group needs both the `api` and
+`rest-api` policies, plus `read` to read
+([MikroTik REST API docs](https://manual.mikrotik.com/docs/developer-guides/rest-api/),
+[User docs](https://help.mikrotik.com/docs/spaces/ROS/pages/8978504/User)):
+
+```text
+/user/group/add name=dgx-top-read policy=read,api,rest-api
+/user/add name=dgx-top group=dgx-top-read
+/ip/service/set www-ssl disabled=no certificate=<your-cert>
+```
+
+Set the password interactively (`/password` as that user, or WinBox) rather
+than on a command line that lands in history. Without `write` the user cannot
+change the configuration even if a client tried.
 
 ## Synthetic data
 

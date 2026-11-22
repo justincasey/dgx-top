@@ -53,3 +53,21 @@ label = "spark-2"
 ssh_target = "spark@spark02.example.com"
 vllm_url = "http://spark02.example.com:8000"
 worker = true
+
+# Network switches shown beside the nodes (optional, up to 4). Read-only:
+# dgx-top issues GET requests to RouterOS v7's REST API plus its read-only
+# `interface/ethernet/monitor once`. The password is never in this file: set
+# it in the environment variable named by password_env before starting.
+# Prefer https (RouterOS www-ssl); ca_file verifies a private CA. ports is
+# optional: interface = "label" pairs (labels up to 8 characters) in display
+# order; leave it out to show every running ethernet port.
+# [[switches]]
+# label = "fabric"
+# url = "https://192.0.2.10"
+# user = "dgx-top"
+# password_env = "DGX_TOP_SWITCH_PASSWORD"
+# kind = "routeros"
+# ca_file = "~/.config/dgx-top/switch-ca.pem"
+# [switches.ports]
+# "qsfp56-dd-1-1" = "spark-1"
+# "qsfp56-dd-2-1" = "spark-2"

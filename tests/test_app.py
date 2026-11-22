@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from config import configure, load_config
-from stats import ClusterStats, SparkUnitStats, TopologyInfo
+from stats import ClusterStats, SparkUnitStats, SwitchPort, SwitchPsu, SwitchStats, TopologyInfo
 
 # ─── fixtures ────────────────────────────────────────────────────────
 
@@ -3430,3 +3430,276 @@ async def test_clock_menu_ceiling_stops_at_the_config_bounds(tmp_path: Path, mon
             await pilot.pause()
             options = {oid: text for text, _, oid in _clock_text(app)[0] if oid}
             assert options["lock"] == f"Lock GPU clocks to 0,{edge} MHz on 2 nodes"
+
+
+# ─── network switches ────────────────────────────────────────────────
+
+
+def _config_switch(path: Path, labels: tuple[str, ...] = ("fabric",)) -> None:
+    """The two-node config plus one ``[[switches]]`` table per label."""
+    _config(path)
+    with path.open("a") as fh:
+        for i, label in enumerate(labels, 20):
+            fh.write(
+                f'[[switches]]\nlabel = "{label}"\nurl = "http://192.0.2.{i}"\nuser = "monitor"\n'
+            )
+
+
+def _switch(alarm: bool = False, label: str = "fabric", ports: int = 4) -> SwitchStats:
+    """A synthetic switch with ``ports`` 200G links plus a 1G management
+    port. ``alarm`` adds a down link and a hot switch chip on top of the PSU
+    fault."""
+    links = [
+        SwitchPort(f"qsfp56-dd-{i}-1", f"dd{i}", True, "200Gbps", 2e11, 3e8, 3e8, 8e3, 8e3, 0, True)
+        for i in range(1, ports + 1)
+    ]
+    links.append(SwitchPort("ether1", "eth1", True, "1Gbps", 1e9, 1e3, 1e3, 5, 5, 0, True))
+    temps = {"cpu": 47.0, "switch": 61.0, "phy": 38.0, "board1": 33.0, "psu1": 35.0}
+    findings = [("warn", "psu1 no-input")]
+    if alarm:
+        links[2].running = False
+        temps["switch"] = 85.0
+        findings = [("crit", "sw 85°"), ("crit", "dd3 link down"), ("warn", "psu1 no-input")]
+    return SwitchStats(
+        label=label,
+        host="192.0.2.20",
+        online=True,
+        version="7.20.1",
+        uptime="2d4h10m3s",
+        cpu_pct=3.0,
+        cpu_mhz=2000.0,
+        cpu_count=4,
+        mem_used_bytes=1024**3,
+        mem_total_bytes=4 * 1024**3,
+        temps=temps,
+        fans={"fan1": 4800.0, "fan2": 4900.0},
+        fan_state="ok",
+        psus=[SwitchPsu("psu1", "no-input"), SwitchPsu("psu2", "ok", 38.0, 230.0)],
+        ports=links,
+        findings=findings,
+    )
+
+
+def _stub_switch(monkeypatch, *switches: SwitchStats) -> None:
+    import app as app_module
+
+    async def fake_poll():
+        return ClusterStats(
+            units=[_unit("head"), _unit("worker", worker=True)],
+            topology=TopologyInfo(topology_type="DUAL"),
+            switches=list(switches),
+        )
+
+    monkeypatch.setattr(app_module, "poll_cluster", fake_poll)
+
+
+def _plain(widget) -> str:
+    return widget.render().plain
+
+
+@pytest.mark.parametrize("size", [(132, 40), (90, 40), (132, 16), (110, 13)])
+async def test_grid_switch_is_a_node_sized_tile_without_link_rows(
+    tmp_path: Path, monkeypatch, size
+):
+    """Outside the fabric rail the switch is one more node cell — the same
+    width and height as every node tile at every tier — and carries no port
+    (link) rows: those are the first detail shed. Its alarm is never shed."""
+    from app import DGXTop, NodeBox, SwitchBox
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, _switch())
+    app = DGXTop()
+    async with app.run_test(size=size) as pilot:
+        await app._poll()
+        await _resize(pilot, *size)
+        assert not app.fabric_rail
+        box = app.query_one(SwitchBox)
+        node = app.query(NodeBox).first()
+        assert box.display
+        assert (box.region.width, box.region.height) == (node.region.width, node.region.height)
+        text = _plain(box)
+        assert "b/s" not in text and "dd1" not in text
+        assert "psu1 no-input" in text
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_fabric_rail_holds_link_rows_only_at_the_widest_layout(tmp_path: Path, monkeypatch):
+    """At an ultrawide roomy viewport the switch leaves the grid for the
+    right-edge rail, which alone shows the links; its frame ends with the
+    desk. One column narrower, the rail gives way to the grid tile."""
+    from app import DGXTop, FabricRail, NodeBox, ServingBox, SwitchBox
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, _switch(alarm=True))
+    app = DGXTop()
+    async with app.run_test(size=(196, 44)) as pilot:
+        await app._poll()
+        await _resize(pilot, 196, 44)
+        rail = app.query_one(FabricRail)
+        assert app.fabric_rail and rail.display
+        assert not app.query_one(SwitchBox).display
+        assert all(rail.region.x > n.region.right for n in app.query(NodeBox))
+        text = _plain(rail)
+        assert "dd1" in text and "↓300M ↑300M b/s" in text
+        assert "dd3  ✗ down" in text
+        assert rail.region.bottom == app.query_one(ServingBox).region.bottom
+        assert rail.region.right <= 196
+
+        await _resize(pilot, 159, 44)
+        assert not app.fabric_rail and not rail.display
+        assert app.query_one(SwitchBox).display
+
+
+async def test_switch_layouts_never_scroll_or_clip(tmp_path: Path, monkeypatch):
+    """A switch never makes the dashboard scroll, and no window overlaps or
+    leaves the viewport, from the ultrawide rail down to the floor."""
+    from app import DGXTop
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, _switch(alarm=True))
+    app = DGXTop()
+    async with app.run_test(size=(200, 50)) as pilot:
+        await app._poll()
+        for w, h in [
+            (200, 50),
+            (196, 44),
+            (160, 30),
+            (160, 20),
+            (159, 44),
+            (132, 40),
+            (132, 16),
+            (110, 13),
+            (90, 40),
+            (80, 10),
+            (63, 40),
+            (50, 40),
+            (40, 8),
+        ]:
+            await _resize(pilot, w, h)
+            assert app.screen.max_scroll_y == 0, (w, h)
+            vis = [
+                wid
+                for wid in app.screen.query("Waybar, ServingBox, NodeBox, SwitchBox, FabricRail")
+                if wid.display and wid.region.height
+            ]
+            assert any(type(wid).__name__ in ("SwitchBox", "FabricRail") for wid in vis), (w, h)
+            for wid in vis:
+                r = wid.region
+                assert r.bottom <= h and r.right <= w, (w, h, wid.id, r)
+            for i, a in enumerate(vis):
+                for b in vis[i + 1 :]:
+                    assert not a.region.overlaps(b.region), (w, h, a.id, b.id)
+
+
+async def test_floor_switch_row_keeps_its_alarm_marker(tmp_path: Path, monkeypatch):
+    """At the floor the switch is one condensed row; the alarm marker sits
+    before the readings, so dropping trailing fields never drops it."""
+    from app import DGXTop, SwitchBox
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, _switch(alarm=True))
+    app = DGXTop()
+    async with app.run_test(size=(70, 8)) as pilot:
+        await app._poll()
+        await _resize(pilot, 70, 8)
+        assert app.floor
+        row = _plain(app.query_one(SwitchBox))
+        assert "\n" not in row
+        assert row.startswith("● fab !!")
+
+
+@pytest.mark.parametrize("alarm", [True, False])
+async def test_switch_finding_raises_the_waybar_badge(tmp_path: Path, monkeypatch, alarm):
+    """A switch finding lights the waybar's ``!`` badge as a hot or lost node
+    does; a healthy switch leaves it dark."""
+    from app import DGXTop, Waybar
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    switch = _switch(alarm=True)
+    if not alarm:
+        switch.findings = []
+    _stub_switch(monkeypatch, switch)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await app._poll()
+        await _resize(pilot, 132, 40)
+        assert _plain(app.query_one(Waybar)).startswith(" ! ") is alarm
+
+
+async def test_rail_sheds_ports_before_any_switch_status_row(tmp_path: Path, monkeypatch):
+    """With several switches the first one's ports never take the rows the
+    next switch needs: its trailing ports fold into ``+N ports`` while every
+    switch keeps its whole health block, status (alarm) row included."""
+    from app import DGXTop, FabricRail, ServingBox
+
+    _config_switch(tmp_path / "config.toml", ("core", "edge"))
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, _switch(label="core", ports=24), _switch(alarm=True, label="edge"))
+    app = DGXTop()
+    async with app.run_test(size=(196, 44)) as pilot:
+        await app._poll()
+        await _resize(pilot, 196, 44)
+        assert app.fabric_rail
+        rail = app.query_one(FabricRail)
+        text = _plain(rail)
+        assert "core switch" in text and "edge switch" in text
+        assert re.search(r"\+\d+ ports", text)
+        assert "! psu1 no-input" in text  # core's status row
+        assert "!! sw 85°  +2" in text  # edge's status row
+        assert len(text.split("\n")) == rail.region.height
+        assert rail.region.bottom == app.query_one(ServingBox).region.bottom
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_rail_gives_way_when_switch_health_cannot_fit(tmp_path: Path, monkeypatch):
+    """The rail is taken only when every switch's frame and health block fit
+    the viewport; otherwise the switches stay node-sized grid tiles."""
+    from app import DGXTop, SwitchBox
+
+    labels = ("sw-a", "sw-b", "sw-c")
+    _config_switch(tmp_path / "config.toml", labels)
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, *(_switch(label=label, ports=2) for label in labels))
+    app = DGXTop()
+    async with app.run_test(size=(196, 44)) as pilot:
+        await app._poll()
+        await _resize(pilot, 196, 44)
+        assert app.fabric_rail  # 3 x 10 rows + 2 gaps fit 43
+        await _resize(pilot, 196, 30)
+        assert not app.fabric_rail  # 32 rows do not fit 29
+        assert all(box.display for box in app.query(SwitchBox))
+        assert app.screen.max_scroll_y == 0
+
+
+@pytest.mark.parametrize("size", [(132, 40), (132, 16)])
+@pytest.mark.parametrize(
+    ("state", "status"),
+    [
+        (SwitchStats("fabric", "192.0.2.20", online=False, error="timed out"), "✗ timed out"),
+        (SwitchStats("fabric", "192.0.2.20", pending=True), "…"),
+    ],
+)
+async def test_unreachable_or_pending_switch_keeps_the_node_tile_size(
+    tmp_path: Path, monkeypatch, size, state, status
+):
+    """A switch that cannot be read yet keeps exactly a node tile's size and
+    says why on its status row; what a switch reports never moves a tile."""
+    from app import DGXTop, NodeBox, SwitchBox
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    _stub_switch(monkeypatch, state)
+    app = DGXTop()
+    async with app.run_test(size=size) as pilot:
+        await app._poll()
+        await _resize(pilot, *size)
+        box = app.query_one(SwitchBox)
+        node = app.query(NodeBox).first()
+        assert (box.region.width, box.region.height) == (node.region.width, node.region.height)
+        assert status in _plain(box)
+        assert len(_plain(box).split("\n")) == box.region.height
