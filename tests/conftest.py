@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 import collector
+import config
+import switches
 
 
 @pytest.fixture(autouse=True)
@@ -21,3 +23,8 @@ def _isolate_poll_state(monkeypatch):
     monkeypatch.setattr(collector, "_flights", {})
     monkeypatch.setattr(collector, "_landed", {})
     monkeypatch.setattr(collector, "_stack_log_inflight", {})
+    monkeypatch.setattr(collector, "_switch_flights", {})
+    monkeypatch.setattr(collector, "_switch_landed", {})
+    monkeypatch.setattr(switches, "_baselines", {})
+    monkeypatch.setattr(switches, "_seen_running", {})
+    monkeypatch.setattr(config, "SWITCHES", ())

@@ -46,6 +46,25 @@ class NodeConfig:
     ``docker logs``, an absolute path reads that file."""
 
 
+@dataclass(frozen=True)
+class SwitchConfig:
+    """A network switch shown beside the nodes (``[[switches]]``).
+
+    Read-only: dgx-top only issues GET requests and RouterOS's read-only
+    ``monitor`` command. The password never lives in the file: ``password_env``
+    names the environment variable that holds it."""
+
+    label: str
+    url: str  # REST base URL, scheme + host[:port], no path
+    user: str
+    password_env: str = "DGX_TOP_SWITCH_PASSWORD"
+    kind: str = "routeros"
+    ca_file: str | None = None  # PEM bundle to verify an https switch (private CA)
+    ports: tuple[tuple[str, str], ...] = ()
+    """(interface, label) pairs in display order. Empty: every running
+    ethernet port, labelled with a derived short name."""
+
+
 ENGINES = {"vllm", "sglang", "tensorfold", "rexl"}
 """Recognised values for ``NodeConfig.engine``.
 
@@ -76,6 +95,15 @@ chart."""
 MAX_NODES = 12
 """Largest cluster dgx-top displays (one or more Sparks)."""
 
+MAX_SWITCHES = 4
+SWITCH_KINDS = {"routeros"}
+"""Switch operating systems the collector can read. RouterOS v7's REST API is
+the only one today; the field exists so another protocol (SNMP) can be added
+without changing what an existing configuration means."""
+SWITCH_PORT_LABEL_MAX = 8
+"""Cells a port label may take: the fabric rail's row gutter."""
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 CLOCK_CEILING_MIN = 1500
 CLOCK_CEILING_MAX = 2400
 """Bounds (MHz) of ``app.clock_ceiling_mhz`` and of the `c` menu's ceiling: the
@@ -99,6 +127,7 @@ class Settings:
     clock_ceiling_mhz: int = 2200
     # Physical memory per node (GiB); the part MemTotal does not show is "reserved".
     phys_gib: int = 128
+    switches: tuple[SwitchConfig, ...] = ()
 
 
 def _parse_theme(app: dict, override: str | None) -> str:
@@ -184,6 +213,76 @@ def _parse_node(raw: object, node_number: int) -> NodeConfig:
         elif not log.startswith("/") or "\0" in log or "\n" in log or "\r" in log:
             raise ConfigError(message)
     return NodeConfig(label, ssh_target, vllm_url, worker, engine, log)
+
+
+def _parse_switch(raw: object, number: int) -> SwitchConfig:
+    where = f"switches[{number}]"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} must be a TOML table")
+
+    def text(key: str) -> str:
+        value = raw.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"{where}.{key} must be a non-empty string")
+        return value.strip()
+
+    label = text("label")
+    url = text("url").rstrip("/")
+    parsed = urlparse(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError(
+            f"{where}.url must be an http(s) URL with no path, e.g. https://192.0.2.10"
+        )
+    if parsed.username or parsed.password:
+        # Credentials in the URL would sit in the file and in error messages.
+        raise ConfigError(f"{where}.url must not carry credentials; use user and password_env")
+    try:
+        parsed.port  # raises on a non-numeric or out-of-range port
+    except ValueError:
+        raise ConfigError(f"{where}.url has an invalid port") from None
+    user = text("user")
+    password_env = raw.get("password_env", SwitchConfig.password_env)
+    if not isinstance(password_env, str) or not _ENV_NAME.fullmatch(password_env):
+        raise ConfigError(f"{where}.password_env must be an environment variable name")
+    kind = raw.get("kind", SwitchConfig.kind)
+    if not isinstance(kind, str) or kind.strip().lower() not in SWITCH_KINDS:
+        raise ConfigError(f"{where}.kind must be one of: " + ", ".join(sorted(SWITCH_KINDS)))
+    ca_file = raw.get("ca_file")
+    if ca_file is not None:
+        if not isinstance(ca_file, str) or not ca_file.strip():
+            raise ConfigError(f"{where}.ca_file must be a file path")
+        if parsed.scheme != "https":
+            raise ConfigError(f"{where}.ca_file only applies to an https url")
+        resolved = Path(ca_file.strip()).expanduser()
+        if not resolved.is_file():
+            raise ConfigError(f"{where}.ca_file not found: {resolved}")
+        ca_file = str(resolved)
+    raw_ports = raw.get("ports", {})
+    if not isinstance(raw_ports, dict):
+        raise ConfigError(f'{where}.ports must be a table of interface = "label"')
+    ports: list[tuple[str, str]] = []
+    for name, port_label in raw_ports.items():
+        if (
+            not isinstance(port_label, str)
+            or not port_label.strip()
+            or len(port_label.strip()) > SWITCH_PORT_LABEL_MAX
+            or not port_label.strip().isprintable()
+            or not name.strip()
+            or not name.isprintable()
+        ):
+            raise ConfigError(
+                f"{where}.ports.{name} must be a label of 1 to {SWITCH_PORT_LABEL_MAX} characters"
+            )
+        ports.append((name.strip(), port_label.strip()))
+    if len({p[1].casefold() for p in ports}) != len(ports):
+        raise ConfigError(f"{where}.ports labels must be unique")
+    return SwitchConfig(label, url, user, password_env, kind.strip().lower(), ca_file, tuple(ports))
 
 
 def _synthetic_nodes(n: int) -> tuple[NodeConfig, ...]:
@@ -281,8 +380,17 @@ def load_config(
     if len(set(labels)) != len(labels):
         raise ConfigError("node labels must be unique")
 
+    raw_switches = raw.get("switches", [])
+    if not isinstance(raw_switches, list):
+        raise ConfigError("switches must be an array of [[switches]] tables")
+    if len(raw_switches) > MAX_SWITCHES:
+        raise ConfigError(f"configuration supports up to {MAX_SWITCHES} switches")
+    switches = tuple(_parse_switch(sw, index) for index, sw in enumerate(raw_switches, 1))
+    if len({sw.label.casefold() for sw in switches} | set(labels)) != len(labels) + len(switches):
+        raise ConfigError("switch labels must be unique and differ from node labels")
+
     app_settings = _parse_app(raw, theme)
-    return Settings(nodes, *app_settings)
+    return Settings(nodes, *app_settings, switches=switches)
 
 
 def effective_config_path(path: str | Path | None = None) -> Path:
@@ -298,19 +406,22 @@ SIMULATION_NODES: int | None = None
 """When set, ``collector.poll_cluster`` returns synthetic data for this many
 units instead of SSH/HTTP polling. Owned here (not in the collector) so
 ``configure(simulate=N)`` is the single source of truth."""
+SWITCHES: tuple[SwitchConfig, ...] = ()
+"""The configured switches, in display order (``collector.poll_cluster``)."""
 
 
 def configure(
     path: str | Path | None = None, theme: str | None = None, simulate: int | None = None
 ) -> Settings:
     """Load settings and update compatibility globals used by the collector."""
-    global _SETTINGS, _CONFIG_PATH, HISTORY_LEN, SIMULATION_NODES
+    global _SETTINGS, _CONFIG_PATH, HISTORY_LEN, SIMULATION_NODES, SWITCHES
     settings = load_config(path, theme=theme, simulate=simulate)
     _SETTINGS = settings
     # Simulated nodes have no file behind them: nothing may be written back.
     _CONFIG_PATH = None if simulate is not None else effective_config_path(path)
     HISTORY_LEN = settings.history_length
     SIMULATION_NODES = simulate
+    SWITCHES = settings.switches
     SPARK_UNITS.clear()
     SPARK_UNITS.update(
         {

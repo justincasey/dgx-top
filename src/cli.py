@@ -36,7 +36,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     init_parser = subparsers.add_parser("init", help="create an editable example configuration")
     init_parser.add_argument("--force", action="store_true", help="replace an existing file")
-    subparsers.add_parser("check", help="verify configuration, SSH, telemetry, and engine access")
+    subparsers.add_parser(
+        "check", help="verify configuration, SSH, telemetry, engine, and switch access"
+    )
     subparsers.add_parser("themes", help="list available color themes")
     discover_parser = subparsers.add_parser(
         "discover",

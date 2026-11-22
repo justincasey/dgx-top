@@ -45,7 +45,7 @@ Issues = "https://github.com/justincasey/dgx-top/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["app", "cli", "collector", "config", "discovery", "input_driver", "preflight", "simulation", "stats", "themes"]
+py-modules = ["app", "cli", "collector", "config", "discovery", "input_driver", "preflight", "simulation", "stats", "switches", "themes"]
 
 [tool.setuptools.data-files]
 "share/dgx-top" = ["src/config.example.toml"]

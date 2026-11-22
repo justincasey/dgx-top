@@ -1,11 +1,12 @@
 import contextlib
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from collector import EngineLoad
-from config import NodeConfig, Settings
-from preflight import CheckResult, _check_engine, run_preflight
+from config import NodeConfig, Settings, SwitchConfig
+from preflight import CheckResult, _check_engine, check_switch, run_preflight
 
 
 @pytest.mark.asyncio
@@ -207,3 +208,90 @@ async def test_engine_check_skips_the_load_api_for_declared_vllm_without_samples
     assert not result.ok
     assert result.detail == "endpoint returned no engine metrics"
     load.assert_not_awaited()
+
+
+# ─── Switches ─────────────────────────────────────────────────────────
+
+
+def _switch_client(monkeypatch, handler):
+    real = httpx.AsyncClient
+
+    def client(**kwargs):
+        kwargs.pop("verify", None)
+        return real(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+
+
+SWITCH = SwitchConfig("fabric", "https://192.0.2.10", "monitor", "TEST_SWITCH_PW")
+
+
+async def test_switch_check_passes_when_identity_answers(monkeypatch):
+    monkeypatch.setenv("TEST_SWITCH_PW", "synthetic-secret")
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, json={"name": "test-switch"})
+
+    _switch_client(monkeypatch, handler)
+    (result,) = await check_switch(SWITCH)
+    assert (result.ok, result.warning, result.check) == (True, False, "rest")
+    assert seen == [("GET", "/rest/system/identity")]
+
+
+async def test_switch_check_fails_without_the_password_env(monkeypatch):
+    monkeypatch.delenv("TEST_SWITCH_PW", raising=False)
+    (result,) = await check_switch(SWITCH)
+    assert not result.ok
+    assert result.detail == "$TEST_SWITCH_PW is not set"
+
+
+@pytest.mark.parametrize(
+    ("response", "detail"),
+    [
+        (httpx.Response(401), "authentication failed (HTTP 401)"),
+        (httpx.Response(200, json={"unexpected": 1}), "identity response has no name"),
+        (httpx.Response(200, content=b"<html>"), "malformed response"),
+    ],
+)
+async def test_switch_check_fails_on_a_bad_answer(monkeypatch, response, detail):
+    monkeypatch.setenv("TEST_SWITCH_PW", "synthetic-secret")
+    _switch_client(monkeypatch, lambda request: response)
+    (result,) = await check_switch(SWITCH)
+    assert (result.ok, result.detail) == (False, detail)
+
+
+async def test_http_switch_warns_but_does_not_fail(monkeypatch, capsys):
+    monkeypatch.setenv("TEST_SWITCH_PW", "synthetic-secret")
+    _switch_client(monkeypatch, lambda request: httpx.Response(200, json={"name": "sw"}))
+    cfg = SwitchConfig("fabric", "http://192.0.2.10", "monitor", "TEST_SWITCH_PW")
+    settings = Settings(
+        (NodeConfig("node-a", "node-a", "http://node-a.example.com"),), switches=(cfg,)
+    )
+    ok = (
+        CheckResult("node-a", "ssh", True, "ready"),
+        CheckResult("node-a", "engine", True, "ready"),
+    )
+    with patch("preflight.check_node", AsyncMock(return_value=ok)):
+        assert await run_preflight(settings) == 0
+    out = capsys.readouterr().out
+    assert "[WARN] fabric transport: http sends the switch password in cleartext" in out
+    assert "[PASS] fabric rest: RouterOS REST API ready" in out
+    assert "synthetic-secret" not in out
+
+
+async def test_switch_check_names_an_untrusted_certificate(monkeypatch):
+    import ssl
+
+    monkeypatch.setenv("TEST_SWITCH_PW", "synthetic-secret")
+
+    def handler(request):
+        try:
+            raise ssl.SSLCertVerificationError("certificate verify failed")
+        except ssl.SSLError as cause:
+            raise httpx.ConnectError("[SSL] certificate verify failed") from cause
+
+    _switch_client(monkeypatch, handler)
+    (result,) = await check_switch(SWITCH)
+    assert (result.ok, result.detail) == (False, "TLS certificate not trusted (see ca_file)")
