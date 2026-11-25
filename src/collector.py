@@ -2391,6 +2391,11 @@ async def poll_cluster() -> ClusterStats:
     Each landed poll is rated once, with the time it landed. Configured
     switches fly the same way (``SwitchStats(pending=True)`` until the first
     lands) and are published in config order; simulation has none.
+
+    On a unit failure the exception propagates before the switches are
+    published: the snapshots polled in this call are not published (the app
+    keeps its last frame), but the harvested landings stay in
+    ``_switch_landed`` and are published by the next successful call.
     """
     if config.SIMULATION_NODES:
         return simulate_cluster(config.SIMULATION_NODES)

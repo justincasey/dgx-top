@@ -1,3 +1,4 @@
+import base64
 import contextlib
 from unittest.mock import AsyncMock, patch
 
@@ -231,17 +232,30 @@ async def test_switch_check_passes_when_identity_answers(monkeypatch):
     seen = []
 
     def handler(request):
-        seen.append((request.method, request.url.path))
+        seen.append((request.method, request.url.path, request.headers.get("authorization")))
         return httpx.Response(200, json={"name": "test-switch"})
 
     _switch_client(monkeypatch, handler)
     (result,) = await check_switch(SWITCH)
     assert (result.ok, result.warning, result.check) == (True, False, "rest")
-    assert seen == [("GET", "/rest/system/identity")]
+    assert seen == [
+        (
+            "GET",
+            "/rest/system/identity",
+            "Basic " + base64.b64encode(b"monitor:synthetic-secret").decode(),
+        )
+    ]
 
 
 async def test_switch_check_fails_without_the_password_env(monkeypatch):
     monkeypatch.delenv("TEST_SWITCH_PW", raising=False)
+    (result,) = await check_switch(SWITCH)
+    assert not result.ok
+    assert result.detail == "$TEST_SWITCH_PW is not set"
+
+
+async def test_switch_check_fails_with_an_empty_password_env(monkeypatch):
+    monkeypatch.setenv("TEST_SWITCH_PW", "")
     (result,) = await check_switch(SWITCH)
     assert not result.ok
     assert result.detail == "$TEST_SWITCH_PW is not set"

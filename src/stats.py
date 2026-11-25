@@ -139,6 +139,7 @@ class SwitchPort:
     tx_pps: float = 0.0
     queue_drops: int = 0  # tx-queue-drop increase over the last poll interval
     measured: bool = False  # True once a rate delta exists (second poll onward)
+    disabled: bool = False  # True when the switch has the port disabled on purpose
 
 
 @dataclass
@@ -152,7 +153,13 @@ class SwitchPsu:
 @dataclass
 class SwitchStats:
     """One monitored network switch. Readings the switch does not report keep
-    their unknown sentinel (-1, "", empty) and render as ``—``, never 0."""
+    their unknown sentinel: -1 for the fields consumers gate on >= 0
+    (cpu_pct, hottest, watts, volts), "" / empty for the fields consumers
+    gate on != "" / != empty (board, version, uptime, host, rate, fan_state),
+    and 0 for the fields consumers gate on > 0 (cpu_mhz, cpu_count,
+    mem_used_bytes, mem_total_bytes, rate_bps, queue_drops). Rate/pps fields
+    are consumed behind ``measured`` (False = no rate delta exists). Renderers
+    map every sentinel to ``—``, never 0."""
 
     label: str
     host: str = ""  # host part of the configured URL (the tile's meta tab)

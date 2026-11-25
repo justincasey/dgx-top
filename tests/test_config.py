@@ -595,3 +595,44 @@ def test_invalid_switch_fields_are_rejected(tmp_path: Path, line: str, match: st
     body = "\n".join(row for row in SWITCH.splitlines() if not row.startswith(f"{key} ="))
     with pytest.raises(ConfigError, match=match):
         load_config(_write(tmp_path, VALID_CONFIG + body + "\n" + line + "\n"))
+
+
+@pytest.mark.parametrize(
+    ("line", "match"),
+    [
+        ('url = "https://[::1"', "with no path"),
+        ('url = "https://192.0.2.10:"', "invalid port"),
+        ('url = "https://192.0.2.10:0"', "invalid port"),
+    ],
+)
+def test_unparseable_or_empty_port_urls_are_rejected(tmp_path: Path, line: str, match: str):
+    key = line.split(" =")[0]
+    body = "\n".join(row for row in SWITCH.splitlines() if not row.startswith(f"{key} ="))
+    with pytest.raises(ConfigError, match=match):
+        load_config(_write(tmp_path, VALID_CONFIG + body + "\n" + line + "\n"))
+
+
+def test_relative_ca_file_is_rejected(tmp_path: Path):
+    text = VALID_CONFIG + SWITCH + 'ca_file = "switch-ca.pem"\n'
+    with pytest.raises(ConfigError, match="must be an absolute path"):
+        load_config(_write(tmp_path, text))
+
+
+def test_switch_accepts_a_custom_password_env_and_explicit_port(tmp_path: Path):
+    text = VALID_CONFIG + SWITCH.replace(
+        '"https://192.0.2.10/"', '"https://192.0.2.10:8443/"'
+    ).replace('user = "monitor"', 'user = "monitor"\npassword_env = "MY_SWITCH_PW"')
+    (switch,) = load_config(_write(tmp_path, text)).switches
+    assert switch.url == "https://192.0.2.10:8443"
+    assert switch.password_env == "MY_SWITCH_PW"
+
+
+def test_kind_is_case_insensitive(tmp_path: Path):
+    text = VALID_CONFIG + SWITCH + 'kind = "Routeros"\n'
+    (switch,) = load_config(_write(tmp_path, text)).switches
+    assert switch.kind == "routeros"
+
+
+def test_exactly_four_switches_is_accepted(tmp_path: Path):
+    text = VALID_CONFIG + "".join(SWITCH.replace("fabric", f"sw{i}") for i in range(4))
+    assert len(load_config(_write(tmp_path, text)).switches) == 4

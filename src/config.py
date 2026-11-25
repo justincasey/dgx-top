@@ -228,7 +228,12 @@ def _parse_switch(raw: object, number: int) -> SwitchConfig:
 
     label = text("label")
     url = text("url").rstrip("/")
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        raise ConfigError(
+            f"{where}.url must be an http(s) URL with no path, e.g. https://192.0.2.10"
+        ) from None
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
@@ -243,9 +248,12 @@ def _parse_switch(raw: object, number: int) -> SwitchConfig:
         # Credentials in the URL would sit in the file and in error messages.
         raise ConfigError(f"{where}.url must not carry credentials; use user and password_env")
     try:
-        parsed.port  # raises on a non-numeric or out-of-range port
+        port = parsed.port  # raises on a non-numeric or out-of-range port
     except ValueError:
         raise ConfigError(f"{where}.url has an invalid port") from None
+    if parsed.netloc.endswith(":") or (port is not None and port < 1):
+        # An empty port ("host:") or port 0 is not a server to talk to.
+        raise ConfigError(f"{where}.url has an invalid port")
     user = text("user")
     password_env = raw.get("password_env", SwitchConfig.password_env)
     if not isinstance(password_env, str) or not _ENV_NAME.fullmatch(password_env):
@@ -260,6 +268,8 @@ def _parse_switch(raw: object, number: int) -> SwitchConfig:
         if parsed.scheme != "https":
             raise ConfigError(f"{where}.ca_file only applies to an https url")
         resolved = Path(ca_file.strip()).expanduser()
+        if not resolved.is_absolute():
+            raise ConfigError(f"{where}.ca_file must be an absolute path")
         if not resolved.is_file():
             raise ConfigError(f"{where}.ca_file not found: {resolved}")
         ca_file = str(resolved)
