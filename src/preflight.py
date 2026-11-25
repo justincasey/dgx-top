@@ -124,7 +124,7 @@ async def check_switch(switch: SwitchConfig) -> list[CheckResult]:
                 warning=True,
             )
         )
-    password = os.environ.get(switch.password_env)
+    password = os.environ.get(switch.password_env) or None
     if password is None:
         results.append(
             CheckResult(switch.label, "rest", False, f"${switch.password_env} is not set")

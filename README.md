@@ -279,7 +279,7 @@ past 8s and `!` past 2s, and the value is bold. `tokyo-night` is the default;
 1. The SSH target accepts key-based, non-interactive authentication.
 2. `nvidia-smi` is available and `/proc/stat` is readable.
 3. The configured engine's `/metrics` endpoint (or its SGLang load API) is reachable and carries engine metrics.
-4. For each switch: its password environment variable is set and `GET /rest/system/identity` answers with the switch's name. A plain `http` url passes with a `[WARN]`: the password crosses the network in cleartext.
+4. For each switch: its password environment variable is set and `GET /rest/system/identity` answers with a non-empty `name` (the check does not compare it to the configured label). A plain `http` url passes with a `[WARN]`: the password crosses the network in cleartext.
 
 No collected telemetry or endpoint response body is written to disk.
 
@@ -501,7 +501,8 @@ dgx-top can show the network switch the Sparks hang off: CPU, memory, every
 temperature sensor, fans, PSUs, and per port the link state, negotiated rate,
 rx/tx throughput, packet rates and transmit-queue drops. Today it reads MikroTik
 RouterOS v7 through its REST API, and only reads: `GET` requests to
-`/rest/system/resource`, `/rest/system/health` and `/rest/interface`, plus one
+`/rest/system/resource`, `/rest/system/health` and `/rest/interface` (and
+`/rest/system/identity` from `dgx-top check`), plus one
 `POST /rest/interface/ethernet/monitor` with `once` (RouterOS exposes that
 read-only command as a POST). Nothing is ever written to the switch. A switch
 that cannot answer is polled in the background like a slow node and never
@@ -531,15 +532,16 @@ dgx-top check
 | `user`         | RouterOS user dgx-top logs in as (HTTP Basic auth) |
 | `password_env` | Name of the environment variable holding that user's password (default `DGX_TOP_SWITCH_PASSWORD`); a missing variable shows the switch offline with `$NAME is not set` |
 | `kind`         | Switch operating system; only `"routeros"` (the default) today |
-| `ca_file`      | Optional PEM bundle that verifies an `https` switch signed by a private CA; only valid with an `https` url, and the file must exist |
+| `ca_file`      | Optional absolute path to a PEM bundle that verifies an `https` switch signed by a private CA; only valid with an `https` url, and the file must exist |
 | `ports`        | Optional table of `interface = "label"` (labels up to 8 characters) in display order. Absent: every enabled running ethernet port, labelled by a short name (`qsfp56-dd-1-1` → `dd1`, `qsfp28-3-1` → `q3`, `sfp28-2` → `sfp2`, `ether1` → `eth1`); a port that was running and drops stays listed so the drop shows |
 
 How much of a switch is drawn depends on the room. Port (link) rows are the
 first detail dropped:
 
 - **The fabric rail** — at 160 columns or wider, when the dashboard beside it
-  still fits the roomy tier, every switch moves into a 34-column rail at the
-  right edge. Only the rail shows ports: per port the negotiated speed and
+  still fits the roomy tier and the rail's health rows fit the height
+  (`_fabric_rail_floor(switches) <= height - WAYBAR_HEIGHT`), every switch
+  moves into a 34-column rail at the right edge. Only the rail shows ports: per port the negotiated speed and
   ↓/↑ bits per second, then an activity sparkline (scaled to the link's
   capacity, so an idle 200G link reads idle) and the packet rate. A short rail
   drops the sparklines first, then folds trailing ports into `+N ports`.
@@ -550,10 +552,10 @@ first detail dropped:
 - **The floor** — one condensed row like a node's: CPU, memory, the hottest
   sensor, with the alarm marker kept ahead of the readings.
 
-Alarms are never shed at any size: a temperature at or above 80 °C, a selected
-port whose link is down, a PSU or fan fault, or transmit-queue drops always
-show on the switch's status row and raise the waybar `!` badge, as does a
-switch that stops answering.
+Alarms are never shed at any size: a temperature at or above 80 °C, a listed
+port whose link is down (disabled ports are not links down), a PSU or fan
+fault, or transmit-queue drops always show on the switch's status row and
+raise the waybar `!` badge, as does a switch that stops answering.
 
 ### A read-only RouterOS user
 

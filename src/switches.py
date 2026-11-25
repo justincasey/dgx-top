@@ -192,14 +192,25 @@ def select_ports(cfg: SwitchConfig, interfaces: object) -> list[SwitchPort]:
 
     Configured ports: exactly those, in order (one absent on the switch reads
     as not running). Otherwise every enabled running ethernet port plus any
-    seen running by an earlier poll, in natural name order."""
+    seen running by an earlier poll, in natural name order (a disabled port
+    is retired, not listed). A disabled *configured* port is listed with
+    ``disabled=True``: the row stays visible, but it is never treated as a
+    dropped link."""
     rows = _by_name(interfaces)
 
     def running(name: str) -> bool:
         return _text(rows.get(name, {}).get("running")) == "true"
 
     if cfg.ports:
-        return [SwitchPort(name, label, running=running(name)) for name, label in cfg.ports]
+        return [
+            SwitchPort(
+                name,
+                label,
+                running=running(name),
+                disabled=_text(rows.get(name, {}).get("disabled")) == "true",
+            )
+            for name, label in cfg.ports
+        ]
     seen = _seen_running.setdefault(cfg.label, set())
     for name, row in rows.items():
         if _text(row.get("disabled")) == "true":
@@ -216,7 +227,10 @@ def apply_counters(switch: str, port: SwitchPort, row: object, now: float) -> No
     """Rate one port from its interface counters against the previous poll.
 
     The first observation only seeds. A counter that went backwards (switch
-    reboot, wrap) re-seeds and reports 0, unmeasured, rather than a bogus rate."""
+    reboot, wrap) re-seeds and reports 0, unmeasured, rather than a bogus rate.
+    The tx-queue-drop delta is computed independently of the byte/packet
+    counters: a port that reports only ``tx-queue-drop`` (a DD port) still
+    reports drops, just never a rate."""
     key = (switch, port.name)
     if not isinstance(row, dict):
         _baselines.pop(key, None)
@@ -227,26 +241,39 @@ def apply_counters(switch: str, port: SwitchPort, row: object, now: float) -> No
         _int(row.get("tx-byte")),
         _int(row.get("rx-packet")),
         _int(row.get("tx-packet")),
-        _int(row.get("tx-queue-drop"), 0),
+        _int(row.get("tx-queue-drop")),
     )
-    if min(counters[1:]) < 0:
-        _baselines.pop(key, None)  # unreadable counters: no rate, start over
+    if all(value < 0 for value in counters[1:]):
+        _baselines.pop(key, None)  # nothing readable: no rate, start over
         return
     previous = _baselines.get(key)
     _baselines[key] = counters
     if previous is None:
         return
     elapsed = now - previous[0]
-    deltas = [cur - prev for cur, prev in zip(counters[1:], previous[1:])]
-    if elapsed <= 0 or min(deltas) < 0:
+    if elapsed <= 0:
         return
-    rx_bytes, tx_bytes, rx_pkts, tx_pkts, drops = deltas
-    port.rx_bps = rx_bytes * 8 / elapsed
-    port.tx_bps = tx_bytes * 8 / elapsed
-    port.rx_pps = rx_pkts / elapsed
-    port.tx_pps = tx_pkts / elapsed
-    port.queue_drops = drops
-    port.measured = True
+    rx_bytes, tx_bytes, rx_pkts, tx_pkts, drops = counters[1:]
+    prev_rx, prev_tx, prev_rxp, prev_txp, prev_drops = previous[1:]
+    byte_counters = (rx_bytes, tx_bytes, rx_pkts, tx_pkts)
+    prev_byte_counters = (prev_rx, prev_tx, prev_rxp, prev_txp)
+    if (
+        all(value >= 0 for value in byte_counters)
+        and all(value >= 0 for value in prev_byte_counters)
+        and all(cur >= prev for cur, prev in zip(byte_counters, prev_byte_counters))
+    ):
+        rx_delta, tx_delta, rx_pkt_delta, tx_pkt_delta = [
+            cur - prev for cur, prev in zip(byte_counters, prev_byte_counters)
+        ]
+        port.rx_bps = rx_delta * 8 / elapsed
+        port.tx_bps = tx_delta * 8 / elapsed
+        port.rx_pps = rx_pkt_delta / elapsed
+        port.tx_pps = tx_pkt_delta / elapsed
+        port.measured = True
+    if drops >= 0 and prev_drops >= 0:
+        drop_delta = drops - prev_drops
+        if drop_delta >= 0:
+            port.queue_drops = drop_delta
 
 
 def _sensor_name(key: str) -> str:
@@ -264,7 +291,11 @@ def findings(stats: SwitchStats) -> list[tuple[str, str]]:
         for key, temp in stats.temps.items()
         if temp >= SWITCH_TEMP_ALERT
     ]
-    crit += [("crit", f"{port.label} link down") for port in stats.ports if not port.running]
+    crit += [
+        ("crit", f"{port.label} link down")
+        for port in stats.ports
+        if not port.running and not port.disabled
+    ]
     warn = [("warn", f"{psu.name} {psu.state}") for psu in stats.psus if psu.state in _PSU_FAULTS]
     if stats.fan_state not in ("", "ok"):
         warn.append(("warn", f"fan {stats.fan_state}"))
@@ -355,7 +386,7 @@ async def poll_switch(index: int, cfg: SwitchConfig) -> SwitchStats:
     flight key); rate baselines and sticky ports are keyed by the label."""
     del index
     host = urlparse(cfg.url).hostname or ""
-    password = os.environ.get(cfg.password_env)
+    password = os.environ.get(cfg.password_env) or None
     if password is None:
         return _offline(cfg, host, f"${cfg.password_env} is not set")
     stats = SwitchStats(cfg.label, host, online=True)

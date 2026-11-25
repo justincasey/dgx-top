@@ -3703,3 +3703,62 @@ async def test_unreachable_or_pending_switch_keeps_the_node_tile_size(
         assert (box.region.width, box.region.height) == (node.region.width, node.region.height)
         assert status in _plain(box)
         assert len(_plain(box).split("\n")) == box.region.height
+
+
+def test_switch_temp_alert_matches_the_node_tile_alert():
+    """The switch critical-temperature threshold is duplicated in stats.py (the
+    collector cannot import the app); pin the coupling instead of letting it
+    drift (the same rule the ENGINE_PROFILES pin exists for)."""
+    import app
+    import stats
+
+    assert stats.SWITCH_TEMP_ALERT == app.TEMP_ALERT
+
+
+async def test_live_switch_with_no_sensors_renders_the_dash_sentinel(tmp_path: Path, monkeypatch):
+    """A switch that reports no sensors shows `tmp —`, never a blank row."""
+    from app import DGXTop, SwitchBox
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    quiet = SwitchStats("fabric", "192.0.2.20", online=True, version="7.20.1", uptime="2d4h")
+    _stub_switch(monkeypatch, quiet)
+    app = DGXTop()
+    async with app.run_test(size=(132, 40)) as pilot:
+        await app._poll()
+        await _resize(pilot, 132, 40)
+        text = _plain(app.query_one(SwitchBox))
+        assert "tmp —" in text
+        assert "    —" in text
+
+
+def test_no_sensor_switch_rows_render_the_dash_sentinel():
+    """Full and meter grid grammars render `tmp —` (never a blank row) for a
+    live switch that reports no sensors."""
+    from app import _switch_rows
+    from themes import build_palette, get_theme
+
+    pal = build_palette(get_theme("tokyo-night"), quiet=False)
+    quiet = SwitchStats("fabric", "192.0.2.20", online=True, version="7.20.1", uptime="2d4h")
+    for grammar in ("full", "meter"):
+        rows = _switch_rows(quiet, pal, 30, grammar, "spark", [])
+        text = "\n".join(r.plain for r in rows)
+        assert "tmp —" in text, f"{grammar} grammar renders a blank tmp row: {text!r}"
+
+
+async def test_quiet_switch_in_the_rail_renders_the_dash_sentinel(tmp_path: Path, monkeypatch):
+    """The rail's health block renders `—`, never a blank row, when the
+    switch reports no sensors."""
+    from app import DGXTop, FabricRail
+
+    _config_switch(tmp_path / "config.toml")
+    configure(tmp_path / "config.toml")
+    quiet = SwitchStats("fabric", "192.0.2.20", online=True, version="7.20.1", uptime="2d4h")
+    _stub_switch(monkeypatch, quiet)
+    app = DGXTop()
+    async with app.run_test(size=(196, 44)) as pilot:
+        await app._poll()
+        await _resize(pilot, 196, 44)
+        assert app.fabric_rail
+        text = _plain(app.query_one(FabricRail))
+        assert "—" in text

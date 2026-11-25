@@ -28,3 +28,8 @@ def _isolate_poll_state(monkeypatch):
     monkeypatch.setattr(switches, "_baselines", {})
     monkeypatch.setattr(switches, "_seen_running", {})
     monkeypatch.setattr(config, "SWITCHES", ())
+    # _SETTINGS now carries the same switches tuple: reset it too, so a test
+    # that configures cannot leak its switches into a later test that reads
+    # get_settings() without re-configuring.
+    monkeypatch.setattr(config, "_SETTINGS", None)
+    monkeypatch.setattr(config, "_CONFIG_PATH", None)

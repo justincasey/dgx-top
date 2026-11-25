@@ -311,8 +311,6 @@ class FakeSwitch:
             return httpx.Response(
                 200, json=[{"name": n, "rate": "200Gbps", "status": "link-ok"} for n in names]
             )
-        if path == "/rest/system/identity":
-            return httpx.Response(200, json={"name": "test-switch"})
         return httpx.Response(404)
 
 
@@ -418,6 +416,61 @@ async def test_missing_password_env_is_offline_without_a_request(switch, monkeyp
     s = await switches.poll_switch(0, CFG)
     assert (s.online, s.error) == (False, "$TEST_SWITCH_PW is not set")
     assert switch.requests == []
+
+
+async def test_empty_password_env_is_offline_without_a_request(switch, monkeypatch):
+    monkeypatch.setenv("TEST_SWITCH_PW", "")
+    s = await switches.poll_switch(0, CFG)
+    assert (s.online, s.error) == (False, "$TEST_SWITCH_PW is not set")
+    assert switch.requests == []
+
+
+def test_dd_port_reports_drops_without_byte_counters():
+    """A DD port reports only tx-queue-drop: the drop delta still flows (and
+    the finding), while rates stay unmeasured."""
+    port = SwitchPort("qsfp56-dd-1-1", "dd1", running=True)
+    switches.apply_counters(
+        "fabric",
+        port,
+        {"name": "qsfp56-dd-1-1", "tx-queue-drop": "100"},
+        1.0,
+    )
+    assert not port.measured
+    port = SwitchPort("qsfp56-dd-1-1", "dd1", running=True)
+    switches.apply_counters(
+        "fabric",
+        port,
+        {"name": "qsfp56-dd-1-1", "tx-queue-drop": "150"},
+        3.0,
+    )
+    assert port.queue_drops == 50
+    assert not port.measured  # no byte/packet counters: never a rate
+    s = SwitchStats("fabric", ports=[port])
+    assert ("warn", "dd1 drops +50") in switches.findings(s)
+
+
+def test_disabled_configured_port_is_listed_without_a_link_down_finding():
+    """A deliberately disabled configured port stays visible but is not a
+    dropped link — the default path's rule, applied to the configured one too."""
+    cfg = SwitchConfig(
+        "fabric",
+        "https://192.0.2.10",
+        "monitor",
+        ports=(("qsfp56-dd-1-1", "spark-1"), ("ether1", "mgmt")),
+    )
+    ports = switches.select_ports(
+        cfg,
+        [
+            {"name": "qsfp56-dd-1-1", "type": "ether", "running": "false", "disabled": "true"},
+            {"name": "ether1", "type": "ether", "running": "false", "disabled": "false"},
+        ],
+    )
+    assert [(p.label, p.disabled, p.running) for p in ports] == [
+        ("spark-1", True, False),
+        ("mgmt", False, False),
+    ]
+    s = SwitchStats("fabric", ports=ports)
+    assert switches.findings(s) == [("crit", "mgmt link down")]
 
 
 async def test_http_401_is_offline_and_never_echoes_the_password(switch):
@@ -562,3 +615,48 @@ async def test_simulation_has_no_switches(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SIMULATION_NODES", 2)
     stats = await collector.poll_cluster()
     assert stats.switches == []
+
+
+def test_drops_still_report_across_a_byte_counter_reset():
+    """Drops flow independently of rates: a reboot resets byte counters but the
+    tx-queue-drop delta still reports (and the finding fires)."""
+    switches.apply_counters(
+        "fabric",
+        SwitchPort("p1", "p1"),
+        _iface("p1", rx=100_000, tx=100_000, drops=50),
+        1.0,
+    )
+    port = SwitchPort("p1", "p1")
+    switches.apply_counters(
+        "fabric",
+        port,
+        _iface("p1", rx=100, tx=100, drops=90),  # reboot: counters reset
+        3.0,
+    )
+    assert not port.measured  # byte counters went backwards: no rate
+    assert port.queue_drops == 40  # drops went 50 -> 90: the delta reports
+
+
+def test_partial_baseline_never_rates_after_full_readability():
+    """A partial-readable baseline (-1 byte counters) must not become a bogus
+    rate once a later poll reads the counters: the first full-readability
+    poll only re-seeds."""
+    switches.apply_counters(
+        "fabric",
+        SwitchPort("p1", "p1"),
+        {"name": "p1", "tx-queue-drop": "100"},
+        1.0,
+    )
+    port = SwitchPort("p1", "p1")
+    switches.apply_counters("fabric", port, _iface("p1", rx=10_000, tx=20_000, drops=150), 3.0)
+    assert not port.measured  # the baseline was sentinel-only: no rate
+    assert port.queue_drops == 50  # drops still report against the baseline
+    port = SwitchPort("p1", "p1")
+    switches.apply_counters(
+        "fabric",
+        port,
+        _iface("p1", rx=20_000, tx=40_000, drops=200),
+        5.0,
+    )
+    assert port.measured  # now the baseline is fully readable: real rate
+    assert port.rx_bps == 10_000 * 8 / 2

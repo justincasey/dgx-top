@@ -297,9 +297,12 @@ def _meter_line(
     hairline track), ``tick`` (dim scale + single bright marker at the value)
     or ``spark`` (history sparkline). Fill/marker colour escalates to caution
     at ≥75 and critical at ≥90; under a quiet palette the base colour is
-    already neutral, so only escalation carries hue.
+    already neutral, so only escalation carries hue. A negative ``pct`` means
+    the value is unknown: a dim empty track, never a confident zero.
     """
-    pct = max(0.0, min(100.0, pct))
+    if pct < 0:
+        return Text("─" * max(1, width), style=pal.dim)
+    pct = min(100.0, pct)
     if pct >= 90:
         color = "#f7768e"
     elif pct >= 75:
@@ -967,9 +970,12 @@ class Waybar(Static):
             else:
                 lock = None
         right = Text.assemble(*([lock] if lock else []), *stats)
-        hints = self._fit_hints(width - badge.cell_len - right.cell_len - self.HINT_MIN_GAP, pal)
-        gap = width - badge.cell_len - hints.cell_len - right.cell_len
-        out = Text.assemble(badge, hints, Text(" " * max(0, gap)), right)
+        badge_gap = 1 if badge.cell_len else 0
+        hints = self._fit_hints(
+            width - badge.cell_len - badge_gap - right.cell_len - self.HINT_MIN_GAP, pal
+        )
+        gap = width - badge.cell_len - badge_gap - hints.cell_len - right.cell_len
+        out = Text.assemble(badge, Text(" " * badge_gap), hints, Text(" " * max(0, gap)), right)
         return _fit(out, width)
 
 
@@ -1976,33 +1982,53 @@ def _temp_text(value: float, pal: Palette) -> Text:
     return Text(f"{value:.0f}°", style=_temp_style(value, pal))
 
 
-def _switch_temps(sw: SwitchStats, pal: Palette) -> tuple[Text, Text]:
-    """(chip, groups): the switch's own sensors, switch chip first
-    (``sw 61° · cpu 47° · phy 38°``), then the board and PSU groups
-    (``brd 33°/44° · psu 35°/36°``). Every reported sensor appears."""
-    chip_keys = sorted(
+def _switch_temp_segs(sw: SwitchStats, pal: Palette) -> tuple[list[Text], list[Text]]:
+    """The switch's own sensors as atomic, pre-styled segments: one per chip
+    sensor (``sw 61°``) and one per board/psu group (``brd 33°/44°``). The
+    caller packs as many as fit its width budget. Chip order: switch first,
+    then report order; groups: board, then psu."""
+    chip_segs: list[Text] = []
+    for key in sorted(
         (k for k in sw.temps if not k.startswith(("board", "psu"))),
         key=lambda k: k != "switch",  # stable: the rest keep report order
-    )
-    chip = Text()
-    for key in chip_keys:
-        if chip:
-            chip.append_text(_dot(pal))
-        chip.append(("sw" if key == "switch" else key) + " ", style=pal.dim)
-        chip.append_text(_temp_text(sw.temps[key], pal))
-    groups = Text()
+    ):
+        seg = Text()
+        seg.append(("sw" if key == "switch" else key) + " ", style=pal.dim)
+        seg.append_text(_temp_text(sw.temps[key], pal))
+        chip_segs.append(seg)
+    group_segs: list[Text] = []
     for prefix, name in (("board", "brd"), ("psu", "psu")):
         values = [v for k, v in sw.temps.items() if k.startswith(prefix)]
         if not values:
             continue
-        if groups:
-            groups.append_text(_dot(pal))
-        groups.append(name + " ", style=pal.dim)
+        seg = Text(name + " ", style=pal.dim)
         for i, value in enumerate(values):
             if i:
-                groups.append("/", style=pal.dim)
-            groups.append_text(_temp_text(value, pal))
-    return chip, groups
+                seg.append("/", style=pal.dim)
+            seg.append_text(_temp_text(value, pal))
+        group_segs.append(seg)
+    return chip_segs, group_segs
+
+
+def _pack_segs(segs: list[Text], budget: int, pal: Palette) -> Text:
+    """Join ``segs`` with `` · `` up to ``budget`` cells. Segments that do not
+    fit are dropped whole and a dim ``…`` marks the cut; a single segment
+    wider than the budget is returned whole so the frame's ``_fit`` clips it."""
+    out = Text()
+    dropped = False
+    for i, seg in enumerate(segs):
+        extra = seg.cell_len + (3 if out else 0)
+        if out.cell_len + extra > budget:
+            dropped = True
+            break
+        if out:
+            out.append_text(_dot(pal))
+        out.append_text(seg)
+    if not out and segs:
+        return segs[0].copy()
+    if dropped and out.cell_len + 2 <= budget:
+        out.append(" …", style=pal.dim)
+    return out
 
 
 def _switch_fans(sw: SwitchStats, pal: Palette) -> Text:
@@ -2122,7 +2148,9 @@ def _switch_rows(
     def row(label: str, value: Text) -> Text:
         return Text.assemble(Text(label, style=pal.dim), value)
 
-    chip, groups = _switch_temps(sw, pal) if live else (dash, Text(""))
+    chip_segs, group_segs = _switch_temp_segs(sw, pal) if live else ([], [])
+    chip = _pack_segs(chip_segs, iw - 4, pal) if chip_segs else Text()
+    groups = _pack_segs(group_segs, iw - 4, pal) if group_segs else Text()
     mem, mem_pct = _switch_mem(sw, pal)
     cpu = _switch_cpu(sw, pal)
     pct = Text(f"{mem_pct:.0f}%", style=f"bold {pal.ok}") if mem_pct >= 0 else dash
@@ -2137,21 +2165,20 @@ def _switch_rows(
         return [
             head,
             row("mem ", mem),
-            _meter_line(treatment, max(0.0, mem_pct), iw, pal, pal.ok, mem_history),
-            row("tmp ", chip),
-            row("    ", groups),
+            _meter_line(treatment, mem_pct, iw, pal, pal.ok, mem_history),
+            row("tmp ", chip or dash),
+            row("    ", groups or dash),
             row("fan ", _switch_fans(sw, pal) if live else dash),
             row("psu ", _switch_psus(sw, pal) if live else dash),
             _switch_status(sw, pal),
         ]
     if grammar == "meter":
-        temps = chip.copy()
-        if groups:
-            temps.append_text(_dot(pal))
-            temps.append_text(groups)
+        temps = (
+            _pack_segs(chip_segs + group_segs, iw - 4, pal) if (chip_segs or group_segs) else Text()
+        )
         return [
             Text.assemble(row("cpu ", cpu), _dot(pal), Text("mem ", style=pal.dim), pct),
-            row("tmp ", temps),
+            row("tmp ", temps or dash),
             row("fan ", _switch_fans(sw, pal) if live else dash),
             row("psu ", _switch_psus(sw, pal, short=True) if live else dash),
             _switch_status(sw, pal),
@@ -2269,6 +2296,9 @@ def _rail_port_rows(
 
     def link(p: SwitchPort) -> Text:
         out = Text(p.label.ljust(gutter), style=pal.dim)
+        if p.disabled:
+            out.append("disabled", style=pal.dim)
+            return out
         if not p.running:
             out.append("✗ down", style=f"bold {pal.warn}")
             return out
@@ -2368,7 +2398,9 @@ class FabricRail(Static):
             host.append_text(_dot(pal))
             host.append(sw.board, style=pal.dim)
         mem, mem_pct = _switch_mem(sw, pal)
-        chip, groups = _switch_temps(sw, pal) if live else (dash, Text(""))
+        chip_segs, group_segs = _switch_temp_segs(sw, pal) if live else ([], [])
+        chip = _pack_segs(chip_segs, iw, pal) or dash
+        groups = _pack_segs(group_segs, iw, pal) or dash
         return [
             host,
             Text.assemble(
@@ -2380,7 +2412,7 @@ class FabricRail(Static):
             ),
             _meter_line(
                 _treatment(self),
-                max(0.0, mem_pct),
+                mem_pct,
                 iw,
                 pal,
                 pal.ok,

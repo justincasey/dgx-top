@@ -55,12 +55,15 @@ vllm_url = "http://spark02.example.com:8000"
 worker = true
 
 # Network switches shown beside the nodes (optional, up to 4). Read-only:
-# dgx-top issues GET requests to RouterOS v7's REST API plus its read-only
-# `interface/ethernet/monitor once`. The password is never in this file: set
+# dgx-top issues GET requests to RouterOS v7's REST API plus one read-only
+# `POST /rest/interface/ethernet/monitor` with `once` (RouterOS exposes that
+# read-only command as a POST). The password is never in this file: set
 # it in the environment variable named by password_env before starting.
-# Prefer https (RouterOS www-ssl); ca_file verifies a private CA. ports is
+# Prefer https (RouterOS www-ssl); ca_file verifies a private CA (absolute
+# path). ports is
 # optional: interface = "label" pairs (labels up to 8 characters) in display
-# order; leave it out to show every running ethernet port.
+# order; leave it out to show every enabled running ethernet port, plus any
+# port that was running and drops (so the drop stays visible).
 # [[switches]]
 # label = "fabric"
 # url = "https://192.0.2.10"
